@@ -24,12 +24,35 @@ from typing import Any
 
 DEFAULT_URL = "http://127.0.0.1:3478"
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+DURABLE_REFRESH_QUIET_SECONDS = 0.08
+DURABLE_REFRESH_FALLBACK_SECONDS = 0.7
+MAX_PANE_REPLAY_BYTES = 2 * 1024 * 1024
 
 
-def _read_exact(stream: socket.socket, size: int) -> bytes:
+def _append_bounded_utf8(buffer: bytearray, value: str) -> None:
+    encoded = value.encode("utf-8", errors="replace")
+    if not encoded:
+        return
+    if len(encoded) >= MAX_PANE_REPLAY_BYTES:
+        buffer[:] = encoded[-MAX_PANE_REPLAY_BYTES:]
+    else:
+        buffer.extend(encoded)
+        overflow = len(buffer) - MAX_PANE_REPLAY_BYTES
+        if overflow > 0:
+            del buffer[:overflow]
+    while buffer and buffer[0] & 0xC0 == 0x80:
+        del buffer[0]
+
+
+def _read_exact(stream: socket.socket, size: int, deadline: float | None = None) -> bytes:
     chunks: list[bytes] = []
     remaining = size
     while remaining:
+        if deadline is not None:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise TimeoutError("read deadline exceeded")
+            stream.settimeout(timeout)
         chunk = stream.recv(remaining)
         if not chunk:
             raise OSError("unexpected websocket EOF")
@@ -38,9 +61,14 @@ def _read_exact(stream: socket.socket, size: int) -> bytes:
     return b"".join(chunks)
 
 
-def _read_http_headers(stream: socket.socket) -> str:
+def _read_http_headers(stream: socket.socket, deadline: float | None = None) -> str:
     data = bytearray()
     while b"\r\n\r\n" not in data:
+        if deadline is not None:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                raise TimeoutError("websocket upgrade deadline exceeded")
+            stream.settimeout(timeout)
         chunk = stream.recv(1)
         if not chunk:
             raise OSError("unexpected EOF during websocket upgrade")
@@ -51,19 +79,19 @@ def _read_http_headers(stream: socket.socket) -> str:
     return headers.decode("iso-8859-1")
 
 
-def _read_websocket_frame(stream: socket.socket) -> tuple[int, bytes]:
-    first, second = _read_exact(stream, 2)
+def _read_websocket_frame(stream: socket.socket, deadline: float | None = None) -> tuple[int, bytes]:
+    first, second = _read_exact(stream, 2, deadline)
     opcode = first & 0x0F
     masked = bool(second & 0x80)
     length = second & 0x7F
     if length == 126:
-        length = int.from_bytes(_read_exact(stream, 2), "big")
+        length = int.from_bytes(_read_exact(stream, 2, deadline), "big")
     elif length == 127:
-        length = int.from_bytes(_read_exact(stream, 8), "big")
+        length = int.from_bytes(_read_exact(stream, 8, deadline), "big")
     if length > 4 * 1024 * 1024:
         raise OSError("websocket frame is too large")
-    mask = _read_exact(stream, 4) if masked else b""
-    payload = _read_exact(stream, length)
+    mask = _read_exact(stream, 4, deadline) if masked else b""
+    payload = _read_exact(stream, length, deadline)
     if mask:
         payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
     return opcode, payload
@@ -222,6 +250,16 @@ class WmuxClient:
         )
 
     def read_pane_output(self, pane_id: str, cols: int, rows: int, timeout: float = 10) -> dict[str, Any]:
+        if timeout <= 0:
+            raise SystemExit("wmuxctl: pane output timeout must be greater than zero")
+        overall_deadline = time.monotonic() + timeout
+
+        def remaining_timeout(phase: str) -> float:
+            remaining = overall_deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"timed out waiting for pane output {phase} after {timeout:g}s")
+            return remaining
+
         parsed = urllib.parse.urlsplit(self.url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise SystemExit(f"wmuxctl: unsupported wmux URL for websocket output: {self.url}")
@@ -243,16 +281,20 @@ class WmuxClient:
             headers.append(f"Authorization: Bearer {self.token}")
         headers.extend(["", ""])
 
-        raw_socket = socket.create_connection((parsed.hostname, port), timeout=timeout)
-        stream: socket.socket
-        if parsed.scheme == "https":
-            stream = ssl.create_default_context().wrap_socket(raw_socket, server_hostname=parsed.hostname)
-        else:
-            stream = raw_socket
-        stream.settimeout(timeout)
+        raw_socket: socket.socket | None = None
+        stream: socket.socket | None = None
         try:
+            raw_socket = socket.create_connection(
+                (parsed.hostname, port), timeout=remaining_timeout("connection")
+            )
+            raw_socket.settimeout(remaining_timeout("TLS handshake" if parsed.scheme == "https" else "upgrade"))
+            if parsed.scheme == "https":
+                stream = ssl.create_default_context().wrap_socket(raw_socket, server_hostname=parsed.hostname)
+            else:
+                stream = raw_socket
+            stream.settimeout(remaining_timeout("upgrade"))
             stream.sendall("\r\n".join(headers).encode("ascii"))
-            response = _read_http_headers(stream)
+            response = _read_http_headers(stream, overall_deadline)
             status_line, _, header_block = response.partition("\r\n")
             if " 101 " not in f" {status_line} ":
                 raise SystemExit(f"wmuxctl: pane output websocket upgrade failed: {status_line}")
@@ -262,8 +304,45 @@ class WmuxClient:
             ).decode("ascii")
             if not accept_match or accept_match.group(1) != expected_accept:
                 raise SystemExit("wmuxctl: pane output websocket returned an invalid handshake")
+            ready: dict[str, Any] | None = None
+            refresh_output = bytearray()
+            refresh_deadline = 0.0
+            quiet_deadline = 0.0
+
+            def finish_refresh() -> dict[str, Any]:
+                assert ready is not None
+                ready["replay"] = refresh_output.decode("utf-8")
+                return ready
+
             while True:
-                opcode, payload = _read_websocket_frame(stream)
+                if ready is not None:
+                    completion_deadline = min(quiet_deadline or refresh_deadline, refresh_deadline)
+                    deadline = min(completion_deadline, overall_deadline)
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        if overall_deadline <= completion_deadline:
+                            raise TimeoutError(
+                                f"timed out waiting for pane output refresh after {timeout:g}s"
+                            )
+                        return finish_refresh()
+                    stream.settimeout(remaining)
+                    read_deadline = deadline
+                else:
+                    stream.settimeout(remaining_timeout("ready state"))
+                    read_deadline = overall_deadline
+                try:
+                    opcode, payload = _read_websocket_frame(stream, read_deadline)
+                except TimeoutError:
+                    if ready is None:
+                        raise TimeoutError(
+                            f"timed out waiting for pane output ready state after {timeout:g}s"
+                        )
+                    completion_deadline = min(quiet_deadline or refresh_deadline, refresh_deadline)
+                    if overall_deadline <= completion_deadline:
+                        raise TimeoutError(
+                            f"timed out waiting for pane output refresh after {timeout:g}s"
+                        )
+                    return finish_refresh()
                 if opcode == 0x8:
                     raise SystemExit("wmuxctl: pane output websocket closed before sending ready state")
                 if opcode == 0x9:
@@ -273,11 +352,26 @@ class WmuxClient:
                     continue
                 message = json.loads(payload.decode("utf-8"))
                 if message.get("type") == "ready":
-                    return message
+                    if not message.get("waitForRefresh"):
+                        return message
+                    ready = message
+                    _append_bounded_utf8(refresh_output, str(ready.get("replay") or ""))
+                    ready["replay"] = ""
+                    refresh_deadline = min(
+                        time.monotonic() + DURABLE_REFRESH_FALLBACK_SECONDS,
+                        overall_deadline,
+                    )
+                    continue
+                if ready is not None and message.get("type") == "output" and isinstance(message.get("data"), str):
+                    _append_bounded_utf8(refresh_output, message["data"])
+                    quiet_deadline = time.monotonic() + DURABLE_REFRESH_QUIET_SECONDS
         except (OSError, ValueError, json.JSONDecodeError) as error:
             raise SystemExit(f"wmuxctl: cannot read pane output: {error}") from error
         finally:
-            stream.close()
+            if stream is not None:
+                stream.close()
+            elif raw_socket is not None:
+                raw_socket.close()
 
 
 def active_tab(workspace: dict[str, Any]) -> dict[str, Any]:

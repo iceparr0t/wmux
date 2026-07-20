@@ -58,7 +58,16 @@ test("wmuxctl output and wait read authenticated pane replay", async () => {
       "",
       "",
     ].join("\r\n"));
-    socket.end(websocketFrame({ type: "ready", paneId: "pane_agent", replay, outputOnly: true }));
+    socket.write(websocketFrame({
+      type: "ready",
+      paneId: "pane_agent",
+      replay: "",
+      replayKind: "raw",
+      outputOnly: true,
+      waitForRefresh: true,
+    }));
+    setTimeout(() => socket.write(websocketFrame({ type: "output", paneId: "pane_agent", data: replay })), 10);
+    setTimeout(() => socket.end(), 250);
   });
 
   const url = await listen(server);
@@ -73,6 +82,100 @@ test("wmuxctl output and wait read authenticated pane replay", async () => {
     assert.equal(result.matched, "task_complete");
     assert.deepEqual(authorizations, ["Bearer test-token", "Bearer test-token"]);
   } finally {
+    await close(server);
+  }
+});
+
+test("wmuxctl bounds noisy durable refresh replay to the newest 2 MiB of valid UTF-8", async () => {
+  const server = http.createServer();
+  const newest = "newest-é-🦜\n";
+  server.on("upgrade", (request, socket) => {
+    const key = request.headers["sec-websocket-key"];
+    assert.equal(typeof key, "string");
+    const accept = crypto.createHash("sha1").update(`${key}${websocketGuid}`).digest("base64");
+    socket.write([
+      "HTTP/1.1 101 Switching Protocols",
+      "Upgrade: websocket",
+      "Connection: Upgrade",
+      `Sec-WebSocket-Accept: ${accept}`,
+      "",
+      "",
+    ].join("\r\n"));
+    socket.write(websocketFrame({
+      type: "ready",
+      paneId: "pane_noisy",
+      replay: "oldest-must-be-trimmed\n",
+      replayKind: "raw",
+      outputOnly: true,
+      waitForRefresh: true,
+    }));
+    for (let index = 0; index < 40; index += 1) {
+      socket.write(websocketFrame({ type: "output", paneId: "pane_noisy", data: "é".repeat(30_000) }));
+    }
+    socket.write(websocketFrame({ type: "output", paneId: "pane_noisy", data: newest }));
+    setTimeout(() => socket.end(), 300);
+  });
+
+  const url = await listen(server);
+  try {
+    const result = await execFileAsync(
+      "python3",
+      [wmuxctl, "--url", url, "output", "pane_noisy", "--raw", "--tail-chars", "0"],
+      {
+        cwd: repoRoot,
+        env: { ...process.env, WMUX_TOKEN: "test-token" },
+        maxBuffer: 3 * 1024 * 1024,
+      },
+    );
+    const replayBytes = Buffer.byteLength(result.stdout, "utf8");
+    assert.ok(replayBytes <= 2 * 1024 * 1024);
+    assert.ok(replayBytes >= 2 * 1024 * 1024 - 3, "only a split leading UTF-8 code point may be discarded");
+    assert.equal(result.stdout.endsWith(newest), true);
+    assert.doesNotMatch(result.stdout, /oldest-must-be-trimmed/);
+  } finally {
+    await close(server);
+  }
+});
+
+test("wmuxctl caps durable refresh waiting at the caller's overall timeout", async () => {
+  const server = http.createServer();
+  let upgradedSocket: import("node:stream").Duplex | undefined;
+  server.on("upgrade", (request, socket) => {
+    upgradedSocket = socket;
+    const key = request.headers["sec-websocket-key"];
+    assert.equal(typeof key, "string");
+    const accept = crypto.createHash("sha1").update(`${key}${websocketGuid}`).digest("base64");
+    socket.write([
+      "HTTP/1.1 101 Switching Protocols",
+      "Upgrade: websocket",
+      "Connection: Upgrade",
+      `Sec-WebSocket-Accept: ${accept}`,
+      "",
+      "",
+    ].join("\r\n"));
+    socket.write(websocketFrame({
+      type: "ready",
+      paneId: "pane_silent",
+      replay: "",
+      replayKind: "raw",
+      outputOnly: true,
+      waitForRefresh: true,
+    }));
+  });
+
+  const url = await listen(server);
+  const startedAt = Date.now();
+  try {
+    await assert.rejects(
+      cli(url, ["output", "pane_silent", "--timeout", "0.2"]),
+      (error: { stderr?: string }) => {
+        assert.match(error.stderr ?? "", /timed out waiting for pane output refresh after 0\.2s/);
+        return true;
+      },
+    );
+    assert.ok(Date.now() - startedAt < 600, "short caller timeout must not wait for the 700ms refresh fallback");
+  } finally {
+    upgradedSocket?.destroy();
     await close(server);
   }
 });

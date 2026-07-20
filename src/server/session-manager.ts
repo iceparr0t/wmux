@@ -285,7 +285,11 @@ export class SessionManager {
         replay: replay.data,
         replayKind: replay.kind,
         outputOnly: true,
+        ...(this.shouldUseDurableClientRefresh(pane) && replay.kind === "raw" && replay.data === ""
+          ? { waitForRefresh: true as const }
+          : {}),
       });
+      this.scheduleDurableClientRefresh(pane, socket);
     };
     if (session.attachReady) void session.attachReady.then(sendReady);
     else sendReady();
