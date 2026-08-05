@@ -641,7 +641,7 @@ case "$command_name" in
       --tmpfs "/home/wmux:rw,nosuid,nodev,noexec,mode=0700,size=128m,uid=$(id -u),gid=$(id -g)" \
       --tmpfs "/tmp:rw,nosuid,nodev,noexec,mode=1777,size=512m,uid=$(id -u),gid=$(id -g)" \
       --tmpfs "/run:rw,nosuid,nodev,noexec,mode=0755,size=8m,uid=$(id -u),gid=$(id -g)" \
-      --log-driver local --log-opt max-size=4m --log-opt max-file=1 --restart no \
+      --log-driver local --log-opt max-size=4m --log-opt max-file=1 --log-opt compress=false --restart no \
       --mount "type=bind,src=$e2e_context,dst=/workspace,readonly,bind-propagation=rprivate" \
       --mount "type=bind,src=$runner_bootstrap,dst=/runner-bootstrap,readonly,bind-propagation=rprivate" \
       --env HOME=/home/wmux --env TMPDIR=/tmp --env XDG_CACHE_HOME=/home/wmux/.cache \

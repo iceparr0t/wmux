@@ -244,7 +244,7 @@ if [ "$1" = inspect ]; then
       const hm=[{Type:"bind",Source:ctx,Target:"/workspace",ReadOnly:true},{Type:"bind",Source:boot,Target:"/runner-bootstrap",ReadOnly:true}];
       const mounts=[{Type:"bind",Source:ctx,Destination:"/workspace",Mode:"ro",RW:false,Propagation:"rprivate"},{Type:"bind",Source:boot,Destination:"/runner-bootstrap",Mode:"ro",RW:false,Propagation:"rprivate"}];
       const opt=(mode,size)=>"rw,nosuid,nodev,noexec,mode="+mode+",size="+size+",uid="+uid+",gid="+gid;
-      const h={Binds:null,CapDrop:["ALL"],DeviceRequests:null,Devices:[],IpcMode:"private",Init:true,LogConfig:{Type:"local",Config:{"max-file":"1","max-size":"4m"}},Memory:2147483648,MemorySwap:2147483648,Mounts:hm,NanoCpus:2000000000,NetworkMode:net,PidMode:"",PidsLimit:512,PortBindings:{},Privileged:false,ReadonlyRootfs:true,RestartPolicy:{Name:"no"},SecurityOpt:["no-new-privileges:true"],ShmSize:536870912,Tmpfs:{"/home/wmux":opt("700",134217728),"/tmp":opt("1777",536870912),"/run":opt("755",8388608)},UsernsMode:"",VolumesFrom:null};
+      const h={Binds:null,CapDrop:["ALL"],DeviceRequests:null,Devices:[],IpcMode:"private",Init:true,LogConfig:{Type:"local",Config:{compress:"false","max-file":"1","max-size":"4m"}},Memory:2147483648,MemorySwap:2147483648,Mounts:hm,NanoCpus:2000000000,NetworkMode:net,PidMode:"",PidsLimit:512,PortBindings:{},Privileged:false,ReadonlyRootfs:true,RestartPolicy:{Name:"no"},SecurityOpt:["no-new-privileges:true"],ShmSize:536870912,Tmpfs:{"/home/wmux":opt("700",134217728),"/tmp":opt("1777",536870912),"/run":opt("755",8388608)},UsernsMode:"",VolumesFrom:null};
       const labels={"org.opencontainers.image.revision":r,"wmux.staging.e2e":"true","wmux.staging.project":p};
       const env=["PATH=/usr/bin:/bin","PLAYWRIGHT_BROWSERS_PATH=/ms-playwright","HOME=/home/wmux","TMPDIR=/tmp","XDG_CACHE_HOME=/home/wmux/.cache","WMUX_BUILD_REVISION="+r,"WMUX_E2E_BASE_URL="+url];
       const early=ctl("runner-prestart-network-realized");
@@ -259,6 +259,8 @@ if [ "$1" = inspect ]; then
       if(ctl("runner-inspect-network"))value.NetworkSettings.Networks.extra={NetworkID:"${networkId}"};
       if(ctl("runner-inspect-port")){h.PortBindings={"8080/tcp":[{HostIp:"0.0.0.0",HostPort:"8080"}]};value.NetworkSettings.Ports={"8080/tcp":[{HostIp:"0.0.0.0",HostPort:"8080"}]};}
       if(ctl("runner-inspect-limit"))h.PidsLimit=1024;
+      if(ctl("runner-inspect-compress-missing"))delete h.LogConfig.Config.compress;
+      if(ctl("runner-inspect-compress-changed"))h.LogConfig.Config.compress="true";
       if(ctl("runner-inspect-token-env"))env.push("WMUX_E2E_TOKEN=metadata-secret");
       if(post&&ctl("runner-post-inspect-identity"))value.Name="/substituted";
       if(post&&ctl("runner-post-inspect-config"))value.Config.OpenStdin=false;
@@ -625,6 +627,7 @@ test("owner-local E2E context rejects source/dependency drift and runs only in t
     const escapedContext = e2eContext.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     assert.match(log, new RegExp(`npm-ci cwd=${escapedContext} token=no reg=no`));
     assert.match(log, /<create> <--interactive>.*<--read-only>.*<--cap-drop> <ALL>.*<--network>.*_default/s);
+    assert.match(log, /<create>.*<--log-driver> <local>.*<--log-opt> <max-size=4m>.*<--log-opt> <max-file=1>.*<--log-opt> <compress=false>/s);
     assert.match(log, new RegExp(`<start> <${runnerContainerId}>`));
     assert.match(log, new RegExp(`<attach> <--no-stdin=false> <${runnerContainerId}>`));
     assert.match(log, new RegExp(`<wait> <${runnerContainerId}>`));
@@ -661,7 +664,7 @@ test("runner rejects image, package, inspect, output, result, and execution drif
     for (const control of [
       "runner-image-drift", "runner-image-malformed", "runner-image-unexpected", "playwright-version-drift", "e2e-symlink-drift", "runner-inspect-privileged", "runner-inspect-host-pid",
       "runner-inspect-device", "runner-inspect-mount", "runner-inspect-network", "runner-inspect-port",
-      "runner-inspect-limit", "runner-inspect-token-env", "runner-post-inspect-identity", "runner-post-inspect-config", "runner-post-inspect-stdin-once",
+      "runner-inspect-limit", "runner-inspect-compress-missing", "runner-inspect-compress-changed", "runner-inspect-token-env", "runner-post-inspect-identity", "runner-post-inspect-config", "runner-post-inspect-stdin-once",
       "runner-post-inspect-mount", "runner-post-inspect-resource", "runner-post-inspect-network", "runner-post-inspect-state",
       "runner-prestart-network-drift", "runner-network-before-start-drift", "runner-start-fail", "runner-attach-fail",
       "runner-wait-fail", "runner-token-log", "runner-result-token", "runner-fail",

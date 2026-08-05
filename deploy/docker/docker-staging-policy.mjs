@@ -1186,7 +1186,7 @@ const validateRunnerContainer = async ([project, revision, runnerName, container
   requireEmptyList(h.DeviceRequests, "runner DeviceRequests"); requireEmptyList(h.VolumesFrom, "runner VolumesFrom");
   if (h.PortBindings !== null && Object.keys(h.PortBindings).length !== 0) fail("runner ports must be empty");
   exactKeys(h.LogConfig, ["Config", "Type"], "runner LogConfig");
-  exactMap(h.LogConfig.Config, { "max-file": "1", "max-size": "4m" }, "runner LogConfig options");
+  exactMap(h.LogConfig.Config, { compress: "false", "max-file": "1", "max-size": "4m" }, "runner LogConfig options");
   if (h.LogConfig.Type !== "local") fail("runner log driver drift");
   exactKeys(h.Tmpfs, Object.keys(runnerTmpfs(runnerUid, runnerGid)), "runner Tmpfs");
   for (const [destination, expected] of Object.entries(runnerTmpfs(runnerUid, runnerGid))) validateTmpfsOptions(h.Tmpfs[destination], expected, destination);
