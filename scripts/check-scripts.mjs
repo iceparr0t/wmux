@@ -81,4 +81,4 @@ run("bash", [
   "scripts/wmuxctl",
 ]);
 
-run("sh", ["-n", "scripts/wmux-docker-staging"]);
+run("sh", ["-n", "scripts/wmux-docker-staging", "deploy/docker/e2e-runner-bootstrap"]);

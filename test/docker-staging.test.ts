@@ -14,6 +14,9 @@ const privateHost = Object.values(os.networkInterfaces()).flat().find((entry) =>
 const containerId = "a".repeat(64);
 const networkId = "b".repeat(64);
 const imageId = `sha256:${"c".repeat(64)}`;
+const runnerContainerId = "d".repeat(64);
+const runnerImageId = `sha256:${"7".repeat(64)}`;
+const runnerImage = "mcr.microsoft.com/playwright@sha256:57b65fdc9ceabe0ef613124c7bbe2babcf9362c4d85e382fe3b03604e84b428a";
 
 const executable = (filePath: string, source: string) => fs.writeFileSync(filePath, source, { mode: 0o755 });
 const git = (cwd: string, ...args: string[]) => {
@@ -60,7 +63,7 @@ const removeFixture = (fixture: Fixture) => {
   }
 };
 
-function makeFixture() {
+function makeFixture(options: { runnerTimeoutSeconds?: number } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-staging-worktree-"));
   fs.chmodSync(directory, 0o700);
   const repository = path.join(directory, "source");
@@ -76,14 +79,22 @@ function makeFixture() {
   for (const relative of [
     "scripts/wmux-docker-staging", "deploy/docker/docker-bind-host.mjs", "deploy/docker/docker-staging-policy.mjs",
     "deploy/docker/docker-staging-smoke.mjs", "deploy/docker/docker-compose.staging.yml", "deploy/docker/Dockerfile",
+    "deploy/docker/e2e-runner-bootstrap",
   ]) {
     const target = path.join(repository, relative);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.copyFileSync(path.join(sourceRoot, relative), target);
   }
   fs.chmodSync(path.join(repository, "scripts/wmux-docker-staging"), 0o755);
+  if (options.runnerTimeoutSeconds !== undefined) {
+    const launcher = path.join(repository, "scripts/wmux-docker-staging");
+    fs.writeFileSync(launcher, fs.readFileSync(launcher, "utf8").replace('"$runtime_dir/e2e-run.log" 1800', `"$runtime_dir/e2e-run.log" ${options.runnerTimeoutSeconds}`), { mode: 0o755 });
+  }
   fs.writeFileSync(path.join(repository, "package.json"), '{"name":"candidate","scripts":{"test:e2e:browser:chromium":"true"}}\n');
-  fs.writeFileSync(path.join(repository, "package-lock.json"), '{"name":"candidate","lockfileVersion":3,"requires":true,"packages":{"":{"name":"candidate"}}}\n');
+  fs.writeFileSync(path.join(repository, "package-lock.json"), JSON.stringify({ name: "candidate", lockfileVersion: 3, requires: true, packages: {
+    "": { name: "candidate" }, "node_modules/@playwright/test": { version: "1.61.0" },
+    "node_modules/playwright": { version: "1.61.0" }, "node_modules/playwright-core": { version: "1.61.0" },
+  } }) + "\n");
   fs.writeFileSync(path.join(repository, "playwright.browser.config.ts"), "export default {};\n");
   fs.writeFileSync(path.join(repository, ".gitattributes"), "*.sh text eol=lf\nscripts/** text eol=lf\n");
   fs.symlinkSync("package.json", path.join(repository, "fixture-link"));
@@ -132,9 +143,68 @@ if [ "$1" = compose ]; then
   esac; exit
 fi
 revision=$(/bin/cat "$STATE/revision" 2>/dev/null); project=$(/bin/cat "$STATE/project" 2>/dev/null); host=$(/bin/cat "$STATE/host" 2>/dev/null); port=$(/bin/cat "$STATE/port" 2>/dev/null)
+if [ "$1" = pull ]; then [ "$2" = '${runnerImage}' ] || exit 73; exit 0; fi
+if [ "$1 $2" = 'image inspect' ] && [ "$5" = '${runnerImage}' ]; then
+  ctl runner-image-drift && digest='mcr.microsoft.com/playwright@sha256:${"8".repeat(64)}' || digest='${runnerImage}'
+  printf '{"Id":"${runnerImageId}","RepoDigests":["%s"],"Config":{"Cmd":["/bin/sh"],"Entrypoint":null,"Env":["PATH=/usr/bin:/bin","PLAYWRIGHT_BROWSERS_PATH=/ms-playwright"],"Labels":null}}\n' "$digest"; exit
+fi
+if [ "$1" = create ]; then
+  ctl runner-create-fail && exit 74
+  previous=; for arg in "$@"; do
+    case "$previous" in
+      --name) printf '%s' "$arg" >"$STATE/runner-name";; --user) printf '%s' "$arg" >"$STATE/runner-user";;
+      --mount) source=\${arg#*src=}; source=\${source%%,*}; case "$arg" in *dst=/workspace,*) printf '%s' "$source" >"$STATE/runner-context";; *dst=/runner-bootstrap,*) printf '%s' "$source" >"$STATE/runner-bootstrap";; esac;;
+      --env) case "$arg" in WMUX_BUILD_REVISION=*) printf '%s' "\${arg#*=}" >"$STATE/runner-revision";; WMUX_E2E_BASE_URL=*) printf '%s' "\${arg#*=}" >"$STATE/runner-url";; esac;;
+    esac
+    previous=$arg
+  done
+  touch "$STATE/runner"; printf '${runnerContainerId}\n' >"$STATE/runner-id"; printf '${runnerContainerId}\n'; exit
+fi
+if [ "$1" = start ]; then
+  IFS= read -r token || exit 74; IFS= read -r registration || exit 75
+  if ctl runner-token-log; then printf '%s\n' "$token"; fi
+  if ctl runner-result-token; then printf '%s' "$registration" >"$STATE/runner-result-secret"; fi
+  context=$(/bin/cat "$STATE/runner-context")
+  ctl e2e-drift && chmod 700 "$context/package.json"
+  ctl e2e-config-drift && chmod 700 "$context/playwright.browser.config.ts"
+  ctl e2e-dependency-drift && printf 'drift\n' >"$context/node_modules/fake/drift"
+  ctl runner-timeout && sleep 5
+  ctl runner-fail && exit 42
+  printf 'browser suite passed\n'; exit 0
+fi
+if [ "$1" = cp ]; then
+  if ctl runner-result-token; then /bin/cat "$STATE/runner-result-secret"; else printf 'safe-result-archive'; fi
+  exit 0
+fi
+if [ "$1" = rm ] && [ "$2" = -f ]; then
+  [ "$3" = '${runnerContainerId}' ] || exit 76
+  rm -f "$STATE/runner-id"
+  ctl runner-name-substituted || rm -f "$STATE/runner"
+  exit 0
+fi
 if [ "$1" = exec ]; then printf '1000\n'; exit; fi
 if [ "$1" = inspect ]; then
-  if [ "$2" != --format ]; then has container; exit; fi
+  if [ "$2" != --format ]; then case "$2" in '${runnerContainerId}') has runner-id;; *-e2e-*) has runner;; *) has container;; esac; exit; fi
+  if [ "$3" = '{{.Id}}' ]; then
+    case "$4" in
+      '${runnerContainerId}')
+        [ -f "$STATE/runner-id" ] && /bin/cat "$STATE/runner-id"
+        exit 0
+        ;;
+      *-e2e-*)
+        if ctl runner-name-substituted; then
+          printf '%s\n' '${"e".repeat(64)}'
+        elif [ -f "$STATE/runner-name" ] && [ -f "$STATE/runner-id" ]; then
+          /bin/cat "$STATE/runner-id"
+        fi
+        exit 0
+        ;;
+    esac
+    exit 0
+  fi
+  if [ "$4" = '${runnerContainerId}' ]; then
+    node -e 'const fs=require("node:fs"),s=process.argv[1],control=process.argv[2];const get=n=>fs.readFileSync(s+"/runner-"+n,"utf8");const [uid,gid]=get("user").split(":").map(Number);const p=fs.readFileSync(s+"/project","utf8"),r=get("revision"),name=get("name"),url=get("url"),ctx=get("context"),boot=get("bootstrap"),net=p+"_default";const hm=[{Type:"bind",Source:ctx,Target:"/workspace",ReadOnly:true},{Type:"bind",Source:boot,Target:"/runner-bootstrap",ReadOnly:true}];const mounts=[{Type:"bind",Source:ctx,Destination:"/workspace",Mode:"ro",RW:false,Propagation:"rprivate"},{Type:"bind",Source:boot,Destination:"/runner-bootstrap",Mode:"ro",RW:false,Propagation:"rprivate"}];const opt=(mode,size)=>"rw,nosuid,nodev,noexec,mode="+mode+",size="+size+",uid="+uid+",gid="+gid;const h={Binds:null,CapDrop:["ALL"],DeviceRequests:null,Devices:[],IpcMode:"private",Init:true,LogConfig:{Type:"local",Config:{"max-file":"1","max-size":"4m"}},Memory:2147483648,MemorySwap:2147483648,Mounts:hm,NanoCpus:2000000000,NetworkMode:net,PidMode:"",PidsLimit:512,PortBindings:{},Privileged:false,ReadonlyRootfs:true,RestartPolicy:{Name:"no"},SecurityOpt:["no-new-privileges:true"],ShmSize:536870912,Tmpfs:{"/home/wmux":opt("700",134217728),"/tmp":opt("1777",536870912),"/run":opt("755",8388608)},UsernsMode:"",VolumesFrom:null};const labels={"org.opencontainers.image.revision":r,"wmux.staging.e2e":"true","wmux.staging.project":p};const env=["PATH=/usr/bin:/bin","PLAYWRIGHT_BROWSERS_PATH=/ms-playwright","HOME=/home/wmux","TMPDIR=/tmp","XDG_CACHE_HOME=/home/wmux/.cache","WMUX_BUILD_REVISION="+r,"WMUX_E2E_BASE_URL="+url];const value={Id:"${runnerContainerId}",Image:"${runnerImageId}",Name:"/"+name,Config:{Cmd:["run"],Entrypoint:["/runner-bootstrap"],Env:env,Image:"${runnerImage}",Labels:labels,User:get("user"),WorkingDir:"/workspace"},HostConfig:h,NetworkSettings:{Networks:{[net]:{NetworkID:"${networkId}"}},Ports:{}},Mounts:mounts};if(control==="privileged")h.Privileged=true;if(control==="host-pid")h.PidMode="host";if(control==="device")h.Devices=[{PathOnHost:"/dev/null"}];if(control==="mount")hm[0].Source="/etc";if(control==="network")h.NetworkMode="host";if(control==="port")h.PortBindings={"80/tcp":[{HostPort:"80"}]};if(control==="limit")h.Memory=0;if(control==="token-env")value.Config.Env.push("WMUX_E2E_TOKEN=forbidden");process.stdout.write(JSON.stringify(value))' "$STATE" "$(for control in privileged host-pid device mount network port limit token-env; do ctl runner-inspect-$control && { printf '%s' "$control"; break; }; done)"; exit
+  fi
   case "$3" in *State.Health.Status*) printf 'healthy\n';; *'{{.Image}}'*) printf '${imageId}\n';; *'"HostConfig"'*)
     node -e 'const [cid,nid,iid,p,r,host,port,portMode]=process.argv.slice(1);const binding=[{HostIp:host,HostPort:port}];const h={Binds:null,CapDrop:["ALL"],DeviceRequests:null,Devices:[],IpcMode:"private",LogConfig:{Type:"local",Config:{"max-file":"3","max-size":"10m"}},Memory:1073741824,MemorySwap:1073741824,NanoCpus:2000000000,NetworkMode:p+"_default",PidMode:"",PidsLimit:512,PortBindings:{"3478/tcp":binding},Privileged:false,ReadonlyRootfs:true,RestartPolicy:{Name:"no"},SecurityOpt:["no-new-privileges:true"],Tmpfs:{"/home/node/.wmux":"rw,nosuid,nodev,mode=700,size=268435456,uid=1000,gid=1000","/tmp":"rw,nosuid,nodev,noexec,mode=1777,size=67108864,uid=1000,gid=1000","/run":"rw,nosuid,nodev,noexec,mode=755,size=8388608,uid=1000,gid=1000"},VolumesFrom:null};process.stdout.write(JSON.stringify({Id:cid,Image:iid,Name:"/"+p+"-wmux",Config:{Image:"wmux-staging:"+r,Labels:{"com.docker.compose.project":p,"com.docker.compose.service":"wmux","org.opencontainers.image.revision":r},User:"node"},HostConfig:h,NetworkSettings:{Networks:{[p+"_default"]:{NetworkID:nid}},Ports:portMode==="null"?null:{"3478/tcp":binding}},Mounts:[]}))' "$cid" "$nid" "$iid" "$project" "$revision" "$host" "$port" "$(ctl null-realized-ports && printf null || printf bound)";; esac; exit
 fi
@@ -147,7 +217,10 @@ exit 72
 [ -z "\${WMUX_TOKEN-}\${WMUX_REGISTRATION_TOKEN-}\${WMUX_E2E_TOKEN-}\${WMUX_E2E_REGISTRATION_TOKEN-}\${WMUX_E2E_BASE_URL-}" ] || exit 91
 [ -f package.json ] && [ -f package-lock.json ] || exit 92
 printf 'npm-ci cwd=%s token=no reg=no\n' "$PWD" >>'${log}'
-mkdir -p node_modules/.bin node_modules/fake
+mkdir -p node_modules/.bin node_modules/fake node_modules/@playwright/test node_modules/playwright node_modules/playwright-core
+for package in node_modules/@playwright/test node_modules/playwright node_modules/playwright-core; do printf '{"version":"1.61.0"}\n' >"$package/package.json"; done
+[ ! -f '${state}/control-playwright-version-drift' ] || printf '{"version":"1.60.0"}\n' >node_modules/playwright-core/package.json
+[ ! -f '${state}/control-e2e-symlink-drift' ] || { rm package.json; ln -s /etc/passwd package.json; }
 cat >node_modules/fake/playwright <<'RUNNER'
 #!/bin/sh
 printf 'playwright cwd=%s rev=%s token=%s reg=%s args=%s\n' "$PWD" "\${WMUX_BUILD_REVISION-}" "$([ -n "\${WMUX_E2E_TOKEN-}" ] && printf yes || printf no)" "$([ -n "\${WMUX_E2E_REGISTRATION_TOKEN-}" ] && printf yes || printf no)" "$*" >>'${log}'
@@ -455,7 +528,7 @@ test("local build-context drift is rejected and retained for audit", () => {
   } finally { removeFixture(fixture); }
 });
 
-test("detached worktree rejects file mode, symlink, and E2E checkout drift and binds E2E to the build revision", () => {
+test("owner-local E2E context rejects source/dependency drift and runs only in the isolated container", () => {
   const fixture = makeFixture();
   let server: ChildProcess | undefined;
   try {
@@ -481,15 +554,132 @@ test("detached worktree rejects file mode, symlink, and E2E checkout drift and b
     assert.equal(e2e.status, 0, e2e.stderr);
     const log = fs.readFileSync(fixture.log, "utf8");
     const secrets = metadata(path.join(fixture.runtime, fixture.project, "staging.env"));
-    const escapedWorktree = identity.WMUX_WORKTREE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    assert.match(log, new RegExp(`npm-ci cwd=${escapedWorktree} token=no reg=no`));
-    assert.match(log, new RegExp(`playwright cwd=${escapedWorktree} rev=${fixture.revision} token=yes reg=yes args=test --config=playwright.browser.config.ts`));
+    const e2eContext = path.join(fixture.runtime, fixture.project, "e2e-context");
+    const escapedContext = e2eContext.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    assert.match(log, new RegExp(`npm-ci cwd=${escapedContext} token=no reg=no`));
+    assert.match(log, /<create>.*<--read-only>.*<--cap-drop> <ALL>.*<--network>.*_default/s);
+    assert.match(log, /<start> <-a> <-i>/);
+    assert.match(fs.readFileSync(path.join(fixture.runtime, fixture.project, "e2e-run.log"), "utf8"), /browser suite passed/);
     assert.equal(fs.existsSync(path.join(fixture.state, "canonical-playwright-executed")), false);
     assert.equal(fs.existsSync(path.join(identity.WMUX_WORKTREE, "node_modules")), false);
+    assert.equal(fs.existsSync(e2eContext), false);
+    assert.equal(fs.existsSync(path.join(fixture.state, "runner")), false);
     assert.doesNotMatch(log, /WMUX_TOKEN=|WMUX_REGISTRATION_TOKEN=/);
     assert.equal(log.includes(secrets.WMUX_TOKEN), false); assert.equal(log.includes(secrets.WMUX_REGISTRATION_TOKEN), false);
     assert.equal(run(fixture, "down").status, 0);
   } finally { server?.kill(); removeFixture(fixture); }
+});
+
+test("runner rejects image, package, inspect, output, result, and execution drift with exact cleanup", () => {
+  const fixture = makeFixture();
+  let server: ChildProcess | undefined;
+  try {
+    assert.equal(run(fixture, "up").status, 0);
+    server = startHttpFixture(fixture.directory, "ok", fixture.port);
+    const runtimeDirectory = path.join(fixture.runtime, fixture.project);
+    const secrets = metadata(path.join(runtimeDirectory, "staging.env"));
+    for (const control of [
+      "runner-image-drift", "playwright-version-drift", "e2e-symlink-drift", "runner-inspect-privileged", "runner-inspect-host-pid",
+      "runner-inspect-device", "runner-inspect-mount", "runner-inspect-network", "runner-inspect-port",
+      "runner-inspect-limit", "runner-inspect-token-env", "runner-token-log", "runner-result-token", "runner-fail",
+    ]) {
+      const controlPath = path.join(fixture.state, `control-${control}`); fs.writeFileSync(controlPath, "");
+      const result = run(fixture, "e2e");
+      assert.notEqual(result.status, 0, `${control} unexpectedly passed`);
+      assert.equal(fs.existsSync(path.join(fixture.state, "runner")), false, `${control} left runner container state`);
+      assert.equal(fs.existsSync(path.join(runtimeDirectory, "e2e-context")), false, `${control} left E2E context`);
+      assert.equal(fs.existsSync(path.join(fixture.runtime, `.lock-${fixture.project}`)), false, `${control} left operation lock`);
+      assert.equal(result.stderr.includes(secrets.WMUX_TOKEN), false, `${control} reported shared token`);
+      assert.equal(result.stderr.includes(secrets.WMUX_REGISTRATION_TOKEN), false, `${control} reported registration token`);
+      fs.rmSync(controlPath);
+    }
+    const commandLog = fs.readFileSync(fixture.log, "utf8");
+    assert.equal(commandLog.includes(secrets.WMUX_TOKEN), false);
+    assert.equal(commandLog.includes(secrets.WMUX_REGISTRATION_TOKEN), false);
+    assert.doesNotMatch(commandLog, /<--env> <WMUX_E2E_(?:TOKEN|REGISTRATION_TOKEN)=/);
+    assert.equal(run(fixture, "down").status, 0);
+  } finally { server?.kill(); removeFixture(fixture); }
+});
+
+test("bounded runner client times out without putting credentials in arguments or logs", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-runner-timeout-")); fs.chmodSync(directory, 0o700);
+  const lock = path.join(directory, ".lock-wmux-staging-timeout"); const config = path.join(lock, "docker-config");
+  const bin = path.join(directory, "bin"); const envFile = path.join(directory, "staging.env"); const logFile = path.join(directory, "e2e-run.log");
+  fs.mkdirSync(config, { recursive: true, mode: 0o700 }); fs.chmodSync(config, 0o500); fs.mkdirSync(bin, { mode: 0o700 });
+  const token = "a".repeat(64); const registration = "b".repeat(64);
+  fs.writeFileSync(envFile, `WMUX_TOKEN=${token}\nWMUX_REGISTRATION_TOKEN=${registration}\n`, { mode: 0o600 });
+  executable(path.join(bin, "docker"), "#!/bin/sh\nsleep 5\n");
+  try {
+    const started = Date.now();
+    const result = spawnSync(process.execPath, [sourcePolicy, "run-runner", envFile, logFile, "1", "direct", config, "context", "default", "runner"], {
+      encoding: "utf8", env: { PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`, HOME: process.env.HOME }, timeout: 5_000,
+    });
+    assert.notEqual(result.status, 0); assert.match(result.stderr, /bounded timeout/); assert.ok(Date.now() - started < 4_000);
+    assert.equal(result.stderr.includes(token) || result.stderr.includes(registration), false);
+    if (fs.existsSync(logFile)) {
+      const log = fs.readFileSync(logFile, "utf8"); assert.equal(log.includes(token) || log.includes(registration), false);
+    }
+  } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("runner timeout removes only the exact runner, E2E context, and operation lock", () => {
+  const fixture = makeFixture({ runnerTimeoutSeconds: 1 });
+  let server: ChildProcess | undefined;
+  try {
+    assert.equal(run(fixture, "up").status, 0);
+    server = startHttpFixture(fixture.directory, "ok", fixture.port);
+    fs.writeFileSync(path.join(fixture.state, "control-runner-timeout"), "");
+    const result = run(fixture, "e2e");
+    assert.notEqual(result.status, 0); assert.match(result.stderr, /bounded timeout|browser E2E runner failed/);
+    assert.equal(fs.existsSync(path.join(fixture.state, "runner")), false);
+    assert.equal(fs.existsSync(path.join(fixture.runtime, fixture.project, "e2e-context")), false);
+    assert.equal(fs.existsSync(path.join(fixture.runtime, `.lock-${fixture.project}`)), false);
+    const log = fs.readFileSync(fixture.log, "utf8");
+    assert.match(log, /<rm> <-f> <[0-9a-f]{64}>/);
+    assert.doesNotMatch(log, /\bprune\b|container rm|--force .*wmux-staging/);
+    fs.rmSync(path.join(fixture.state, "control-runner-timeout"));
+    assert.equal(run(fixture, "down").status, 0);
+  } finally { server?.kill(); removeFixture(fixture); }
+});
+
+test("create failure does not retain runner_created and does not perform by-name cleanup", () => {
+  const fixture = makeFixture();
+  let server: ChildProcess | undefined;
+  try {
+    assert.equal(run(fixture, "up").status, 0);
+    server = startHttpFixture(fixture.directory, "ok", fixture.port);
+    fs.writeFileSync(path.join(fixture.state, "control-runner-create-fail"), "");
+    const result = run(fixture, "e2e");
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stderr.includes("cannot create isolated E2E runner"), true);
+    assert.equal(fs.existsSync(path.join(fixture.runtime, ".lock-" + fixture.project)), false);
+    assert.equal(fs.existsSync(path.join(fixture.state, "runner")), false);
+    const log = fs.readFileSync(fixture.log, "utf8");
+    assert.doesNotMatch(log, /<rm> <-f>/);
+  } finally {
+    server?.kill();
+    removeFixture(fixture);
+  }
+});
+
+test("name substitution during runner cleanup fails and retains lock for operator attention", () => {
+  const fixture = makeFixture();
+  let server: ChildProcess | undefined;
+  try {
+    assert.equal(run(fixture, "up").status, 0);
+    server = startHttpFixture(fixture.directory, "ok", fixture.port);
+    fs.writeFileSync(path.join(fixture.state, "control-runner-name-substituted"), "");
+    const result = runRaw(fixture, "e2e");
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /operation lock retained/);
+    assert.equal(fs.existsSync(path.join(fixture.runtime, `.lock-${fixture.project}`)), true);
+    const log = fs.readFileSync(fixture.log, "utf8");
+    assert.match(log, /<rm> <-f> <[0-9a-f]{64}>/);
+    assert.equal(fs.existsSync(path.join(fixture.state, "runner")), true);
+  } finally {
+    server?.kill();
+    removeFixture(fixture);
+  }
 });
 
 test("pre-resource interruption down audits and removes identity or provision worktrees without residue", () => {
@@ -625,6 +815,7 @@ test("dedicated staging artifacts preserve exact private publish and omit produc
   const compose = fs.readFileSync(path.join(sourceRoot, "deploy/docker/docker-compose.staging.yml"), "utf8");
   const script = fs.readFileSync(path.join(sourceRoot, "scripts/wmux-docker-staging"), "utf8");
   const policy = fs.readFileSync(sourcePolicy, "utf8");
+  const bootstrap = fs.readFileSync(path.join(sourceRoot, "deploy/docker/e2e-runner-bootstrap"), "utf8");
   assert.match(compose, /WMUX_PUBLISH_HOST.*WMUX_PUBLISH_PORT/); assert.match(compose, /internal: false/); assert.match(compose, /attachable: false/);
   assert.doesNotMatch(compose, /^volumes:/m); assert.doesNotMatch(script, /docker-compose\.yml|--volumes|\bprune\b|git archive|candidate\.tar/);
   assert.match(script, /runtime_root=\$\{XDG_STATE_HOME:-\$\{HOME:\?HOME is required\}\/\.local\/state\}\/wmux\/docker-staging/);
@@ -634,8 +825,14 @@ test("dedicated staging artifacts preserve exact private publish and omit produc
   assert.match(script, /create-build-context.*"\$candidate_context".*"\$build_context"/);
   assert.match(script, /-f "\$build_context\/deploy\/docker\/docker-compose\.staging\.yml"/);
   assert.doesNotMatch(script, /pack-objects "\$isolated_repo\/objects\/pack\/pack"/);
-  assert.doesNotMatch(script, /\b(?:tar|cp)\b/);
+  assert.doesNotMatch(script, /(?:^|[;|&]\s*|\n\s*)(?:tar|cp)\s/m);
+  assert.match(script, /scan-runner-results/); assert.match(policy, /\["cp", `\$\{runnerName\}:\/tmp\/e2e-results/);
   assert.doesNotMatch(policy, /spawnSync\("(?:tar|cp)"/);
   assert.match(policy, /validateCommittedTree/); assert.match(policy, /O_EXCL/); assert.match(policy, /O_NOFOLLOW/);
   assert.match(policy, /validateCleanupWorktree/); assert.match(policy, /"worktree", "remove", "--force"/);
+  assert.match(bootstrap, /read -r WMUX_E2E_TOKEN/); assert.match(bootstrap, /read -r WMUX_E2E_REGISTRATION_TOKEN/);
+  assert.match(bootstrap, /if IFS= read -r _unexpected/);
+  assert.match(bootstrap, /exec \/workspace\/node_modules\/\.bin\/playwright test/);
+  assert.match(bootstrap, /--workers=1 --output=\/tmp\/e2e-results/);
+  assert.doesNotMatch(bootstrap, /set -x|docker|WMUX_E2E_BASE_URL=/);
 });

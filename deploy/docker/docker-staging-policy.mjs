@@ -9,6 +9,10 @@ const fail = (message) => { throw new Error(message); };
 const uid = process.getuid?.();
 if (!Number.isInteger(uid)) fail("staging policy requires a POSIX uid");
 
+const runnerImage = "mcr.microsoft.com/playwright@sha256:57b65fdc9ceabe0ef613124c7bbe2babcf9362c4d85e382fe3b03604e84b428a";
+const runnerPlaywrightVersion = "1.61.0";
+const runnerLogLimit = 4 * 1024 * 1024;
+
 const exactKeys = (value, expected, name) => {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail(`${name} must be an object`);
   const actual = Object.keys(value).sort();
@@ -373,8 +377,7 @@ const validateWorktree = (repository, root, revision, { allowNodeModules = false
   });
 };
 
-const validateE2eWorktree = (repository, root, revision) => {
-  validateWorktree(repository, root, revision, { allowNodeModules: true });
+const validatePlaywrightExecutable = (root) => {
   const executable = path.join(root, "node_modules/.bin/playwright");
   const resolvedExecutable = fs.realpathSync(executable);
   const nodeModulesRoot = `${path.resolve(root, "node_modules")}${path.sep}`;
@@ -385,13 +388,17 @@ const validateE2eWorktree = (repository, root, revision) => {
   }
 };
 
+const validateE2eWorktree = (repository, root, revision) => {
+  validateWorktree(repository, root, revision, { allowNodeModules: true });
+  validatePlaywrightExecutable(root);
+};
+
 const validateDependencyWorktree = (repository, root, revision) => {
   if (!fs.existsSync(path.join(root, "node_modules"))) fail("candidate node_modules is missing");
   validateWorktree(repository, root, revision, { allowNodeModules: true });
 };
 
-const dependencyDigest = (repository, root, revision) => {
-  validateE2eWorktree(repository, root, revision);
+const dependencyTreeDigest = (root) => {
   const dependencyRoot = path.join(root, "node_modules");
   const hash = crypto.createHash("sha256");
   const add = (value) => {
@@ -415,6 +422,136 @@ const dependencyDigest = (repository, root, revision) => {
   };
   visit(dependencyRoot);
   return hash.digest("hex");
+};
+
+const dependencyDigest = (repository, root, revision) => {
+  validateE2eWorktree(repository, root, revision);
+  return dependencyTreeDigest(root);
+};
+
+const copyCommittedTree = (repository, source, destination, revision, treeName) => {
+  const expected = validateCommittedTree(repository, source, revision, {
+    strictOwnerModes: true, name: `${treeName} source`,
+  });
+  if (fs.existsSync(destination)) fail(`${treeName} destination is not exclusive`);
+  fs.mkdirSync(destination, { mode: 0o700 });
+  const directories = new Set();
+  for (const relative of expected.keys()) {
+    let parent = path.posix.dirname(relative);
+    while (parent !== ".") { directories.add(parent); parent = path.posix.dirname(parent); }
+  }
+  for (const relative of [...directories].sort((left, right) => {
+    const depth = left.split("/").length - right.split("/").length;
+    return depth || left.localeCompare(right);
+  })) fs.mkdirSync(path.join(destination, relative), { mode: 0o700 });
+  for (const [relative, entry] of expected) {
+    const sourcePath = path.join(source, relative);
+    const destinationPath = path.join(destination, relative);
+    if (entry.mode === "120000") {
+      const target = fs.readlinkSync(sourcePath);
+      const resolvedTarget = path.resolve(path.dirname(destinationPath), target);
+      if (path.isAbsolute(target) || (resolvedTarget !== destination && !resolvedTarget.startsWith(`${destination}${path.sep}`))) {
+        fail(`${treeName} symlink escapes its root: ${relative}`);
+      }
+      fs.symlinkSync(target, destinationPath);
+      continue;
+    }
+    const sourceDescriptor = fs.openSync(sourcePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    let destinationDescriptor;
+    try {
+      const sourceStat = fs.fstatSync(sourceDescriptor);
+      const bytes = fs.readFileSync(sourceDescriptor);
+      if (!sourceStat.isFile() || hashBlobNoFilters(bytes) !== entry.object) fail(`${treeName} source changed while copying: ${relative}`);
+      destinationDescriptor = fs.openSync(destinationPath,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW ?? 0),
+        entry.mode === "100755" ? 0o700 : 0o600);
+      fs.writeFileSync(destinationDescriptor, bytes); fs.fsyncSync(destinationDescriptor);
+    } finally {
+      if (destinationDescriptor !== undefined) fs.closeSync(destinationDescriptor);
+      fs.closeSync(sourceDescriptor);
+    }
+  }
+  return expected;
+};
+
+const e2eContextKeys = [
+  "WMUX_E2E_CONTEXT", "WMUX_BUILD_REVISION", "WMUX_BUILD_TREE_DIGEST", "WMUX_E2E_CONTEXT_DEV", "WMUX_E2E_CONTEXT_INO",
+];
+
+const createE2eContext = (buildIdentityFile, repository, destination, identityFile) => {
+  const build = validateBuildContextIdentity(buildIdentityFile, repository);
+  const runtimeDirectory = path.dirname(buildIdentityFile);
+  if (destination !== path.join(runtimeDirectory, "e2e-context") || identityFile !== path.join(runtimeDirectory, "e2e-context.env")) {
+    fail("E2E context paths must use their dedicated runtime locations");
+  }
+  if (fs.existsSync(identityFile)) fail("E2E context identity is not exclusive");
+  try {
+    const expected = copyCommittedTree(repository, build.WMUX_BUILD_CONTEXT, destination, build.WMUX_BUILD_REVISION, "E2E context");
+    const stat = fs.lstatSync(destination);
+    const values = {
+      WMUX_E2E_CONTEXT: destination,
+      WMUX_BUILD_REVISION: build.WMUX_BUILD_REVISION,
+      WMUX_BUILD_TREE_DIGEST: committedTreeDigest(expected),
+      WMUX_E2E_CONTEXT_DEV: String(stat.dev), WMUX_E2E_CONTEXT_INO: String(stat.ino),
+    };
+    writeExclusive(identityFile, `${e2eContextKeys.map((key) => `${key}=${values[key]}`).join("\n")}\n`);
+  } catch (error) {
+    if (fs.existsSync(destination)) removePrivateTree(destination);
+    throw error;
+  }
+};
+
+const validateE2eContextIdentity = (identityFile, repository, allowNodeModules) => {
+  const values = readMetadata(identityFile);
+  exactKeys(values, e2eContextKeys, "E2E context identity");
+  const runtimeDirectory = path.dirname(identityFile);
+  if (identityFile !== path.join(runtimeDirectory, "e2e-context.env")
+    || values.WMUX_E2E_CONTEXT !== path.join(runtimeDirectory, "e2e-context")) fail("E2E context identity path drift");
+  const stat = fs.lstatSync(values.WMUX_E2E_CONTEXT);
+  if (String(stat.dev) !== values.WMUX_E2E_CONTEXT_DEV || String(stat.ino) !== values.WMUX_E2E_CONTEXT_INO) {
+    fail("E2E context filesystem identity changed");
+  }
+  const expected = validateCommittedTree(repository, values.WMUX_E2E_CONTEXT, values.WMUX_BUILD_REVISION, {
+    allowNodeModules, strictOwnerModes: true, name: "E2E context",
+  });
+  if (committedTreeDigest(expected) !== values.WMUX_BUILD_TREE_DIGEST) fail("E2E context source digest drift");
+  return values;
+};
+
+const validatePlaywrightVersion = (root) => {
+  const lock = JSON.parse(fs.readFileSync(path.join(root, "package-lock.json"), "utf8"));
+  for (const packageName of ["@playwright/test", "playwright", "playwright-core"]) {
+    const lockVersion = lock.packages?.[`node_modules/${packageName}`]?.version;
+    const installed = JSON.parse(fs.readFileSync(path.join(root, `node_modules/${packageName}/package.json`), "utf8")).version;
+    if (lockVersion !== runnerPlaywrightVersion || installed !== runnerPlaywrightVersion) {
+      fail(`Playwright package/image version drift for ${packageName}`);
+    }
+  }
+};
+
+const e2eDependencyKeys = [...e2eContextKeys, "WMUX_E2E_DEPENDENCY_DIGEST", "WMUX_PLAYWRIGHT_VERSION"];
+
+const sealE2eContext = (contextIdentityFile, dependencyIdentityFile, repository) => {
+  const values = validateE2eContextIdentity(contextIdentityFile, repository, true);
+  if (dependencyIdentityFile !== path.join(path.dirname(contextIdentityFile), "e2e-dependencies.env")) fail("E2E dependency identity path drift");
+  validatePlaywrightVersion(values.WMUX_E2E_CONTEXT);
+  validatePlaywrightExecutable(values.WMUX_E2E_CONTEXT);
+  const digest = dependencyTreeDigest(values.WMUX_E2E_CONTEXT);
+  const sealed = { ...values, WMUX_E2E_DEPENDENCY_DIGEST: digest, WMUX_PLAYWRIGHT_VERSION: runnerPlaywrightVersion };
+  writeExclusive(dependencyIdentityFile, `${e2eDependencyKeys.map((key) => `${key}=${sealed[key]}`).join("\n")}\n`);
+};
+
+const validateSealedE2eContext = (dependencyIdentityFile, contextIdentityFile, repository) => {
+  const sealed = readMetadata(dependencyIdentityFile);
+  exactKeys(sealed, e2eDependencyKeys, "E2E dependency identity");
+  const current = validateE2eContextIdentity(contextIdentityFile, repository, true);
+  for (const key of e2eContextKeys) if (sealed[key] !== current[key]) fail(`sealed E2E context drift for ${key}`);
+  if (sealed.WMUX_PLAYWRIGHT_VERSION !== runnerPlaywrightVersion) fail("sealed Playwright version drift");
+  validatePlaywrightVersion(current.WMUX_E2E_CONTEXT);
+  validatePlaywrightExecutable(current.WMUX_E2E_CONTEXT);
+  const digest = dependencyTreeDigest(current.WMUX_E2E_CONTEXT);
+  if (digest !== sealed.WMUX_E2E_DEPENDENCY_DIGEST) fail("E2E dependency tree digest drift");
+  return sealed;
 };
 
 const secureWorktree = (root) => {
@@ -959,6 +1096,148 @@ const validateImage = async ([imageId, revision]) => {
   }
 };
 
+const readJsonFile = (filePath, name) => {
+  validateMetadata(filePath);
+  try { return JSON.parse(fs.readFileSync(filePath, "utf8")); } catch { fail(`${name} is not valid JSON`); }
+};
+
+const validateRunnerImage = async () => {
+  const value = await parseStdinJson();
+  exactKeys(value, ["Id", "RepoDigests", "Config"], "runner image inspect");
+  if (!/^sha256:[0-9a-f]{64}$/.test(value.Id ?? "")) fail("runner image ID is invalid");
+  if (!Array.isArray(value.RepoDigests) || !value.RepoDigests.includes(runnerImage)) fail("runner image digest drift");
+  exactKeys(value.Config, ["Cmd", "Entrypoint", "Env", "Labels"], "runner image Config");
+  if (!Array.isArray(value.Config.Env) || value.Config.Env.some((entry) => /(?:TOKEN|SECRET|PASSWORD|CREDENTIAL)/i.test(entry))) {
+    fail("runner base image environment is unsafe");
+  }
+};
+
+const runnerTmpfs = (runnerUid, runnerGid) => ({
+  "/home/wmux": { flags: ["rw", "nosuid", "nodev", "noexec"], mode: 0o700, size: 134_217_728, uid: runnerUid, gid: runnerGid },
+  "/tmp": { flags: ["rw", "nosuid", "nodev", "noexec"], mode: 0o1777, size: 536_870_912, uid: runnerUid, gid: runnerGid },
+  "/run": { flags: ["rw", "nosuid", "nodev", "noexec"], mode: 0o755, size: 8_388_608, uid: runnerUid, gid: runnerGid },
+});
+
+const validateRunnerContainer = async ([project, revision, runnerName, containerId, networkName, networkId, imageId,
+  context, bootstrap, baseUrl, runnerUser, imageInspectFile]) => {
+  if (!/^\d+:\d+$/.test(runnerUser ?? "")) fail("runner user must be numeric uid:gid");
+  const [runnerUid, runnerGid] = runnerUser.split(":").map(Number);
+  const imageInspect = readJsonFile(imageInspectFile, "runner image identity");
+  const value = await parseStdinJson();
+  exactKeys(value, ["Id", "Image", "Name", "Config", "HostConfig", "NetworkSettings", "Mounts"], "runner inspect");
+  if (value.Id !== containerId || value.Image !== imageId || value.Name !== `/${runnerName}`) fail("runner container identity drift");
+  const config = value.Config;
+  exactKeys(config, ["Cmd", "Entrypoint", "Env", "Image", "Labels", "User", "WorkingDir"], "runner Config");
+  if (config.Image !== runnerImage || config.User !== runnerUser || config.WorkingDir !== "/workspace") fail("runner image/user/workdir drift");
+  exactMembers(config.Entrypoint, ["/runner-bootstrap"], "runner entrypoint");
+  exactMembers(config.Cmd, ["run"], "runner command");
+  exactMap(config.Labels, {
+    ...(imageInspect.Config.Labels ?? {}),
+    "org.opencontainers.image.revision": revision,
+    "wmux.staging.e2e": "true",
+    "wmux.staging.project": project,
+  }, "runner labels");
+  const requiredEnvironment = [
+    `HOME=/home/wmux`, `TMPDIR=/tmp`, `XDG_CACHE_HOME=/home/wmux/.cache`,
+    `WMUX_BUILD_REVISION=${revision}`, `WMUX_E2E_BASE_URL=${baseUrl}`,
+  ];
+  const inherited = imageInspect.Config?.Env;
+  if (!Array.isArray(inherited)) fail("runner image environment identity is malformed");
+  const expectedEnvironment = new Map(inherited.map((entry) => [String(entry).split("=", 1)[0], entry]));
+  for (const entry of requiredEnvironment) expectedEnvironment.set(entry.split("=", 1)[0], entry);
+  exactMembers(config.Env, [...expectedEnvironment.values()], "runner environment");
+  if (config.Env.some((entry) => /(?:^|_)(?:TOKEN|SECRET|PASSWORD|CREDENTIAL)=/i.test(entry))) fail("credential found in runner environment");
+
+  const h = value.HostConfig;
+  exactKeys(h, [
+    "Binds", "CapDrop", "DeviceRequests", "Devices", "IpcMode", "Init", "LogConfig", "Memory", "MemorySwap", "Mounts",
+    "NanoCpus", "NetworkMode", "PidMode", "PidsLimit", "PortBindings", "Privileged", "ReadonlyRootfs", "RestartPolicy",
+    "SecurityOpt", "ShmSize", "Tmpfs", "UsernsMode", "VolumesFrom",
+  ], "runner HostConfig");
+  if (h.Privileged !== false || h.ReadonlyRootfs !== true || h.PidMode !== "" || h.IpcMode !== "private"
+    || h.NetworkMode !== networkName || h.PidsLimit !== 512 || h.NanoCpus !== 2_000_000_000
+    || h.Memory !== 2_147_483_648 || h.MemorySwap !== 2_147_483_648 || h.ShmSize !== 536_870_912
+    || h.RestartPolicy?.Name !== "no" || h.UsernsMode !== "" || h.Init !== true) fail("runner namespace/resource policy drift");
+  exactMembers(h.CapDrop, ["ALL"], "runner CapDrop");
+  exactMembers(h.SecurityOpt, ["no-new-privileges:true"], "runner SecurityOpt");
+  requireEmptyList(h.Binds, "runner Binds"); requireEmptyList(h.Devices, "runner Devices");
+  requireEmptyList(h.DeviceRequests, "runner DeviceRequests"); requireEmptyList(h.VolumesFrom, "runner VolumesFrom");
+  if (h.PortBindings !== null && Object.keys(h.PortBindings).length !== 0) fail("runner ports must be empty");
+  exactKeys(h.LogConfig, ["Config", "Type"], "runner LogConfig");
+  exactMap(h.LogConfig.Config, { "max-file": "1", "max-size": "4m" }, "runner LogConfig options");
+  if (h.LogConfig.Type !== "local") fail("runner log driver drift");
+  exactKeys(h.Tmpfs, Object.keys(runnerTmpfs(runnerUid, runnerGid)), "runner Tmpfs");
+  for (const [destination, expected] of Object.entries(runnerTmpfs(runnerUid, runnerGid))) validateTmpfsOptions(h.Tmpfs[destination], expected, destination);
+  if (!Array.isArray(h.Mounts) || h.Mounts.length !== 2 || h.Mounts.some((mount) => mount.Type !== "bind" || mount.ReadOnly !== true)) {
+    fail("runner host mount policy drift");
+  }
+  const expectedMounts = new Map([[context, "/workspace"], [bootstrap, "/runner-bootstrap"]]);
+  for (const mount of h.Mounts) if (expectedMounts.get(mount.Source) !== mount.Target) fail("runner host mount substitution detected");
+  exactMembers(value.Mounts.map((mount) => `${mount.Type}:${mount.Source}:${mount.Destination}:${mount.RW}:${mount.Propagation}`), [
+    `bind:${context}:/workspace:false:rprivate`, `bind:${bootstrap}:/runner-bootstrap:false:rprivate`,
+  ], "runner realized mounts");
+  exactKeys(value.NetworkSettings, ["Networks", "Ports"], "runner NetworkSettings");
+  exactKeys(value.NetworkSettings.Networks, [networkName], "runner attached networks");
+  if (value.NetworkSettings.Networks[networkName].NetworkID !== networkId) fail("runner network ID drift");
+  if (value.NetworkSettings.Ports !== null && Object.keys(value.NetworkSettings.Ports).length !== 0) fail("runner realized ports must be empty");
+};
+
+const dockerInvocation = (mode, dockerConfig, selector, endpoint, dockerArgs) => {
+  if (!['direct', 'sudo'].includes(mode) || !['context', 'host'].includes(selector)) fail("invalid runner Docker selector");
+  validateDockerConfigPath(path.dirname(dockerConfig), dockerConfig);
+  const selection = selector === "host" ? ["--host", endpoint] : ["--context", endpoint];
+  const cleanEnvironment = {
+    PATH: process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    HOME: process.env.HOME ?? "/nonexistent", LC_ALL: "C", LANG: "C", DOCKER_CONFIG: dockerConfig,
+  };
+  if (mode === "direct") return { command: "docker", args: [...selection, ...dockerArgs], env: cleanEnvironment };
+  return {
+    command: "sudo",
+    args: ["-n", "env", "-i", `PATH=${cleanEnvironment.PATH}`, "HOME=/root", "LC_ALL=C", "LANG=C",
+      `DOCKER_CONFIG=${dockerConfig}`, "docker", ...selection, ...dockerArgs],
+    env: { PATH: cleanEnvironment.PATH, HOME: cleanEnvironment.HOME },
+  };
+};
+
+const containsCredential = (bytes, token, registrationToken) => bytes.includes(Buffer.from(token)) || bytes.includes(Buffer.from(registrationToken));
+
+const runRunner = (metadataFile, logFile, timeoutText, mode, dockerConfig, selector, endpoint, runnerName) => {
+  const metadata = readMetadata(metadataFile);
+  const token = metadata.WMUX_TOKEN; const registrationToken = metadata.WMUX_REGISTRATION_TOKEN;
+  if (!/^[0-9a-f]{64}$/.test(token ?? "") || !/^[0-9a-f]{64}$/.test(registrationToken ?? "") || token === registrationToken) fail("runner credential metadata is invalid");
+  const timeout = Number(timeoutText);
+  if (!Number.isInteger(timeout) || timeout < 1 || timeout > 3600) fail("runner timeout is invalid");
+  if (logFile !== path.join(path.dirname(metadataFile), "e2e-run.log")) fail("runner log path drift");
+  if (fs.existsSync(logFile)) { validateMetadata(logFile); fs.unlinkSync(logFile); }
+  const invocation = dockerInvocation(mode, dockerConfig, selector, endpoint, ["start", "-a", "-i", runnerName]);
+  const result = spawnSync(invocation.command, invocation.args, {
+    env: invocation.env, input: `${token}\n${registrationToken}\n`, timeout: timeout * 1000,
+    maxBuffer: runnerLogLimit,
+  });
+  const stdout = Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.alloc(0);
+  const stderr = Buffer.isBuffer(result.stderr) ? result.stderr : Buffer.alloc(0);
+  if (containsCredential(stdout, token, registrationToken) || containsCredential(stderr, token, registrationToken)) {
+    try { fs.unlinkSync(logFile); } catch {}
+    fail("credential material detected in runner output; output quarantined");
+  }
+  const combined = Buffer.concat([stdout, stderr]);
+  writeExclusive(logFile, combined.subarray(0, runnerLogLimit));
+  if (result.error?.code === "ETIMEDOUT") fail("runner exceeded its bounded timeout");
+  if (result.error) fail("runner output exceeded its bounded capture or Docker start failed");
+  if (result.status !== 0) fail(`runner exited with status ${result.status ?? "unknown"}`);
+};
+
+const scanRunnerResults = (metadataFile, mode, dockerConfig, selector, endpoint, runnerName) => {
+  const metadata = readMetadata(metadataFile);
+  const invocation = dockerInvocation(mode, dockerConfig, selector, endpoint, ["cp", `${runnerName}:/tmp/e2e-results/.`, "-"]);
+  const result = spawnSync(invocation.command, invocation.args, { env: invocation.env, timeout: 60_000, maxBuffer: 128 * 1024 * 1024 });
+  if (result.error || result.status !== 0) fail("runner results could not be scanned");
+  if (containsCredential(result.stdout ?? Buffer.alloc(0), metadata.WMUX_TOKEN, metadata.WMUX_REGISTRATION_TOKEN)
+    || containsCredential(result.stderr ?? Buffer.alloc(0), metadata.WMUX_TOKEN, metadata.WMUX_REGISTRATION_TOKEN)) {
+    fail("credential material detected in runner results; results quarantined");
+  }
+};
+
 const [command, ...args] = process.argv.slice(2);
 try {
   switch (command) {
@@ -974,10 +1253,15 @@ try {
     case "validate-e2e-worktree": validateE2eWorktree(...args); break;
     case "validate-dependency-worktree": validateDependencyWorktree(...args); break;
     case "dependency-digest": process.stdout.write(`${dependencyDigest(...args)}\n`); break;
+    case "runner-image": process.stdout.write(`${runnerImage}\n`); break;
+    case "runner-playwright-version": process.stdout.write(`${runnerPlaywrightVersion}\n`); break;
     case "validate-source-checkout": validateSourceCheckout(...args); break;
     case "secure-worktree": secureWorktree(args[0]); break;
     case "create-build-context": createBuildContext(...args); break;
     case "validate-build-context": emitBuildContextIdentity(...args); break;
+    case "create-e2e-context": createE2eContext(...args); break;
+    case "seal-e2e-context": sealE2eContext(...args); break;
+    case "validate-e2e-context": validateSealedE2eContext(...args); break;
     case "new-run-id": process.stdout.write(`${crypto.randomBytes(8).toString("hex")}\n`); break;
     case "validate-dockerfile": validateDockerfile(args[0]); break;
     case "create-metadata": createMetadata(args[0], args.slice(1)); break;
@@ -993,6 +1277,10 @@ try {
     case "validate-container": await validateContainer(args); break;
     case "validate-network": await validateNetwork(args); break;
     case "validate-image": await validateImage(args); break;
+    case "validate-runner-image": await validateRunnerImage(args); break;
+    case "validate-runner-container": await validateRunnerContainer(args); break;
+    case "run-runner": runRunner(...args); break;
+    case "scan-runner-results": scanRunnerResults(...args); break;
     default: fail(`unknown staging policy command: ${command ?? ""}`);
   }
 } catch (error) {

@@ -120,7 +120,9 @@ using the production Compose project, state, credentials, port, service, or
 configuration. It may be run from any directory. Every invocation requires an
 explicit private IPv4 publish address and an explicit high port; the wrapper
 uses the same publish-address validator as the image and rejects port `3478`.
-There are no host, Docker socket, SSH, or home-directory mounts.
+The staged wmux service has no host, Docker socket, SSH, or home-directory
+mounts; the one-shot runner's two owner-local read-only inputs are described
+below.
 
 Choose a currently unused private address/port pair and keep the project name
 for the lifetime of the staging installation:
@@ -144,17 +146,51 @@ never its credential. `smoke` requires a healthy container, checks public
 health and authenticated bootstrap responses, verifies the expected candidate
 revision and `groupSidebarSessionsByHost: true`, and confirms the exact
 ephemeral mounts, bridge network, read-only root, resource limits, logging,
-dropped capabilities, and `no-new-privileges`. `e2e` first runs that smoke gate and then points the
-existing browser-only desktop/mobile Chromium suite at the staged URL.
-Before any staging credential enters a process environment, `e2e` revalidates
-the candidate manifests and runs a clean
-`npm ci --ignore-scripts --no-audit --no-fund` inside the detached worktree with
-a private npm home/cache. It then validates that only the owner-only
-`node_modules` dependency tree was added and invokes that tree's own Playwright
-executable against the candidate config/tests. Canonical-checkout
-`node_modules` is never used by authenticated staging tests. Source is checked
-again before cleanup, and audited `down` removes the dependency tree together
-with the detached worktree.
+dropped capabilities, and `no-new-privileges`. `e2e` first runs that smoke gate,
+then runs the existing browser-only desktop/mobile Chromium suite in a separate
+one-shot container. It never executes a browser or installs browser libraries on
+the Docker host.
+
+The runner image is the official Playwright image pinned by manifest digest:
+`mcr.microsoft.com/playwright@sha256:57b65fdc9ceabe0ef613124c7bbe2babcf9362c4d85e382fe3b03604e84b428a`.
+That digest was selected for the repository's Playwright `1.61.0` dependency;
+the policy rejects either image-digest drift or installed/locked Playwright
+package-version drift. The image ID observed during the original Haswell
+verification began `sha256:753f`; the manifest digest, rather than that
+daemon-local image ID, is the durable identity.
+
+Before any staging credential is supplied, `e2e` revalidates the candidate and
+copies the already validated owner-local build mirror into a new private
+`<runtime>/e2e-context` without reading the shared `/mnt` worktree. It runs
+`env -i npm ci --ignore-scripts --no-audit --no-fund` there with private npm
+home/cache directories, validates source bytes/modes against the candidate,
+pins the complete dependency-tree digest, and checks it again after execution.
+The canonical checkout and detached provenance worktree never gain
+`node_modules`. The E2E context and npm directories are removed after success,
+failure, timeout, or a handled signal.
+
+The runner is created before credentials are delivered and its exact inspect
+model is policy-checked: a revision-derived unique name and labels, numeric
+non-root host-owner UID/GID, read-only root, all capabilities dropped,
+`no-new-privileges`, Docker's default seccomp profile, default private PID and
+explicit private IPC namespaces, no devices/ports/restart policy, 2 CPUs, 2 GiB
+memory and matching memory-plus-swap limit, 512 PIDs, bounded tmpfs/shm, and a
+single bounded local log. Its only host mounts are the E2E context and its fixed
+bootstrap, both read-only and sourced below the owner-local runtime. It joins
+the exact recorded staging bridge and receives only the exact private staging
+URL and non-secret revision/runtime variables in container metadata.
+
+The fixed bootstrap accepts exactly two line-delimited credentials on stdin
+from `docker start -a -i`, exports them only in the runner process, and execs the
+context's Playwright binary with one worker and fixed Chromium projects/output.
+Tokens are never Docker arguments, environment options, labels, mounts, image
+layers, or reported output. Attached output is captured to a mode-`600`, 4 MiB
+bounded runtime log instead of the terminal. Both that stream and the bounded
+`/tmp/e2e-results` archive are scanned for either credential before any result
+is reported; a match is reported generically and the affected ephemeral
+material is removed with the exact runner container. The same exact-container
+cleanup runs after test failure or timeout—there is no prune or project-wide
+runner cleanup.
 
 `up` verifies the launcher's bytes against committed `HEAD`, refuses tracked or
 staged checkout changes, and has no dirty-tree override. It copies the pinned
@@ -191,7 +227,8 @@ The mode-`600` environment containing independently generated shared and
 registration tokens is stored below the durable owner-local
 `${XDG_STATE_HOME:-$HOME/.local/state}/wmux/docker-staging` hierarchy, never
 `/tmp` or shared root-squashed storage. Override this with an absolute
-`WMUX_STAGING_RUNTIME_ROOT` when another approved durable location is required.
+owner-local, non-`/mnt` `WMUX_STAGING_RUNTIME_ROOT` when another approved
+durable location is required; `e2e` rejects shared `/mnt` runtime paths.
 When Docker access requires `sudo`, that override must be on a root-readable
 local filesystem so root can read the empty `DOCKER_CONFIG`, protected Compose
 metadata, and verified build mirror; the shared owner-only worktree is never a
@@ -232,7 +269,8 @@ every capability, enables `no-new-privileges`, and bounds the container at 2
 CPUs, 1 GiB memory with the memory-plus-swap ceiling also at 1 GiB, 512
 processes, and three 10 MiB local log files.
 
-There are no Docker volumes or host-backed mounts. `/home/node/.wmux` is a
+The staged wmux service has no Docker volumes or host-backed mounts.
+`/home/node/.wmux` is a
 bounded 256 MiB tmpfs; `/tmp` and `/run` are bounded 64 MiB and 8 MiB no-exec
 tmpfs mounts. All staging settings, workspaces, sessions, generated credentials,
 and durable-shell state inside the container are intentionally lost whenever
@@ -249,6 +287,10 @@ credentials in this container. The wrapper still permits exactly one bridge and
 one private host/port binding, and live policy verifies the bridge driver,
 non-internal/non-attachable flags, attached network, and realized port. Docker
 image build networking remains under the Docker builder's normal policy.
+The one-shot E2E runner uses this same reviewed bridge so it can reach the
+private published staging URL. It therefore also has Docker-default outbound
+access; these controls isolate host resources and credentials but do not claim
+adversarial egress isolation. Run only reviewed, committed candidates.
 
 Resource discovery checks project labels and exact container/network names
 independently and also refuses any project-labeled or legacy exact-name volume.

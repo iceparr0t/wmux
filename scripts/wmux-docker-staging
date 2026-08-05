@@ -67,7 +67,7 @@ case "$full_revision:$short_revision" in *[!0-9a-f:]*) die "Git returned a non-c
 launcher_blob=$(git_cmd rev-parse "$full_revision:scripts/wmux-docker-staging" 2>/dev/null) || die "staging launcher is not committed at HEAD"
 actual_launcher_blob=$(git_cmd hash-object --no-filters "$script_dir/wmux-docker-staging" 2>/dev/null) || die "cannot hash staging launcher"
 [ "$launcher_blob" = "$actual_launcher_blob" ] || die "staging launcher bytes differ from committed HEAD"
-for trusted_path in deploy/docker/docker-staging-policy.mjs deploy/docker/docker-bind-host.mjs deploy/docker/docker-staging-smoke.mjs; do
+for trusted_path in deploy/docker/docker-staging-policy.mjs deploy/docker/docker-bind-host.mjs deploy/docker/docker-staging-smoke.mjs deploy/docker/e2e-runner-bootstrap; do
   trusted_blob=$(git_cmd rev-parse "$full_revision:$trusted_path" 2>/dev/null) || die "$trusted_path is not committed at HEAD"
   actual_trusted_blob=$(git_cmd hash-object --no-filters "$repo_root/$trusted_path" 2>/dev/null) || die "cannot hash $trusted_path"
   [ "$trusted_blob" = "$actual_trusted_blob" ] || die "$trusted_path bytes differ from committed HEAD"
@@ -216,6 +216,38 @@ lock_owned=0
 inspect_output=
 docker_config=
 docker_sudo_marker=$lock_dir/.docker-sudo-used
+runner_created=0
+runner_container_id=
+runner_name=
+runner_image_inspect=
+e2e_context=
+e2e_context_file=
+e2e_dependency_file=
+npm_home=
+npm_cache=
+
+remove_runner() {
+  [ "$runner_created" = 1 ] || return 0
+  [ -n "$runner_container_id" ] || return 1
+  docker_cmd rm -f "$runner_container_id" >/dev/null 2>&1 || return 1
+  if docker_cmd inspect "$runner_container_id" >/dev/null 2>&1; then return 1; fi
+  if [ -n "$runner_name" ] && docker_cmd inspect "$runner_name" >/dev/null 2>&1; then
+    if [ -n "$(docker_cmd inspect --format '{{.Id}}' "$runner_name" 2>/dev/null)" ]; then return 1; fi
+  fi
+  runner_created=0
+}
+
+remove_e2e_local() {
+  for private_tree in "$e2e_context" "$npm_home" "$npm_cache"; do
+    [ -n "$private_tree" ] && [ -e "$private_tree" ] || continue
+    node_cmd "$policy" remove-private-tree "$private_tree" || return 1
+  done
+  for private_file in "$e2e_context_file" "$e2e_dependency_file" "$runner_image_inspect"; do
+    [ -n "$private_file" ] && [ -e "$private_file" ] || continue
+    node_cmd "$policy" validate-metadata "$private_file" || return 1
+    rm -f "$private_file" || return 1
+  done
+}
 
 remove_docker_config() {
   [ -n "$docker_config" ] && [ -e "$docker_config" ] || return 0
@@ -240,9 +272,12 @@ release_docker_client() {
 }
 
 cleanup() {
+  cleanup_failed=0
+  remove_runner 2>/dev/null || cleanup_failed=1
+  remove_e2e_local 2>/dev/null || cleanup_failed=1
   [ -z "$inspect_output" ] || rm -f "$inspect_output"
-  remove_docker_config 2>/dev/null || true
-  if [ "$lock_owned" = 1 ]; then
+  remove_docker_config 2>/dev/null || cleanup_failed=1
+  if [ "$lock_owned" = 1 ] && [ "$cleanup_failed" = 0 ]; then
     rmdir "$lock_dir" 2>/dev/null || true
     lock_owned=0
   fi
@@ -555,45 +590,92 @@ case "$command_name" in
     clean_candidate
     run_smoke
     [ "${WMUX_STAGING_LAUNCH_HEAD-}" = "$full_revision" ] || die "E2E launcher HEAD does not equal WMUX_BUILD_REVISION"
+    e2e_context=$runtime_dir/e2e-context
+    e2e_context_file=$runtime_dir/e2e-context.env
+    e2e_dependency_file=$runtime_dir/e2e-dependencies.env
     npm_home=$runtime_dir/npm-home
     npm_cache=$runtime_dir/npm-cache
+    case "$runtime_dir" in /mnt|/mnt/*) die "E2E runtime must be owner-local and outside /mnt" ;; esac
+    [ ! -e "$e2e_context" ] && [ ! -e "$e2e_context_file" ] && [ ! -e "$e2e_dependency_file" ] \
+      || die "stale E2E context exists; evidence retained"
+    node_cmd "$policy" create-e2e-context "$build_context_file" "$isolated_repo" "$e2e_context" "$e2e_context_file" \
+      || die "cannot create verified owner-local E2E context"
     node_cmd "$policy" prepare-private-dir "$npm_home" || die "cannot create private E2E npm home"
     node_cmd "$policy" prepare-private-dir "$npm_cache" || die "cannot create private E2E npm cache"
     install_status=0
     (
-      cd "$candidate_context"
+      cd "$e2e_context"
       exec env -i PATH="$tool_path" HOME="$npm_home" npm_config_cache="$npm_cache" LC_ALL=C LANG=C \
         npm ci --ignore-scripts --no-audit --no-fund
     ) || install_status=$?
     if [ "$install_status" -ne 0 ]; then
-      if [ -d "$candidate_context/node_modules" ]; then
-        node_cmd "$policy" validate-dependency-worktree "$isolated_repo" "$candidate_context" "$full_revision" \
-          || die "failed dependency install left unsafe worktree drift; evidence retained"
-      fi
-      clean_candidate
+      remove_e2e_local || die "failed dependency install left unsafe E2E context; lock retained"
       die "candidate dependency install failed with status $install_status"
     fi
-    node_cmd "$policy" validate-e2e-worktree "$isolated_repo" "$candidate_context" "$full_revision" \
+    node_cmd "$policy" seal-e2e-context "$e2e_context_file" "$e2e_dependency_file" "$isolated_repo" \
       || die "candidate E2E dependency validation failed; evidence retained"
-    dependency_digest=$(node_cmd "$policy" dependency-digest "$isolated_repo" "$candidate_context" "$full_revision") \
-      || die "cannot bind candidate E2E dependency identity"
-    token=$(env_value "$env_file" WMUX_TOKEN); registration_token=$(env_value "$env_file" WMUX_REGISTRATION_TOKEN)
-    e2e_status=0
-    (
-      cd "$candidate_context"
-      exec env -i PATH="$candidate_context/node_modules/.bin:$tool_path" HOME="$npm_home" LC_ALL=C LANG=C \
-        PLAYWRIGHT_BROWSERS_PATH="${HOME:?HOME is required}/.cache/ms-playwright" \
-        NO_PROXY='*' no_proxy='*' WMUX_BUILD_REVISION="$full_revision" WMUX_E2E_BASE_URL="$base_url" \
-        WMUX_E2E_TOKEN="$token" WMUX_E2E_REGISTRATION_TOKEN="$registration_token" \
-        "$candidate_context/node_modules/.bin/playwright" test --config=playwright.browser.config.ts \
-          --project=chromium --project=mobile-chromium --output="$runtime_dir/e2e-results"
-    ) || e2e_status=$?
-    node_cmd "$policy" validate-e2e-worktree "$isolated_repo" "$candidate_context" "$full_revision" \
-      || die "candidate E2E changed source or dependency boundaries; evidence retained"
-    [ "$(node_cmd "$policy" dependency-digest "$isolated_repo" "$candidate_context" "$full_revision")" = "$dependency_digest" ] \
-      || die "candidate E2E dependency tree changed while credentials were present; evidence retained"
+    node_cmd "$policy" validate-e2e-context "$e2e_dependency_file" "$e2e_context_file" "$isolated_repo" >/dev/null \
+      || die "sealed E2E context validation failed before runner creation"
+
+    runner_image=$(node_cmd "$policy" runner-image) || die "cannot resolve pinned E2E runner image"
+    docker_cmd pull "$runner_image" >/dev/null || die "cannot pull digest-pinned E2E runner image"
+    runner_image_inspect=$runtime_dir/e2e-runner-image.json
+    ( umask 077; docker_cmd image inspect --format '{"Id":{{json .Id}},"RepoDigests":{{json .RepoDigests}},"Config":{"Cmd":{{json .Config.Cmd}},"Entrypoint":{{json .Config.Entrypoint}},"Env":{{json .Config.Env}},"Labels":{{json .Config.Labels}}}}' "$runner_image" >"$runner_image_inspect" ) \
+      || die "cannot inspect digest-pinned E2E runner image"
+    node_cmd "$policy" validate-metadata "$runner_image_inspect" || die "runner image evidence is unsafe"
+    node_cmd "$policy" validate-runner-image <"$runner_image_inspect" || die "E2E runner image digest policy failed"
+    runner_image_id=$(node -e 'const fs=require("node:fs");process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).Id)' "$runner_image_inspect") \
+      || die "cannot read validated runner image ID"
+    runner_run_id=$(node_cmd "$policy" new-run-id) || die "cannot generate E2E runner identity"
+    runner_name=$project-e2e-$short_revision-$runner_run_id
+    runner_user=$(id -u):$(id -g)
+    runner_bootstrap=$e2e_context/deploy/docker/e2e-runner-bootstrap
+    if docker_cmd inspect "$runner_name" >/dev/null 2>&1; then die "generated E2E runner name already exists"; fi
+    runner_container_id=$(docker_cmd create \
+      --name "$runner_name" \
+      --label "org.opencontainers.image.revision=$full_revision" \
+      --label "wmux.staging.e2e=true" --label "wmux.staging.project=$project" \
+      --user "$runner_user" --workdir /workspace --entrypoint /runner-bootstrap \
+      --read-only --cap-drop ALL --security-opt no-new-privileges:true --ipc private --init \
+      --network "$network_name" --memory 2g --memory-swap 2g --cpus 2 --pids-limit 512 --shm-size 512m \
+      --tmpfs "/home/wmux:rw,nosuid,nodev,noexec,mode=0700,size=128m,uid=$(id -u),gid=$(id -g)" \
+      --tmpfs "/tmp:rw,nosuid,nodev,noexec,mode=1777,size=512m,uid=$(id -u),gid=$(id -g)" \
+      --tmpfs "/run:rw,nosuid,nodev,noexec,mode=0755,size=8m,uid=$(id -u),gid=$(id -g)" \
+      --log-driver local --log-opt max-size=4m --log-opt max-file=1 --restart no \
+      --mount "type=bind,src=$e2e_context,dst=/workspace,readonly,bind-propagation=rprivate" \
+      --mount "type=bind,src=$runner_bootstrap,dst=/runner-bootstrap,readonly,bind-propagation=rprivate" \
+      --env HOME=/home/wmux --env TMPDIR=/tmp --env XDG_CACHE_HOME=/home/wmux/.cache \
+      --env "WMUX_BUILD_REVISION=$full_revision" --env "WMUX_E2E_BASE_URL=$base_url" \
+      "$runner_image" run) || die "cannot create isolated E2E runner"
+    case "$runner_container_id" in *[!0-9a-f]*|'') die "Docker returned an invalid E2E runner container ID" ;; esac
+    [ "${#runner_container_id}" -eq 64 ] || die "Docker returned a non-canonical E2E runner container ID"
+    runner_created=1
+    inspect_output=$(mktemp "$runtime_dir/.e2e-inspect.XXXXXX")
+    docker_cmd inspect --format '{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Config":{"Cmd":{{json .Config.Cmd}},"Entrypoint":{{json .Config.Entrypoint}},"Env":{{json .Config.Env}},"Image":{{json .Config.Image}},"Labels":{{json .Config.Labels}},"User":{{json .Config.User}},"WorkingDir":{{json .Config.WorkingDir}}},"HostConfig":{"Binds":{{json .HostConfig.Binds}},"CapDrop":{{json .HostConfig.CapDrop}},"DeviceRequests":{{json .HostConfig.DeviceRequests}},"Devices":{{json .HostConfig.Devices}},"IpcMode":{{json .HostConfig.IpcMode}},"Init":{{json .HostConfig.Init}},"LogConfig":{{json .HostConfig.LogConfig}},"Memory":{{json .HostConfig.Memory}},"MemorySwap":{{json .HostConfig.MemorySwap}},"Mounts":{{json .HostConfig.Mounts}},"NanoCpus":{{json .HostConfig.NanoCpus}},"NetworkMode":{{json .HostConfig.NetworkMode}},"PidMode":{{json .HostConfig.PidMode}},"PidsLimit":{{json .HostConfig.PidsLimit}},"PortBindings":{{json .HostConfig.PortBindings}},"Privileged":{{json .HostConfig.Privileged}},"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"RestartPolicy":{{json .HostConfig.RestartPolicy}},"SecurityOpt":{{json .HostConfig.SecurityOpt}},"ShmSize":{{json .HostConfig.ShmSize}},"Tmpfs":{{json .HostConfig.Tmpfs}},"UsernsMode":{{json .HostConfig.UsernsMode}},"VolumesFrom":{{json .HostConfig.VolumesFrom}}},"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}},"Ports":{{json .NetworkSettings.Ports}}},"Mounts":{{json .Mounts}}}' "$runner_container_id" >"$inspect_output" \
+      || die "cannot inspect isolated E2E runner"
+    node_cmd "$policy" validate-runner-container "$project" "$full_revision" "$runner_name" "$runner_container_id" \
+      "$network_name" "$(env_value "$live_file" WMUX_NETWORK_ID)" "$runner_image_id" "$e2e_context" "$runner_bootstrap" \
+      "$base_url" "$runner_user" "$runner_image_inspect" <"$inspect_output" \
+      || die "isolated E2E runner inspect policy failed before credential delivery"
+    rm -f "$inspect_output"; inspect_output=
+
+    runner_status=0
+    node_cmd "$policy" run-runner "$env_file" "$runtime_dir/e2e-run.log" 1800 "$docker_mode" "$docker_config" \
+      "$docker_selector" "$( [ "$docker_selector" = host ] && printf '%s' "$docker_endpoint" || printf '%s' "$docker_context" )" "$runner_name" \
+      || runner_status=$?
+    result_scan_status=0
+    node_cmd "$policy" scan-runner-results "$env_file" "$docker_mode" "$docker_config" "$docker_selector" \
+      "$( [ "$docker_selector" = host ] && printf '%s' "$docker_endpoint" || printf '%s' "$docker_context" )" "$runner_name" \
+      || result_scan_status=$?
+    context_status=0
+    node_cmd "$policy" validate-e2e-context "$e2e_dependency_file" "$e2e_context_file" "$isolated_repo" >/dev/null || context_status=$?
+    remove_runner || die "failed to remove exact E2E runner; operation lock retained"
+    remove_e2e_local || die "failed to clean exact E2E context; operation lock retained"
     clean_candidate
-    [ "$e2e_status" -eq 0 ] || die "browser E2E failed with status $e2e_status"
+    [ "$runner_status" -eq 0 ] || die "browser E2E runner failed"
+    [ "$result_scan_status" -eq 0 ] || die "browser E2E result credential scan failed"
+    [ "$context_status" -eq 0 ] || die "candidate E2E source or dependency tree changed while credentials were present"
+    printf '%s\n' "staging browser E2E passed for $project at $base_url"
     ;;
   down)
     select_docker

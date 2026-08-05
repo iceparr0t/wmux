@@ -1,0 +1,27 @@
+#!/bin/sh
+set -eu
+
+[ "$#" -eq 1 ] && [ "$1" = run ] || exit 64
+
+credential_error() {
+  printf '%s\n' 'wmux staging E2E credential input rejected' >&2
+  exit 64
+}
+
+IFS= read -r WMUX_E2E_TOKEN || credential_error
+IFS= read -r WMUX_E2E_REGISTRATION_TOKEN || credential_error
+if IFS= read -r _unexpected; then credential_error; fi
+
+case "$WMUX_E2E_TOKEN" in ''|*[!0-9a-f]* ) credential_error ;; esac
+case "$WMUX_E2E_REGISTRATION_TOKEN" in ''|*[!0-9a-f]* ) credential_error ;; esac
+[ "${#WMUX_E2E_TOKEN}" -eq 64 ] || credential_error
+[ "${#WMUX_E2E_REGISTRATION_TOKEN}" -eq 64 ] || credential_error
+[ "$WMUX_E2E_TOKEN" != "$WMUX_E2E_REGISTRATION_TOKEN" ] || credential_error
+[ -n "${WMUX_E2E_BASE_URL-}" ] || credential_error
+
+export WMUX_E2E_TOKEN WMUX_E2E_REGISTRATION_TOKEN
+unset _unexpected
+exec /workspace/node_modules/.bin/playwright test \
+  --config=playwright.browser.config.ts \
+  --project=chromium --project=mobile-chromium \
+  --workers=1 --output=/tmp/e2e-results
