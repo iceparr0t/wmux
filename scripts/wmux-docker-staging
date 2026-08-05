@@ -98,8 +98,6 @@ case "$project" in *[!a-z0-9-]*|*-|*--*|*production*|*prod*) die "WMUX_STAGING_P
 
 if [ -n "${WMUX_STAGING_RUNTIME_ROOT-}" ]; then
   runtime_root=$WMUX_STAGING_RUNTIME_ROOT
-elif [ -d /mnt/storage/sw_projects/.workspace ]; then
-  runtime_root=/mnt/storage/sw_projects/.workspace/deployments/wmux-staging
 else
   runtime_root=${XDG_STATE_HOME:-${HOME:?HOME is required}/.local/state}/wmux/docker-staging
 fi
@@ -158,9 +156,21 @@ if [ -z "${WMUX_STAGING_INTERNAL_IDENTITY-}" ] && [ -z "${WMUX_STAGING_INTERNAL_
       GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 git -c core.hooksPath=/dev/null init -q --bare --template= "$isolated_repo" \
       || die "cannot initialize isolated repository; evidence retained"
     chmod -R go-rwx "$isolated_repo"
-    pack_base=$isolated_repo/objects/pack/pack
-    printf '%s\n' "$full_revision" | git_cmd pack-objects "$pack_base" --revs >/dev/null \
-      || die "cannot copy committed objects into isolated repository; evidence retained"
+    object_revs=$(mktemp "$runtime_dir/.object-revs.XXXXXX") || die "cannot create local object revision list; evidence retained"
+    object_pack=$(mktemp "$runtime_dir/.objects.XXXXXX") || die "cannot create local object pack; evidence retained"
+    cleanup_object_copy() { rm -f "$object_revs" "$object_pack"; }
+    trap 'cleanup_object_copy' EXIT
+    trap 'cleanup_object_copy; trap - EXIT; exit 129' HUP
+    trap 'cleanup_object_copy; trap - EXIT; exit 130' INT
+    trap 'cleanup_object_copy; trap - EXIT; exit 143' TERM
+    printf '%s\n' "$full_revision" >"$object_revs" \
+      || die "cannot prepare committed object revision list; evidence retained"
+    git_cmd pack-objects --stdout --revs <"$object_revs" >"$object_pack" \
+      || die "cannot produce committed object pack; evidence retained"
+    isolated_git index-pack --stdin <"$object_pack" >/dev/null \
+      || die "cannot ingest committed object pack into isolated repository; evidence retained"
+    cleanup_object_copy
+    trap - EXIT HUP INT TERM
     isolated_git cat-file -e "$full_revision^{commit}" || die "isolated repository lacks the pinned commit; evidence retained"
     isolated_git update-ref refs/wmux/candidate "$full_revision" || die "cannot pin isolated candidate ref; evidence retained"
     [ ! -e "$candidate_context" ] || die "generated staging worktree path already exists; evidence retained"

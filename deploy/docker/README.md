@@ -178,12 +178,14 @@ Docker client uses a new empty owner-only config for every locked operation, and
 all standard upper/lowercase proxy build arguments are explicitly empty.
 
 The mode-`600` environment containing independently generated shared and
-registration tokens is stored below the durable
-`/mnt/storage/sw_projects/.workspace/deployments/wmux-staging` hierarchy when
-the managed workspace exists. The durable fallback is
-`${XDG_STATE_HOME:-$HOME/.local/state}/wmux/docker-staging`, never `/tmp`.
-Override this with an absolute `WMUX_STAGING_RUNTIME_ROOT` when another approved
-durable location is required. Every path component is owner/mode/symlink
+registration tokens is stored below the durable owner-local
+`${XDG_STATE_HOME:-$HOME/.local/state}/wmux/docker-staging` hierarchy, never
+`/tmp` or shared root-squashed storage. Override this with an absolute
+`WMUX_STAGING_RUNTIME_ROOT` when another approved durable location is required.
+When Docker access requires `sudo`, that override must be on a root-readable
+local filesystem so root can read the empty `DOCKER_CONFIG`; the directory and
+all staging secrets remain owner-only (`0700` directories and `0600` files).
+Every path component is owner/mode/symlink
 validated, each project operation owns an exclusive lock, and metadata is
 created once with exclusive no-follow semantics. A protected identity record
 pins the isolated repository, detached worktree, Git administrative directory,

@@ -48,6 +48,7 @@ function makeFixture() {
   fs.chmodSync(directory, 0o700);
   const repository = path.join(directory, "source");
   const runtime = path.join(directory, "runtime");
+  const stateHome = path.join(directory, "state-home");
   const state = path.join(directory, "docker-state");
   const bin = path.join(directory, "bin");
   const log = path.join(directory, "commands.log");
@@ -143,7 +144,7 @@ ln -s ../fake/playwright node_modules/.bin/playwright
     WMUX_STAGING_PUBLISH_HOST: privateHost, WMUX_STAGING_PUBLISH_PORT: port, WMUX_STAGING_RUNTIME_ROOT: runtime,
     WMUX_STAGING_WORKTREE_ROOT: approvedWorktreeRoot,
   };
-  return { directory, repository, runtime, state, bin, log, project, revision, port, environment, script: path.join(repository, "scripts/wmux-docker-staging") };
+  return { directory, repository, runtime, stateHome, state, bin, log, project, revision, port, environment, script: path.join(repository, "scripts/wmux-docker-staging") };
 }
 
 const run = (fixture: Fixture, command: string, changes: NodeJS.ProcessEnv = {}) => spawnSync("/bin/sh", [fixture.script, command], {
@@ -190,6 +191,21 @@ test("bootstrap rejects modified launcher and tracked or staged source drift", (
       assert.match(result.stderr, kind === "launcher" ? /launcher bytes differ/ : kind === "staged" ? /staged checkout changes/ : /tracked checkout changes/);
     } finally { removeFixture(fixture); }
   }
+});
+
+test("default staging root is owner-local state even when the managed shared workspace exists", () => {
+  const fixture = makeFixture();
+  try {
+    const defaultRuntime = path.join(fixture.stateHome, "wmux", "docker-staging");
+    const result = run(fixture, "up", {
+      WMUX_STAGING_RUNTIME_ROOT: "",
+      XDG_STATE_HOME: fixture.stateHome,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.existsSync(path.join(defaultRuntime, fixture.project, "identity.env")), true);
+    assert.equal(fs.existsSync(path.join(fixture.runtime, fixture.project)), false);
+    assert.equal(run(fixture, "down", { WMUX_STAGING_RUNTIME_ROOT: "", XDG_STATE_HOME: fixture.stateHome }).status, 0);
+  } finally { removeFixture(fixture); }
 });
 
 test("detached worktree rejects file mode, symlink, and E2E checkout drift and binds E2E to the build revision", () => {
@@ -351,5 +367,10 @@ test("dedicated staging artifacts preserve exact private publish and omit produc
   const policy = fs.readFileSync(sourcePolicy, "utf8");
   assert.match(compose, /WMUX_PUBLISH_HOST.*WMUX_PUBLISH_PORT/); assert.match(compose, /internal: true/);
   assert.doesNotMatch(compose, /^volumes:/m); assert.doesNotMatch(script, /docker-compose\.yml|--volumes|\bprune\b|git archive|candidate\.tar/);
+  assert.match(script, /runtime_root=\$\{XDG_STATE_HOME:-\$\{HOME:\?HOME is required\}\/\.local\/state\}\/wmux\/docker-staging/);
+  assert.doesNotMatch(script, /\.workspace\/deployments\/wmux-staging/);
+  assert.match(script, /git_cmd pack-objects --stdout --revs <"\$object_revs" >"\$object_pack"/);
+  assert.match(script, /isolated_git index-pack --stdin <"\$object_pack"/);
+  assert.doesNotMatch(script, /pack-objects "\$isolated_repo\/objects\/pack\/pack"/);
   assert.match(policy, /validateCleanupWorktree/); assert.match(policy, /"worktree", "remove", "--force"/);
 });
