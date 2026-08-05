@@ -351,10 +351,11 @@ validate_build_context_if_present() {
   fi
 }
 
-compose() {
+compose() (
+  cd "$build_context" || die "cannot enter verified local build context"
   docker_cmd compose --project-name "$project" --env-file "$env_file" \
     -f "$build_context/deploy/docker/docker-compose.staging.yml" "$@"
-}
+)
 
 query_resources() {
   project_containers=$(docker_cmd ps -aq --no-trunc --filter "label=com.docker.compose.project=$project") || die "failed to query project containers"

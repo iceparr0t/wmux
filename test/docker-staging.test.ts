@@ -79,7 +79,7 @@ function makeFixture() {
 
   executable(path.join(bin, "docker"), `#!/bin/sh
 LOG='${log}'; STATE='${state}'
-{ printf 'docker'; for arg in "$@"; do printf ' <%s>' "$arg"; done; printf '\n'; } >>"$LOG"
+{ printf 'docker cwd=<%s>' "$PWD"; for arg in "$@"; do printf ' <%s>' "$arg"; done; printf '\n'; } >>"$LOG"
 ctl() { [ -f "$STATE/control-$1" ]; }; has() { [ -f "$STATE/$1" ]; }
 val() { [ -f "$STATE/control-$1" ] && /bin/cat "$STATE/control-$1"; }
 [ -n "\${DOCKER_CONFIG-}" ] && [ -d "$DOCKER_CONFIG" ] || exit 60
@@ -246,6 +246,10 @@ test("sudo Compose uses only the verified owner-local mirror, never the root-squ
     const log = fs.readFileSync(fixture.log, "utf8");
     const escapedMirror = buildIdentity.WMUX_BUILD_CONTEXT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const escapedWorktree = identity.WMUX_WORKTREE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const composeCwds = [...log.matchAll(/docker cwd=<([^>]+)>.* <compose>/g)].map((match) => match[1]);
+    assert.ok(composeCwds.length > 0, log);
+    assert.ok(composeCwds.every((cwd) => cwd === buildIdentity.WMUX_BUILD_CONTEXT), log);
+    assert.ok(composeCwds.every((cwd) => cwd !== identity.WMUX_WORKTREE && cwd !== os.tmpdir()), log);
     assert.match(log, new RegExp(`compose.*-f.*${escapedMirror}/deploy/docker/docker-compose\\.staging\\.yml`));
     assert.doesNotMatch(log, new RegExp(escapedWorktree));
     const down = run(fixture, "down");
