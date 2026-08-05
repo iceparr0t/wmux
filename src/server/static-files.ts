@@ -24,6 +24,8 @@ const contentType = (filePath: string): string => {
   if (filePath.endsWith(".css")) return "text/css";
   if (filePath.endsWith(".woff")) return "font/woff";
   if (filePath.endsWith(".woff2")) return "font/woff2";
+  if (filePath.endsWith(".png")) return "image/png";
+  if (filePath.endsWith(".svg")) return "image/svg+xml";
   if (filePath.endsWith(".wasm")) return "application/wasm";
   return "application/octet-stream";
 };
