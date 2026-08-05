@@ -110,6 +110,8 @@ node_cmd "$policy" validate-worktree-root "$worktree_root" || die "staging workt
 runtime_dir=$runtime_root/$project
 identity_file=$runtime_dir/identity.env
 provision_file=$runtime_dir/provision.env
+build_context=$runtime_dir/build-context
+build_context_file=$runtime_dir/build-context.env
 
 exec_committed_launcher() {
   node_cmd "$policy" validate-identity "$identity_file" >/dev/null || die "isolated repository/worktree identity validation failed; evidence retained"
@@ -181,6 +183,8 @@ if [ -z "${WMUX_STAGING_INTERNAL_IDENTITY-}" ] && [ -z "${WMUX_STAGING_INTERNAL_
       || die "detached worktree differs from pinned commit; evidence retained"
     node_cmd "$policy" create-identity "$identity_file" "$isolated_repo" "$candidate_context" "$full_revision" "$launcher_blob" \
       || die "cannot record isolated repository/worktree identity; evidence retained"
+    node_cmd "$policy" create-build-context "$isolated_repo" "$candidate_context" "$build_context" "$full_revision" "$build_context_file" \
+      || die "cannot create verified local build context; evidence retained"
     exec_committed_launcher
   fi
 fi
@@ -241,6 +245,8 @@ runtime_dir=$runtime_root/$project
 env_file=$runtime_dir/staging.env
 live_file=$runtime_dir/live.env
 [ -n "${candidate_context-}" ] || candidate_context=$runtime_dir/candidate
+build_context=$runtime_dir/build-context
+build_context_file=$runtime_dir/build-context.env
 base_url=http://$publish_host:$publish_port
 container_name=$project-wmux
 network_name=${project}_default
@@ -334,9 +340,20 @@ require_daemon_identity() {
   fi
 }
 
+validate_build_context_if_present() {
+  if [ -e "$build_context" ] || [ -e "$build_context_file" ]; then
+    [ -d "$build_context" ] && [ -f "$build_context_file" ] || die "incomplete local build context; evidence retained"
+    [ -n "${isolated_repo-}" ] || die "local build context has no isolated repository identity; evidence retained"
+    node_cmd "$policy" validate-build-context "$build_context_file" "$isolated_repo" >/dev/null \
+      || die "local build context identity validation failed; evidence retained"
+    [ "$(env_value "$build_context_file" WMUX_BUILD_REVISION)" = "$full_revision" ] \
+      || die "local build context revision mismatch; evidence retained"
+  fi
+}
+
 compose() {
   docker_cmd compose --project-name "$project" --env-file "$env_file" \
-    -f "$candidate_context/deploy/docker/docker-compose.staging.yml" "$@"
+    -f "$build_context/deploy/docker/docker-compose.staging.yml" "$@"
 }
 
 query_resources() {
@@ -357,14 +374,20 @@ require_unused_project() {
 }
 
 validate_candidate() {
-  [ "$(env_value "$env_file" WMUX_BUILD_CONTEXT)" = "$candidate_context" ] || die "candidate context path mismatch"
+  [ "$(env_value "$env_file" WMUX_BUILD_CONTEXT)" = "$build_context" ] || die "build context path mismatch"
+  [ "$(env_value "$env_file" WMUX_BUILD_CONTEXT_IDENTITY)" = "$build_context_file" ] || die "build context identity path mismatch"
   [ "$(env_value "$env_file" WMUX_IDENTITY_PATH)" = "$identity_file" ] || die "candidate identity path mismatch"
   [ "$(env_value "$env_file" WMUX_BUILD_REVISION)" = "$full_revision" ] || die "candidate revision mismatch"
   node_cmd "$policy" validate-identity "$identity_file" >/dev/null || die "candidate identity validation failed; evidence retained"
   node_cmd "$policy" validate-worktree "$isolated_repo" "$candidate_context" "$full_revision" \
     || die "candidate worktree validation failed"
-  node_cmd "$policy" validate-dockerfile "$candidate_context/deploy/docker/Dockerfile" \
-    || die "candidate Dockerfile validation failed"
+  node_cmd "$policy" validate-build-context "$build_context_file" "$isolated_repo" >/dev/null \
+    || die "local build context identity validation failed; evidence retained"
+  [ "$(env_value "$build_context_file" WMUX_BUILD_REVISION)" = "$full_revision" ] || die "local build context revision mismatch"
+  [ "$(env_value "$build_context_file" WMUX_BUILD_TREE_DIGEST)" = "$(env_value "$env_file" WMUX_BUILD_TREE_DIGEST)" ] \
+    || die "local build context digest mismatch"
+  node_cmd "$policy" validate-dockerfile "$build_context/deploy/docker/Dockerfile" \
+    || die "local build-context Dockerfile validation failed"
 }
 
 clean_candidate() {
@@ -376,13 +399,15 @@ clean_materialized_candidate() {
   git_cmd clean -ffdx >/dev/null || die "failed to clean detached candidate worktree"
   node_cmd "$policy" validate-worktree "$isolated_repo" "$candidate_context" "$full_revision" \
     || die "candidate worktree validation failed"
-  node_cmd "$policy" validate-dockerfile "$candidate_context/deploy/docker/Dockerfile" \
-    || die "candidate Dockerfile validation failed"
+  node_cmd "$policy" validate-build-context "$build_context_file" "$isolated_repo" >/dev/null \
+    || die "local build context identity validation failed; evidence retained"
+  node_cmd "$policy" validate-dockerfile "$build_context/deploy/docker/Dockerfile" \
+    || die "local build-context Dockerfile validation failed"
 }
 
 validate_compose() {
   compose config --format json | node_cmd "$policy" validate-compose \
-    "$project" "$candidate_context" "$publish_host" "$publish_port" \
+    "$project" "$build_context" "$publish_host" "$publish_port" \
     "$(env_value "$env_file" WMUX_IMAGE)" "$(env_value "$env_file" WMUX_BUILD_REVISION)" \
     "$(env_value "$env_file" WMUX_BUILD_VERSION)" "$base_url" "$env_file" \
     || die "dedicated staging Compose policy validation failed"
@@ -433,7 +458,8 @@ create_candidate() {
   clean_materialized_candidate
   node_cmd "$policy" create-metadata "$env_file" \
     "$project" "wmux-staging:$full_revision" "staging-$short_revision" "$full_revision" \
-    "$candidate_context" "$identity_file" "$publish_host" "$publish_port" "$base_url" \
+    "$build_context" "$build_context_file" "$(env_value "$build_context_file" WMUX_BUILD_TREE_DIGEST)" \
+    "$identity_file" "$publish_host" "$publish_port" "$base_url" \
     "$docker_mode" "$docker_context" "$docker_endpoint" "$docker_engine_id" \
     || die "failed to create exclusive staging metadata"
 }
@@ -465,6 +491,16 @@ run_smoke() {
   node_cmd "$smoke_helper" "$base_url" "$env_file" "$full_revision" || die "bounded staging HTTP smoke failed"
   printf '%s\n' "staging smoke passed for $project at $base_url"
 }
+
+case "$command_name" in
+  up)
+    if [ -n "${WMUX_STAGING_INTERNAL_IDENTITY-}" ]; then
+      [ -d "$build_context" ] && [ -f "$build_context_file" ] || die "verified local build context is missing; evidence retained"
+    fi
+    validate_build_context_if_present
+    ;;
+  status|smoke|e2e|down) validate_build_context_if_present ;;
+esac
 
 case "$command_name" in
   up)

@@ -69,6 +69,7 @@ function makeFixture() {
   fs.writeFileSync(path.join(repository, "package-lock.json"), '{"name":"candidate","lockfileVersion":3,"requires":true,"packages":{"":{"name":"candidate"}}}\n');
   fs.writeFileSync(path.join(repository, "playwright.browser.config.ts"), "export default {};\n");
   fs.writeFileSync(path.join(repository, ".gitattributes"), "*.sh text eol=lf\nscripts/** text eol=lf\n");
+  fs.symlinkSync("package.json", path.join(repository, "fixture-link"));
   git(repository, "init", "-q");
   git(repository, "-c", "user.name=wmux-test", "-c", "user.email=wmux@example.invalid", "add", ".");
   git(repository, "-c", "user.name=wmux-test", "-c", "user.email=wmux@example.invalid", "commit", "-qm", "fixture");
@@ -84,6 +85,8 @@ val() { [ -f "$STATE/control-$1" ] && /bin/cat "$STATE/control-$1"; }
 [ -n "\${DOCKER_CONFIG-}" ] && [ -d "$DOCKER_CONFIG" ] || exit 60
 [ -z "$(/bin/ls -A "$DOCKER_CONFIG")" ] || exit 61
 [ -z "\${NODE_OPTIONS-}\${TAR_OPTIONS-}\${GIT_DIR-}\${GIT_WORK_TREE-}\${HTTP_PROXY-}\${http_proxy-}" ] || exit 62
+if ctl sudo-only && [ "\${WMUX_TEST_SUDO-}" != 1 ]; then exit 59; fi
+for arg in "$@"; do case "$arg" in '${approvedWorktreeRoot}'/*) exit 58;; esac; done
 if [ "$1" = context ] && [ "$2" = show ]; then printf 'default\n'; exit; fi
 if [ "$1" = context ] && [ "$2" = inspect ]; then printf 'unix:///var/run/docker.sock\n'; exit; fi
 if [ "$1" = --context ] || [ "$1" = --host ]; then shift 2; fi
@@ -100,11 +103,11 @@ if [ "$1" = compose ]; then
     *' config --format json '*)
       node -e '
         const fs=require("node:fs");const file=process.argv[1];const env=Object.fromEntries(fs.readFileSync(file,"utf8").trim().split("\\n").map(line=>{const i=line.indexOf("=");return [line.slice(0,i),line.slice(i+1)]}));
-        fs.writeFileSync(process.argv[2],env.WMUX_BUILD_REVISION);fs.writeFileSync(process.argv[3],env.COMPOSE_PROJECT_NAME);fs.writeFileSync(process.argv[4],env.WMUX_PUBLISH_HOST);fs.writeFileSync(process.argv[5],env.WMUX_PUBLISH_PORT);
+        if(env.WMUX_BUILD_CONTEXT.startsWith("${approvedWorktreeRoot}/"))process.exit(58);fs.writeFileSync(process.argv[2],env.WMUX_BUILD_REVISION);fs.writeFileSync(process.argv[3],env.COMPOSE_PROJECT_NAME);fs.writeFileSync(process.argv[4],env.WMUX_PUBLISH_HOST);fs.writeFileSync(process.argv[5],env.WMUX_PUBLISH_PORT);fs.writeFileSync(process.argv[6],env.WMUX_BUILD_CONTEXT);
         const proxy={ALL_PROXY:"",FTP_PROXY:"",HTTPS_PROXY:"",HTTP_PROXY:"",NO_PROXY:"",all_proxy:"",ftp_proxy:"",http_proxy:"",https_proxy:"",no_proxy:""};
         const service={build:{context:env.WMUX_BUILD_CONTEXT,dockerfile:"deploy/docker/Dockerfile",args:{...proxy,WMUX_REVISION:env.WMUX_BUILD_REVISION,WMUX_VERSION:env.WMUX_BUILD_VERSION}},cap_drop:["ALL"],command:null,container_name:env.COMPOSE_PROJECT_NAME+"-wmux",cpus:2,entrypoint:null,environment:{WMUX_BROWSER_AUTH_MODE:"shared-or-login",WMUX_HOST:"",WMUX_PORT:"3478",WMUX_PUBLIC_URL:env.WMUX_PUBLIC_URL,WMUX_PUBLISH_HOST:env.WMUX_PUBLISH_HOST,WMUX_REGISTRATION_TOKEN:env.WMUX_REGISTRATION_TOKEN,WMUX_TOKEN:env.WMUX_TOKEN},image:env.WMUX_IMAGE,init:true,ipc:"private",logging:{driver:"local",options:{"max-file":"3","max-size":"10m"}},mem_limit:1073741824,memswap_limit:1073741824,networks:{default:null},pid:"private",pids_limit:512,ports:[{mode:"ingress",host_ip:env.WMUX_PUBLISH_HOST,target:3478,published:env.WMUX_PUBLISH_PORT,protocol:"tcp"}],read_only:true,restart:"no",security_opt:["no-new-privileges:true"],tmpfs:["/home/node/.wmux:rw,nosuid,nodev,mode=0700,size=256m,uid=1000,gid=1000","/tmp:rw,nosuid,nodev,noexec,mode=1777,size=64m,uid=1000,gid=1000","/run:rw,nosuid,nodev,noexec,mode=0755,size=8m,uid=1000,gid=1000"],user:"node"};
         process.stdout.write(JSON.stringify({name:env.COMPOSE_PROJECT_NAME,networks:{default:{name:env.COMPOSE_PROJECT_NAME+"_default",driver:"bridge",ipam:{},internal:true}},services:{wmux:service}}));
-      ' "$env_file" "$STATE/revision" "$STATE/project" "$STATE/host" "$STATE/port";;
+      ' "$env_file" "$STATE/revision" "$STATE/project" "$STATE/host" "$STATE/port" "$STATE/build-context";;
     *' up -d --build '*) touch "$STATE/container" "$STATE/network" "$STATE/image";;
     *' ps '*) has container && printf 'Up (healthy)\n';;
     *' down --remove-orphans '*) rm -f "$STATE/container" "$STATE/network";;
@@ -137,7 +140,15 @@ RUNNER
 chmod 700 node_modules/fake/playwright
 ln -s ../fake/playwright node_modules/.bin/playwright
 `);
-  executable(path.join(bin, "sudo"), "#!/bin/sh\nexit 1\n");
+  executable(path.join(bin, "sudo"), `#!/bin/sh
+[ "$1" = -n ] || exit 81
+shift
+[ "$1" = env ] || exit 82
+shift
+[ "$1" = -i ] || exit 83
+shift
+exec env -i WMUX_TEST_SUDO=1 "$@"
+`);
   const port = String(20_000 + Math.floor(Math.random() * 20_000));
   const environment: NodeJS.ProcessEnv = {
     ...process.env, PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`, WMUX_STAGING_PROJECT: project,
@@ -173,7 +184,13 @@ test("bootstrap ignores source attributes, filters, replace refs, untracked file
     const result = run(fixture, "up", { NODE_OPTIONS: "--invalid", TAR_OPTIONS: "--delete", GIT_DIR: hostile, GIT_WORK_TREE: hostile, GIT_OBJECT_DIRECTORY: hostile, GIT_ALTERNATE_OBJECT_DIRECTORIES: hostile });
     assert.equal(result.status, 0, `${result.stderr}\n${fs.existsSync(fixture.log) ? fs.readFileSync(fixture.log, "utf8") : ""}`);
     const identity = metadata(path.join(fixture.runtime, fixture.project, "identity.env"));
+    const buildIdentity = metadata(path.join(fixture.runtime, fixture.project, "build-context.env"));
     assert.equal(fs.existsSync(path.join(identity.WMUX_WORKTREE, "source-untracked-secret")), false);
+    assert.equal(fs.existsSync(path.join(buildIdentity.WMUX_BUILD_CONTEXT, "source-untracked-secret")), false);
+    assert.equal(fs.existsSync(path.join(buildIdentity.WMUX_BUILD_CONTEXT, ".git")), false);
+    assert.equal(fs.existsSync(path.join(buildIdentity.WMUX_BUILD_CONTEXT, "node_modules")), false);
+    assert.equal(fs.lstatSync(path.join(buildIdentity.WMUX_BUILD_CONTEXT, "scripts/wmux-docker-staging")).mode & 0o777, 0o700);
+    assert.equal(fs.readlinkSync(path.join(buildIdentity.WMUX_BUILD_CONTEXT, "fixture-link")), "package.json");
     assert.equal(git(identity.WMUX_WORKTREE, "rev-parse", "HEAD"), fixture.revision);
     { const down = run(fixture, "down"); assert.equal(down.status, 0, down.stderr); }
   } finally { removeFixture(fixture); }
@@ -205,6 +222,74 @@ test("default staging root is owner-local state even when the managed shared wor
     assert.equal(fs.existsSync(path.join(defaultRuntime, fixture.project, "identity.env")), true);
     assert.equal(fs.existsSync(path.join(fixture.runtime, fixture.project)), false);
     assert.equal(run(fixture, "down", { WMUX_STAGING_RUNTIME_ROOT: "", XDG_STATE_HOME: fixture.stateHome }).status, 0);
+  } finally { removeFixture(fixture); }
+});
+
+test("sudo Compose uses only the verified owner-local mirror, never the root-squashed worktree", () => {
+  const fixture = makeFixture();
+  try {
+    fs.writeFileSync(path.join(fixture.state, "control-sudo-only"), "");
+    const up = run(fixture, "up");
+    assert.equal(up.status, 0, `${up.stderr}\n${fs.existsSync(fixture.log) ? fs.readFileSync(fixture.log, "utf8") : ""}`);
+    const runtimeDirectory = path.join(fixture.runtime, fixture.project);
+    const identity = metadata(path.join(runtimeDirectory, "identity.env"));
+    const buildIdentity = metadata(path.join(runtimeDirectory, "build-context.env"));
+    const staging = metadata(path.join(runtimeDirectory, "staging.env"));
+    assert.equal(fs.lstatSync(identity.WMUX_WORKTREE).mode & 0o777, 0o700);
+    assert.equal(fs.lstatSync(buildIdentity.WMUX_BUILD_CONTEXT).mode & 0o777, 0o700);
+    assert.equal(buildIdentity.WMUX_BUILD_CONTEXT, path.join(runtimeDirectory, "build-context"));
+    assert.equal(staging.WMUX_BUILD_CONTEXT, buildIdentity.WMUX_BUILD_CONTEXT);
+    assert.equal(staging.WMUX_BUILD_TREE_DIGEST, buildIdentity.WMUX_BUILD_TREE_DIGEST);
+    assert.equal(Object.values(staging).includes(identity.WMUX_WORKTREE), false);
+    assert.equal(staging.WMUX_DOCKER_MODE, "sudo");
+    assert.equal(fs.readFileSync(path.join(fixture.state, "build-context"), "utf8"), buildIdentity.WMUX_BUILD_CONTEXT);
+    const log = fs.readFileSync(fixture.log, "utf8");
+    const escapedMirror = buildIdentity.WMUX_BUILD_CONTEXT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escapedWorktree = identity.WMUX_WORKTREE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    assert.match(log, new RegExp(`compose.*-f.*${escapedMirror}/deploy/docker/docker-compose\\.staging\\.yml`));
+    assert.doesNotMatch(log, new RegExp(escapedWorktree));
+    const down = run(fixture, "down");
+    assert.equal(down.status, 0, down.stderr);
+    assert.equal(fs.existsSync(runtimeDirectory), false);
+    assert.equal(fs.existsSync(identity.WMUX_WORKTREE), false);
+  } finally { removeFixture(fixture); }
+});
+
+test("local build-context drift is rejected and retained for audit", () => {
+  const fixture = makeFixture();
+  try {
+    const up = run(fixture, "up");
+    assert.equal(up.status, 0, up.stderr);
+    const runtimeDirectory = path.join(fixture.runtime, fixture.project);
+    const identity = metadata(path.join(runtimeDirectory, "identity.env"));
+    const buildIdentityPath = path.join(runtimeDirectory, "build-context.env");
+    const buildIdentity = metadata(buildIdentityPath);
+    const mirror = buildIdentity.WMUX_BUILD_CONTEXT;
+    const packagePath = path.join(mirror, "package.json");
+    const composePath = path.join(mirror, "deploy/docker/docker-compose.staging.yml");
+
+    fs.chmodSync(packagePath, 0o400);
+    assert.match(run(fixture, "status").stderr, /local build context owner mode drift/);
+    fs.chmodSync(packagePath, 0o600);
+
+    const untracked = path.join(mirror, "untracked");
+    fs.writeFileSync(untracked, "drift\n", { mode: 0o600 });
+    assert.match(run(fixture, "status").stderr, /local build context paths differ/);
+    fs.unlinkSync(untracked);
+
+    const composeBytes = fs.readFileSync(composePath);
+    fs.unlinkSync(composePath); fs.symlinkSync("/etc/passwd", composePath);
+    assert.match(run(fixture, "status").stderr, /local build context (file type drift|symlink is absolute)/);
+    fs.unlinkSync(composePath); fs.writeFileSync(composePath, composeBytes, { mode: 0o600 });
+
+    fs.appendFileSync(packagePath, "drift\n");
+    assert.match(run(fixture, "status").stderr, /local build context blob drift/);
+    fs.copyFileSync(path.join(identity.WMUX_WORKTREE, "package.json"), packagePath);
+    fs.chmodSync(packagePath, 0o600);
+
+    assert.equal(fs.existsSync(runtimeDirectory), true);
+    assert.equal(fs.existsSync(buildIdentityPath), true);
+    assert.equal(run(fixture, "down").status, 0);
   } finally { removeFixture(fixture); }
 });
 
@@ -371,6 +456,11 @@ test("dedicated staging artifacts preserve exact private publish and omit produc
   assert.doesNotMatch(script, /\.workspace\/deployments\/wmux-staging/);
   assert.match(script, /git_cmd pack-objects --stdout --revs <"\$object_revs" >"\$object_pack"/);
   assert.match(script, /isolated_git index-pack --stdin <"\$object_pack"/);
+  assert.match(script, /create-build-context.*"\$candidate_context".*"\$build_context"/);
+  assert.match(script, /-f "\$build_context\/deploy\/docker\/docker-compose\.staging\.yml"/);
   assert.doesNotMatch(script, /pack-objects "\$isolated_repo\/objects\/pack\/pack"/);
+  assert.doesNotMatch(script, /\b(?:tar|cp)\b/);
+  assert.doesNotMatch(policy, /spawnSync\("(?:tar|cp)"/);
+  assert.match(policy, /validateCommittedTree/); assert.match(policy, /O_EXCL/); assert.match(policy, /O_NOFOLLOW/);
   assert.match(policy, /validateCleanupWorktree/); assert.match(policy, /"worktree", "remove", "--force"/);
 });

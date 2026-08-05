@@ -178,6 +178,19 @@ const parseTree = (repository, revision) => parseTreeOutput(
 
 const hashBlobNoFilters = (bytes) => git(["hash-object", "--no-filters", "--stdin"], { input: bytes }).trim();
 
+const committedTreeDigest = (entries) => {
+  const hash = crypto.createHash("sha256");
+  const add = (value) => {
+    const bytes = Buffer.from(value);
+    const length = Buffer.alloc(8); length.writeBigUInt64BE(BigInt(bytes.length));
+    hash.update(length); hash.update(bytes);
+  };
+  for (const [relative, entry] of [...entries].sort(([left], [right]) => left.localeCompare(right))) {
+    add(relative); add(entry.mode); add(entry.object);
+  }
+  return hash.digest("hex");
+};
+
 const validateSourceCheckout = (root, revision) => {
   const expected = parseTreeOutput(git(["-C", root, "ls-tree", "-rz", "--full-tree", revision], { encoding: "buffer" }));
   const indexOutput = git(["-C", root, "ls-files", "--stage", "-z"], { encoding: "buffer" });
@@ -209,13 +222,10 @@ const validateSourceCheckout = (root, revision) => {
   }
 };
 
-const validateWorktree = (repository, root, revision, { allowNodeModules = false } = {}) => {
-  validatePrivateDirectory(repository);
-  validateWorktreeRoot(path.dirname(root));
-  const rootStat = fs.lstatSync(root);
-  if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || rootStat.uid !== uid || (rootStat.mode & 0o077) !== 0) {
-    fail("candidate worktree root must be an owner-only directory");
-  }
+const validateCommittedTree = (repository, root, revision, {
+  allowNodeModules = false, ignoreRootGit = false, strictOwnerModes = false, name: treeName = "committed tree",
+} = {}) => {
+  validatePrivateDirectory(root);
   const expected = parseTree(repository, revision);
   const expectedDirectories = new Set();
   for (const relative of expected.keys()) {
@@ -246,7 +256,7 @@ const validateWorktree = (repository, root, revision, { allowNodeModules = false
   };
   const visit = (directory, relative = "") => {
     for (const name of fs.readdirSync(directory).sort()) {
-      if (!relative && name === ".git") continue;
+      if (!relative && name === ".git" && ignoreRootGit) continue;
       const childRelative = relative ? `${relative}/${name}` : name;
       const child = path.join(directory, name);
       if (!relative && name === "node_modules" && allowNodeModules) {
@@ -257,10 +267,11 @@ const validateWorktree = (repository, root, revision, { allowNodeModules = false
       }
       const stat = fs.lstatSync(child);
       if (stat.uid !== uid || (!stat.isSymbolicLink() && (stat.mode & 0o077) !== 0)) {
-        fail(`candidate worktree entry is not owner-only: ${childRelative}`);
+        fail(`${treeName} entry is not owner-only: ${childRelative}`);
       }
       if (stat.isDirectory() && !stat.isSymbolicLink()) {
-        if (!expectedDirectories.has(childRelative)) fail(`candidate worktree contains an untracked directory: ${childRelative}`);
+        if (strictOwnerModes && (stat.mode & 0o777) !== 0o700) fail(`${treeName} directory mode drift: ${childRelative}`);
+        if (!expectedDirectories.has(childRelative)) fail(`${treeName} contains an untracked directory: ${childRelative}`);
         visit(child, childRelative);
       }
       else actual.add(childRelative);
@@ -268,30 +279,41 @@ const validateWorktree = (repository, root, revision, { allowNodeModules = false
   };
   visit(root);
   if (actual.size !== expected.size || [...actual].some((entry) => !expected.has(entry))) {
-    fail("candidate worktree paths differ from the commit tree");
+    fail(`${treeName} paths differ from the commit tree`);
   }
   for (const [relative, entry] of expected) {
-    if (!actual.has(relative)) fail(`candidate worktree is missing ${relative}`);
+    if (!actual.has(relative)) fail(`${treeName} is missing ${relative}`);
     const absolute = path.join(root, relative);
     const stat = fs.lstatSync(absolute);
     let bytes;
     if (entry.mode === "120000") {
-      if (!stat.isSymbolicLink()) fail(`candidate symlink mode drift: ${relative}`);
+      if (!stat.isSymbolicLink()) fail(`${treeName} symlink mode drift: ${relative}`);
       const target = fs.readlinkSync(absolute);
-      if (path.isAbsolute(target)) fail(`candidate symlink is absolute: ${relative}`);
+      if (path.isAbsolute(target)) fail(`${treeName} symlink is absolute: ${relative}`);
       const resolvedTarget = path.resolve(path.dirname(absolute), target);
       if (resolvedTarget !== resolvedRoot && !resolvedTarget.startsWith(`${resolvedRoot}${path.sep}`)) {
-        fail(`candidate symlink escapes the worktree: ${relative}`);
+        fail(`${treeName} symlink escapes its root: ${relative}`);
       }
       bytes = Buffer.from(target);
     } else {
-      if (!stat.isFile() || stat.isSymbolicLink()) fail(`candidate file type drift: ${relative}`);
+      if (!stat.isFile() || stat.isSymbolicLink()) fail(`${treeName} file type drift: ${relative}`);
       const executable = (stat.mode & 0o111) !== 0;
-      if (executable !== (entry.mode === "100755")) fail(`candidate executable mode drift: ${relative}`);
+      if (executable !== (entry.mode === "100755")) fail(`${treeName} executable mode drift: ${relative}`);
+      const expectedMode = entry.mode === "100755" ? 0o700 : 0o600;
+      if (strictOwnerModes && (stat.mode & 0o777) !== expectedMode) fail(`${treeName} owner mode drift: ${relative}`);
       bytes = fs.readFileSync(absolute);
     }
-    if (hashBlobNoFilters(bytes) !== entry.object) fail(`candidate blob drift: ${relative}`);
+    if (hashBlobNoFilters(bytes) !== entry.object) fail(`${treeName} blob drift: ${relative}`);
   }
+  return expected;
+};
+
+const validateWorktree = (repository, root, revision, { allowNodeModules = false } = {}) => {
+  validatePrivateDirectory(repository);
+  validateWorktreeRoot(path.dirname(root));
+  return validateCommittedTree(repository, root, revision, {
+    allowNodeModules, ignoreRootGit: true, name: "candidate worktree",
+  });
 };
 
 const validateE2eWorktree = (repository, root, revision) => {
@@ -433,10 +455,127 @@ const writeExclusive = (filePath, content) => {
   }
 };
 
+const buildContextIdentityKeys = [
+  "WMUX_BUILD_CONTEXT", "WMUX_BUILD_REVISION", "WMUX_BUILD_TREE_DIGEST",
+  "WMUX_BUILD_CONTEXT_DEV", "WMUX_BUILD_CONTEXT_INO",
+];
+
+const createBuildContext = (repository, source, destination, revision, identityFile) => {
+  if (!/^[0-9a-f]{40,64}$/.test(revision ?? "")) fail("invalid build-context revision");
+  validatePrivateDirectory(repository);
+  const expected = validateWorktree(repository, source, revision);
+  const runtimeDirectory = path.dirname(destination);
+  validatePrivateDirectory(runtimeDirectory);
+  if (destination !== path.join(runtimeDirectory, "build-context")
+    || identityFile !== path.join(runtimeDirectory, "build-context.env")) {
+    fail("build-context paths must use their dedicated runtime locations");
+  }
+  if (fs.existsSync(destination) || fs.existsSync(identityFile)) fail("build-context destination is not exclusive");
+
+  let created = false;
+  try {
+    fs.mkdirSync(destination, { mode: 0o700 });
+    created = true;
+    const directories = new Set();
+    for (const relative of expected.keys()) {
+      let parent = path.posix.dirname(relative);
+      while (parent !== ".") { directories.add(parent); parent = path.posix.dirname(parent); }
+    }
+    for (const relative of [...directories].sort((left, right) => {
+      const depth = left.split("/").length - right.split("/").length;
+      return depth || left.localeCompare(right);
+    })) {
+      fs.mkdirSync(path.join(destination, relative), { mode: 0o700 });
+    }
+
+    for (const [relative, entry] of expected) {
+      const sourcePath = path.join(source, relative);
+      const destinationPath = path.join(destination, relative);
+      if (entry.mode === "120000") {
+        const target = fs.readlinkSync(sourcePath);
+        if (path.isAbsolute(target)) fail(`candidate symlink is absolute: ${relative}`);
+        const resolvedTarget = path.resolve(path.dirname(destinationPath), target);
+        if (resolvedTarget !== destination && !resolvedTarget.startsWith(`${destination}${path.sep}`)) {
+          fail(`candidate symlink escapes the build context: ${relative}`);
+        }
+        fs.symlinkSync(target, destinationPath);
+        continue;
+      }
+
+      const sourceFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+      const sourceDescriptor = fs.openSync(sourcePath, sourceFlags);
+      let destinationDescriptor;
+      try {
+        const sourceStat = fs.fstatSync(sourceDescriptor);
+        if (!sourceStat.isFile() || sourceStat.uid !== uid
+          || ((sourceStat.mode & 0o111) !== 0) !== (entry.mode === "100755")) {
+          fail(`candidate file changed while materializing: ${relative}`);
+        }
+        const bytes = fs.readFileSync(sourceDescriptor);
+        if (hashBlobNoFilters(bytes) !== entry.object) fail(`candidate blob changed while materializing: ${relative}`);
+        const destinationFlags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
+          | (fs.constants.O_NOFOLLOW ?? 0);
+        destinationDescriptor = fs.openSync(destinationPath, destinationFlags, entry.mode === "100755" ? 0o700 : 0o600);
+        fs.writeFileSync(destinationDescriptor, bytes);
+        fs.fsyncSync(destinationDescriptor);
+      } finally {
+        if (destinationDescriptor !== undefined) fs.closeSync(destinationDescriptor);
+        fs.closeSync(sourceDescriptor);
+      }
+    }
+
+    const actual = validateCommittedTree(repository, destination, revision, {
+      strictOwnerModes: true, name: "local build context",
+    });
+    const stat = fs.lstatSync(destination);
+    const values = {
+      WMUX_BUILD_CONTEXT: destination,
+      WMUX_BUILD_REVISION: revision,
+      WMUX_BUILD_TREE_DIGEST: committedTreeDigest(actual),
+      WMUX_BUILD_CONTEXT_DEV: String(stat.dev),
+      WMUX_BUILD_CONTEXT_INO: String(stat.ino),
+    };
+    writeExclusive(identityFile, `${buildContextIdentityKeys.map((key) => `${key}=${safeValue(values[key], key)}`).join("\n")}\n`);
+  } catch (error) {
+    if (created && fs.existsSync(destination)) removePrivateTree(destination);
+    throw error;
+  }
+};
+
+const validateBuildContextIdentity = (identityFile, repository) => {
+  const values = readMetadata(identityFile);
+  exactKeys(values, buildContextIdentityKeys, "build-context identity");
+  const runtimeDirectory = path.dirname(identityFile);
+  if (identityFile !== path.join(runtimeDirectory, "build-context.env")
+    || values.WMUX_BUILD_CONTEXT !== path.join(runtimeDirectory, "build-context")) {
+    fail("build-context identity path drift");
+  }
+  if (!/^[0-9a-f]{40,64}$/.test(values.WMUX_BUILD_REVISION ?? "")
+    || !/^[0-9a-f]{64}$/.test(values.WMUX_BUILD_TREE_DIGEST ?? "")) {
+    fail("invalid build-context object identity");
+  }
+  validatePrivateDirectory(repository);
+  const stat = fs.lstatSync(values.WMUX_BUILD_CONTEXT);
+  if (String(stat.dev) !== values.WMUX_BUILD_CONTEXT_DEV || String(stat.ino) !== values.WMUX_BUILD_CONTEXT_INO) {
+    fail("build-context filesystem identity changed");
+  }
+  const expected = validateCommittedTree(repository, values.WMUX_BUILD_CONTEXT, values.WMUX_BUILD_REVISION, {
+    strictOwnerModes: true, name: "local build context",
+  });
+  if (committedTreeDigest(expected) !== values.WMUX_BUILD_TREE_DIGEST) fail("build-context tree digest drift");
+  return values;
+};
+
+const emitBuildContextIdentity = (identityFile, repository) => {
+  const values = validateBuildContextIdentity(identityFile, repository);
+  process.stdout.write(`${Object.entries(values).map(([key, value]) => `${key}=${value}`).join("\n")}\n`);
+};
+
 const createMetadata = (filePath, values) => {
   const keys = [
     "COMPOSE_PROJECT_NAME", "WMUX_IMAGE", "WMUX_BUILD_VERSION", "WMUX_BUILD_REVISION",
-    "WMUX_BUILD_CONTEXT", "WMUX_IDENTITY_PATH",
+    "WMUX_BUILD_CONTEXT", "WMUX_BUILD_CONTEXT_IDENTITY", "WMUX_BUILD_TREE_DIGEST",
+    "WMUX_IDENTITY_PATH",
     "WMUX_PUBLISH_HOST", "WMUX_PUBLISH_PORT", "WMUX_PUBLIC_URL",
     "WMUX_DOCKER_MODE", "WMUX_DOCKER_CONTEXT", "WMUX_DOCKER_ENDPOINT", "WMUX_DOCKER_ENGINE_ID",
   ];
@@ -769,6 +908,8 @@ try {
     case "dependency-digest": process.stdout.write(`${dependencyDigest(...args)}\n`); break;
     case "validate-source-checkout": validateSourceCheckout(...args); break;
     case "secure-worktree": secureWorktree(args[0]); break;
+    case "create-build-context": createBuildContext(...args); break;
+    case "validate-build-context": emitBuildContextIdentity(...args); break;
     case "new-run-id": process.stdout.write(`${crypto.randomBytes(8).toString("hex")}\n`); break;
     case "validate-dockerfile": validateDockerfile(args[0]); break;
     case "create-metadata": createMetadata(args[0], args.slice(1)); break;

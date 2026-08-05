@@ -165,9 +165,15 @@ re-executes the committed launcher there. Canonical checkout attributes,
 replace refs, filters, untracked files, and archive/tool environment cannot
 alter this materialization. Every tracked path is compared to `git ls-tree`
 mode/blob identity with no-filter hashing; gitlinks and absolute or escaping
-symlinks are rejected. The same worktree is the Docker build context and E2E
-source, and is cleaned and revalidated before build and immediately before and
-after E2E. Candidate image identity, build arguments, `WMUX_BUILD_REVISION`, and
+symlinks are rejected. Before Docker selection, a policy helper copies only
+those committed tracked files into an exclusive owner-only
+`<runtime>/build-context` tree without invoking archive/copy tools. It preserves
+executable and safe relative-symlink semantics, immediately repeats the exact
+path/mode/blob validation against the isolated repository, and pins the tree
+digest plus filesystem identity in protected metadata. Docker and Compose read
+only that local mirror; the detached worktree remains the independently cleaned
+and revalidated E2E source and provenance record. Candidate image identity,
+build arguments, `WMUX_BUILD_REVISION`, and
 OCI revision are verified on reuse or smoke. Remote Docker endpoints (including
 SSH Docker contexts) are refused. The effective direct/sudo access mode, Docker
 context, Unix endpoint, and engine ID are pinned at `up`; every later Docker
@@ -183,8 +189,10 @@ registration tokens is stored below the durable owner-local
 `/tmp` or shared root-squashed storage. Override this with an absolute
 `WMUX_STAGING_RUNTIME_ROOT` when another approved durable location is required.
 When Docker access requires `sudo`, that override must be on a root-readable
-local filesystem so root can read the empty `DOCKER_CONFIG`; the directory and
-all staging secrets remain owner-only (`0700` directories and `0600` files).
+local filesystem so root can read the empty `DOCKER_CONFIG`, protected Compose
+metadata, and verified build mirror; the shared owner-only worktree is never a
+Docker/Compose input. The directory and all staging secrets remain owner-only
+(`0700` directories and `0600` files).
 Every path component is owner/mode/symlink
 validated, each project operation owns an exclusive lock, and metadata is
 created once with exclusive no-follow semantics. A protected identity record
@@ -207,8 +215,9 @@ writing response files. As with any container environment
 secret, Docker-daemon administrators can inspect it; access to the daemon and
 the mode-`600` runtime file remains trusted staging-operator authority.
 
-Staging uses only `docker-compose.staging.yml` from the verified detached worktree; it is
-never merged with the production Compose file. Before build, the wrapper
+Staging uses only `docker-compose.staging.yml` and `Dockerfile` from the verified
+local build mirror; it never reads those inputs from the detached worktree or
+merges them with the production Compose file. Before build, the wrapper
 consumes that entire effective model and rejects every non-allowlisted service,
 build option/argument, environment key, mount, config, secret, namespace,
 device, port, network, or logging option without writing or logging rendered
@@ -239,7 +248,8 @@ recorded IDs and full live container/network policy are revalidated. `down`
 repeats that audit immediately before exact `--remove-orphans`, verifies the
 recorded container/network IDs and every matching name/label are gone, confirms
 the recorded candidate image remains unchanged, and only then removes runtime
-metadata, the isolated repository, and its detached worktree. Worktree removal
+metadata (including the local build mirror), the isolated repository, and its
+detached worktree. Worktree removal
 uses only that isolated repository's `git worktree remove` after filesystem
 identity and exact-tree validation; identity failure preserves the evidence. If
 metadata is missing while matching
