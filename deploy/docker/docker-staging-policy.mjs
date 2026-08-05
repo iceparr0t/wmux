@@ -40,6 +40,19 @@ const requireEmptyList = (value, name) => {
   if (value !== null && (!Array.isArray(value) || value.length !== 0)) fail(`${name} must be empty`);
 };
 
+const requireOptionalStringList = (value, name) => {
+  if (value !== null && (!Array.isArray(value) || value.some((entry) => typeof entry !== "string"))) {
+    fail(`${name} must be null or a string array`);
+  }
+};
+
+const requireOptionalStringMap = (value, name) => {
+  if (value !== null && (!value || typeof value !== "object" || Array.isArray(value)
+    || Object.values(value).some((entry) => typeof entry !== "string"))) {
+    fail(`${name} must be null or a string map`);
+  }
+};
+
 const safeValue = (value, name) => {
   if (!value || /[\r\n\0]/.test(value)) fail(`${name} is empty or contains control characters`);
   return value;
@@ -1107,7 +1120,11 @@ const validateRunnerImage = async () => {
   if (!/^sha256:[0-9a-f]{64}$/.test(value.Id ?? "")) fail("runner image ID is invalid");
   if (!Array.isArray(value.RepoDigests) || !value.RepoDigests.includes(runnerImage)) fail("runner image digest drift");
   exactKeys(value.Config, ["Cmd", "Entrypoint", "Env", "Labels"], "runner image Config");
-  if (!Array.isArray(value.Config.Env) || value.Config.Env.some((entry) => /(?:TOKEN|SECRET|PASSWORD|CREDENTIAL)/i.test(entry))) {
+  requireOptionalStringList(value.Config.Cmd, "runner image command");
+  requireOptionalStringList(value.Config.Entrypoint, "runner image entrypoint");
+  requireOptionalStringMap(value.Config.Labels, "runner image labels");
+  if (!Array.isArray(value.Config.Env) || value.Config.Env.some((entry) => typeof entry !== "string"
+    || /(?:TOKEN|SECRET|PASSWORD|CREDENTIAL)/i.test(entry))) {
     fail("runner base image environment is unsafe");
   }
 };

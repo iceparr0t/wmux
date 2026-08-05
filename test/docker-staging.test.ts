@@ -145,8 +145,18 @@ fi
 revision=$(/bin/cat "$STATE/revision" 2>/dev/null); project=$(/bin/cat "$STATE/project" 2>/dev/null); host=$(/bin/cat "$STATE/host" 2>/dev/null); port=$(/bin/cat "$STATE/port" 2>/dev/null)
 if [ "$1" = pull ]; then [ "$2" = '${runnerImage}' ] || exit 73; exit 0; fi
 if [ "$1 $2" = 'image inspect' ] && [ "$5" = '${runnerImage}' ]; then
+  case "$4" in *'index .Config "Cmd"'*'index .Config "Entrypoint"'*'index .Config "Env"'*'index .Config "Labels"'*) ;; *) exit 77;; esac
   ctl runner-image-drift && digest='mcr.microsoft.com/playwright@sha256:${"8".repeat(64)}' || digest='${runnerImage}'
-  printf '{"Id":"${runnerImageId}","RepoDigests":["%s"],"Config":{"Cmd":["/bin/sh"],"Entrypoint":null,"Env":["PATH=/usr/bin:/bin","PLAYWRIGHT_BROWSERS_PATH=/ms-playwright"],"Labels":null}}\n' "$digest"; exit
+  if ctl runner-image-optional-absent; then
+    printf '{"Id":"${runnerImageId}","RepoDigests":["%s"],"Config":{"Cmd":null,"Entrypoint":null,"Env":["PATH=/usr/bin:/bin","PLAYWRIGHT_BROWSERS_PATH=/ms-playwright"],"Labels":null}}\n' "$digest"
+  elif ctl runner-image-malformed; then
+    printf '{"Id":"${runnerImageId}","RepoDigests":["%s"],"Config":{"Cmd":"/bin/sh","Entrypoint":null,"Env":["PATH=/usr/bin:/bin","PLAYWRIGHT_BROWSERS_PATH=/ms-playwright"],"Labels":null}}\n' "$digest"
+  elif ctl runner-image-unexpected; then
+    printf '{"Id":"${runnerImageId}","RepoDigests":["%s"],"Config":{"Cmd":["/bin/sh"],"Entrypoint":null,"Env":["PATH=/usr/bin:/bin","PLAYWRIGHT_BROWSERS_PATH=/ms-playwright"],"Labels":null,"Unexpected":null}}\n' "$digest"
+  else
+    printf '{"Id":"${runnerImageId}","RepoDigests":["%s"],"Config":{"Cmd":["/bin/sh"],"Entrypoint":null,"Env":["PATH=/usr/bin:/bin","PLAYWRIGHT_BROWSERS_PATH=/ms-playwright"],"Labels":null}}\n' "$digest"
+  fi
+  exit
 fi
 if [ "$1" = create ]; then
   ctl runner-create-fail && exit 74
@@ -578,8 +588,12 @@ test("runner rejects image, package, inspect, output, result, and execution drif
     server = startHttpFixture(fixture.directory, "ok", fixture.port);
     const runtimeDirectory = path.join(fixture.runtime, fixture.project);
     const secrets = metadata(path.join(runtimeDirectory, "staging.env"));
+    fs.writeFileSync(path.join(fixture.state, "control-runner-image-optional-absent"), "");
+    const absentOptional = run(fixture, "e2e");
+    assert.equal(absentOptional.status, 0, absentOptional.stderr);
+    fs.rmSync(path.join(fixture.state, "control-runner-image-optional-absent"));
     for (const control of [
-      "runner-image-drift", "playwright-version-drift", "e2e-symlink-drift", "runner-inspect-privileged", "runner-inspect-host-pid",
+      "runner-image-drift", "runner-image-malformed", "runner-image-unexpected", "playwright-version-drift", "e2e-symlink-drift", "runner-inspect-privileged", "runner-inspect-host-pid",
       "runner-inspect-device", "runner-inspect-mount", "runner-inspect-network", "runner-inspect-port",
       "runner-inspect-limit", "runner-inspect-token-env", "runner-token-log", "runner-result-token", "runner-fail",
     ]) {

@@ -620,7 +620,7 @@ case "$command_name" in
     runner_image=$(node_cmd "$policy" runner-image) || die "cannot resolve pinned E2E runner image"
     docker_cmd pull "$runner_image" >/dev/null || die "cannot pull digest-pinned E2E runner image"
     runner_image_inspect=$runtime_dir/e2e-runner-image.json
-    ( umask 077; docker_cmd image inspect --format '{"Id":{{json .Id}},"RepoDigests":{{json .RepoDigests}},"Config":{"Cmd":{{json .Config.Cmd}},"Entrypoint":{{json .Config.Entrypoint}},"Env":{{json .Config.Env}},"Labels":{{json .Config.Labels}}}}' "$runner_image" >"$runner_image_inspect" ) \
+    ( umask 077; docker_cmd image inspect --format '{"Id":{{json .Id}},"RepoDigests":{{json .RepoDigests}},"Config":{"Cmd":{{json (index .Config "Cmd")}},"Entrypoint":{{json (index .Config "Entrypoint")}},"Env":{{json (index .Config "Env")}},"Labels":{{json (index .Config "Labels")}}}}' "$runner_image" >"$runner_image_inspect" ) \
       || die "cannot inspect digest-pinned E2E runner image"
     node_cmd "$policy" validate-metadata "$runner_image_inspect" || die "runner image evidence is unsafe"
     node_cmd "$policy" validate-runner-image <"$runner_image_inspect" || die "E2E runner image digest policy failed"
