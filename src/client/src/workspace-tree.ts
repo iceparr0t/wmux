@@ -252,19 +252,38 @@ export const sortFavoriteWorkspaceRows = <
   return sorted;
 };
 
+// Canonical sidebar display order: rows grouped by machine (known machines
+// first, in machine-list order), favorites bubbled up within each group.
+// Digit and previous/next shortcuts must walk this same order so Cmd+N always
+// targets the Nth visible row.
+export const orderWorkspaceRowsForDisplay = <
+  T extends { id: string; machineId: string; parentId?: string; favorite: boolean },
+>(rows: readonly T[], machineIds: readonly string[], groupByHost = true): T[] => {
+  if (!groupByHost) return sortFavoriteWorkspaceRows(rows);
+  const grouped = new Map<string, T[]>();
+  for (const row of rows) {
+    const group = grouped.get(row.machineId) ?? [];
+    group.push(row);
+    grouped.set(row.machineId, group);
+  }
+  const orderedMachineIds = [...machineIds, ...grouped.keys()].filter(
+    (machineId, index, ids) => grouped.has(machineId) && ids.indexOf(machineId) === index,
+  );
+  return orderedMachineIds.flatMap((machineId) => sortFavoriteWorkspaceRows(grouped.get(machineId) ?? []));
+};
+
 export const groupSidebarWorkspaceRows = <
   T extends { id: string; parentId?: string; favorite: boolean; machineId: string },
 >(rows: readonly T[], machineIds: readonly string[], groupByHost: boolean): Array<{ machineId?: string; rows: T[] }> => {
-  if (!groupByHost) return [{ rows: sortFavoriteWorkspaceRows(rows) }];
-  const byMachine = new Map<string, T[]>();
-  for (const row of rows) {
-    const group = byMachine.get(row.machineId) ?? [];
+  if (!groupByHost) return [{ rows: orderWorkspaceRowsForDisplay(rows, machineIds, false) }];
+  const orderedRows = orderWorkspaceRowsForDisplay(rows, machineIds);
+  const groups = new Map<string, T[]>();
+  for (const row of orderedRows) {
+    const group = groups.get(row.machineId) ?? [];
     group.push(row);
-    byMachine.set(row.machineId, group);
+    groups.set(row.machineId, group);
   }
-  const orderedMachineIds = [...machineIds, ...byMachine.keys()]
-    .filter((machineId, index, ids) => byMachine.has(machineId) && ids.indexOf(machineId) === index);
-  return orderedMachineIds.map((machineId) => ({ machineId, rows: sortFavoriteWorkspaceRows(byMachine.get(machineId) ?? []) }));
+  return [...groups].map(([machineId, groupedRows]) => ({ machineId, rows: groupedRows }));
 };
 
 export const workspaceMoveIntents = (

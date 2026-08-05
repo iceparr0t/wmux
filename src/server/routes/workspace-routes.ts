@@ -2,6 +2,7 @@ import {
   WorkspaceDepthError,
   type SplitCreationIds,
   type TabCreationIds,
+  type WorkspaceCleanupOptions,
   type WorkspaceCreationIds,
 } from "../state.js";
 import type { WorkspaceReorderPosition } from "../types.js";
@@ -13,6 +14,46 @@ import {
 
 const clientIdPattern = (prefix: string): RegExp =>
   new RegExp(`^${prefix}_[0-9a-f]{16,64}$`);
+
+const MIN_AGENT_WORKSPACE_CLEANUP_TTL_SECONDS = 60;
+const MAX_AGENT_WORKSPACE_CLEANUP_TTL_SECONDS = 7 * 24 * 60 * 60;
+const DEFAULT_AGENT_WORKSPACE_CLEANUP_TTL_SECONDS = 24 * 60 * 60;
+
+const parseWorkspaceCleanup = (
+  policy: unknown,
+  ttlSeconds: unknown,
+): WorkspaceCleanupOptions | undefined => {
+  if (policy === undefined && ttlSeconds === undefined) return undefined;
+  if (policy !== "on-success") {
+    throw new HttpError(400, "invalid_workspace_cleanup_policy");
+  }
+  if (
+    typeof ttlSeconds !== "number"
+    || !Number.isInteger(ttlSeconds)
+    || ttlSeconds < MIN_AGENT_WORKSPACE_CLEANUP_TTL_SECONDS
+    || ttlSeconds > MAX_AGENT_WORKSPACE_CLEANUP_TTL_SECONDS
+  ) {
+    throw new HttpError(400, "invalid_workspace_cleanup_ttl");
+  }
+  return {
+    policy,
+    cleanupAt: new Date(Date.now() + ttlSeconds * 1_000).toISOString(),
+  };
+};
+
+const parseWorkspaceCreationCleanup = (
+  policy: unknown,
+  ttlSeconds: unknown,
+): WorkspaceCleanupOptions | undefined => {
+  if (policy === "retain" && ttlSeconds === undefined) return undefined;
+  if (policy === undefined && ttlSeconds === undefined) {
+    return parseWorkspaceCleanup(
+      "on-success",
+      DEFAULT_AGENT_WORKSPACE_CLEANUP_TTL_SECONDS,
+    );
+  }
+  return parseWorkspaceCleanup(policy, ttlSeconds);
+};
 
 const parseClientCreationIds = (
   value: unknown,
@@ -56,6 +97,8 @@ export const workspaceRoutes: readonly ApiRoute[] = [
         sourcePaneId?: string;
         parentPaneId?: string;
         createdBy?: "user" | "agent";
+        cleanupPolicy?: unknown;
+        cleanupTtlSeconds?: unknown;
         parentWorkspaceId?: unknown;
         clientIds?: unknown;
       };
@@ -67,6 +110,19 @@ export const workspaceRoutes: readonly ApiRoute[] = [
         sendJson(400, { error: "parent_pane_requires_agent" });
         return;
       }
+      if (
+        (body.cleanupPolicy !== undefined || body.cleanupTtlSeconds !== undefined)
+        && body.createdBy !== "agent"
+      ) {
+        sendJson(400, { error: "workspace_cleanup_requires_agent" });
+        return;
+      }
+      const cleanup = body.createdBy === "agent"
+        ? parseWorkspaceCreationCleanup(
+          body.cleanupPolicy,
+          body.cleanupTtlSeconds,
+        )
+        : undefined;
       const parentPane = body.parentPaneId
         ? deps.state.findPane(body.parentPaneId) ?? undefined
         : undefined;
@@ -94,6 +150,7 @@ export const workspaceRoutes: readonly ApiRoute[] = [
             ? deps.state.findPaneContext(parentPane.id)?.workspace.id
             : undefined,
           clientIds,
+          cleanup,
         );
       } catch (error) {
         if (error instanceof WorkspaceDepthError) {
@@ -103,6 +160,57 @@ export const workspaceRoutes: readonly ApiRoute[] = [
         throw error;
       }
       sendJson(201, { workspace, state: deps.currentPayload() });
+    },
+  },
+  {
+    id: "workspace-cleanup-configure",
+    method: "POST",
+    pattern: /^\/api\/workspaces\/([^/]+)\/cleanup$/,
+    policy: routePolicy(
+      "workspace-cleanup-configure",
+      "POST",
+      /^\/api\/workspaces\/[^/]+\/cleanup$/,
+      "normal",
+      ["automation"],
+      false,
+      false,
+      true,
+    ),
+    handler: async ({ deps, match, readJsonBody, sendJson }) => {
+      if (!match) throw new Error("workspace cleanup route matched without captures");
+      const body = (await readJsonBody()) as {
+        cleanupPolicy?: unknown;
+        cleanupTtlSeconds?: unknown;
+      };
+      const existing = deps.state.snapshot().workspaces.find(
+        (workspace) => workspace.id === match[1],
+      );
+      if (!existing) {
+        sendJson(404, { error: "workspace_not_found" });
+        return;
+      }
+      if (existing.createdBy !== "agent") {
+        sendJson(409, { error: "workspace_cleanup_requires_agent" });
+        return;
+      }
+      if (
+        body.cleanupPolicy === "retain"
+        && body.cleanupTtlSeconds === undefined
+      ) {
+        const workspace = deps.state.configureWorkspaceCleanup(match[1]);
+        sendJson(200, { workspace, state: deps.currentPayload() });
+        return;
+      }
+      const cleanup = parseWorkspaceCleanup(
+        body.cleanupPolicy,
+        body.cleanupTtlSeconds,
+      );
+      if (!cleanup) {
+        sendJson(400, { error: "workspace_cleanup_policy_required" });
+        return;
+      }
+      const workspace = deps.state.configureWorkspaceCleanup(match[1], cleanup);
+      sendJson(200, { workspace, state: deps.currentPayload() });
     },
   },
   {
@@ -176,6 +284,38 @@ export const workspaceRoutes: readonly ApiRoute[] = [
       if (!match) throw new Error("workspace notifications route matched without captures");
       deps.state.markWorkspaceNotificationsRead(match[1]);
       sendJson(200, deps.currentPayload());
+    },
+  },
+  {
+    id: "workspace-close-schedule",
+    method: "POST",
+    pattern: /^\/api\/workspaces\/([^/]+)\/pending-close$/,
+    policy: routePolicy(
+      "workspace-close-schedule",
+      "POST",
+      /^\/api\/workspaces\/[^/]+\/pending-close$/,
+    ),
+    handler: async ({ deps, match, sendJson }) => {
+      if (!match) throw new Error("workspace close schedule route matched without captures");
+      const closeAt = deps.sessions.scheduleWorkspaceClose(match[1]);
+      sendJson(closeAt ? 202 : 404, closeAt
+        ? { scheduled: true, closeAt }
+        : { error: "workspace_not_found" });
+    },
+  },
+  {
+    id: "workspace-close-cancel",
+    method: "DELETE",
+    pattern: /^\/api\/workspaces\/([^/]+)\/pending-close$/,
+    policy: routePolicy(
+      "workspace-close-cancel",
+      "DELETE",
+      /^\/api\/workspaces\/[^/]+\/pending-close$/,
+    ),
+    handler: async ({ deps, match, sendJson }) => {
+      if (!match) throw new Error("workspace close cancel route matched without captures");
+      const cancelled = deps.sessions.cancelWorkspaceClose(match[1]);
+      sendJson(200, { cancelled, state: deps.currentPayload() });
     },
   },
   {

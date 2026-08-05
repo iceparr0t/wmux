@@ -33,10 +33,28 @@ module = runpy.run_path("scripts/wmux-windows-agent")
 without_profile = module["powershell_command"]("pwsh", "C:/work", False)
 with_profile = module["powershell_command"]("pwsh", "C:/work", True)
 optional_profile_auth = module["powershell_command"]("pwsh", "C:/work", False, True)
+profile_owned_cwd = module["session_command"](
+    {},
+    {"shell": "pwsh", "loadPowerShellProfile": True},
+    "C:/Users/wmux",
+)
+explicit_cwd = module["session_command"](
+    {},
+    {"shell": "pwsh", "loadPowerShellProfile": True, "cwd": "C:/work"},
+    "C:/Users/wmux",
+)
+configured_cwd = module["session_command"](
+    {"cwd": "D:/configured"},
+    {"shell": "pwsh", "loadPowerShellProfile": True},
+    "C:/Users/wmux",
+)
 print(json.dumps({
     "withoutProfile": without_profile,
     "withProfile": with_profile,
     "optionalProfileAuth": optional_profile_auth,
+    "profileOwnedCwd": profile_owned_cwd,
+    "explicitCwd": explicit_cwd,
+    "configuredCwd": configured_cwd,
 }))
 `;
   const result = spawnSync("python3", ["-c", source], { cwd: repoRoot, encoding: "utf8" });
@@ -47,17 +65,142 @@ print(json.dumps({
   assert.match(commands.withProfile.at(-1), /__wmuxInstallPrompt \$true/);
   assert.match(commands.withoutProfile.at(-1), /__wmuxInstallPrompt \$false/);
   assert.match(commands.optionalProfileAuth.at(-1), /apply --quiet --optional-auth/);
+  assert.doesNotMatch(commands.profileOwnedCwd.at(-1), /Set-Location/);
+  assert.match(commands.explicitCwd.at(-1), /Set-Location -LiteralPath 'C:\/work'/);
+  assert.match(commands.configuredCwd.at(-1), /Set-Location -LiteralPath 'D:\/configured'/);
 });
 
-test("Windows agent URLs bracket IPv6 callback addresses", () => {
+test("session-agent URLs reject unsupported IPv6 callback addresses", () => {
   const machine: MachineConfig = {
     id: "dynamic-v6",
     name: "Dynamic IPv6",
     kind: "powershell-ssh",
     host: "fd7a:115c:a1e0::8",
+    sessionBackend: "agent",
     agentPort: 3481,
   };
-  assert.equal(windowsAgentUrl(machine), "http://[fd7a:115c:a1e0::8]:3481");
+  assert.equal(windowsAgentUrl(machine), undefined);
+});
+
+test("session-agent URL construction rejects public and DNS fallbacks", () => {
+  assert.equal(windowsAgentUrl({
+    id: "public",
+    name: "Public",
+    kind: "ssh",
+    host: "203.0.113.8",
+    sessionBackend: "agent",
+    agentPort: 3481,
+  }), undefined);
+  assert.equal(windowsAgentUrl({
+    id: "dns",
+    name: "DNS",
+    kind: "ssh",
+    host: "changed.internal",
+    sessionBackend: "agent",
+    agentPort: 3481,
+  }), undefined);
+  assert.equal(windowsAgentUrl({
+    id: "pinned",
+    name: "Pinned",
+    kind: "ssh",
+    host: "changed.internal",
+    sessionBackend: "agent",
+    agentUrl: "http://100.64.0.8:3481",
+    agentPort: 3481,
+  }), "http://100.64.0.8:3481");
+});
+
+test("agent hard-drain and pending-update fences are atomic against concurrent creates", () => {
+  const source = String.raw`
+import json
+import runpy
+import threading
+
+module = runpy.run_path("scripts/wmux-windows-agent")
+
+class FakeSession:
+    def __init__(self, session_id, config, payload, on_exit):
+        self.id = session_id
+        self.exited = False
+        self.on_exit = on_exit
+    def snapshot(self):
+        return {"id": self.id, "status": "exited" if self.exited else "running"}
+    def terminate(self):
+        self.exited = True
+
+module["AgentState"].get_or_create.__globals__["Session"] = FakeSession
+hard_create_wins = 0
+hard_fence_wins = 0
+pending_create_wins = 0
+pending_fence_wins = 0
+
+for index in range(100):
+    state = module["AgentState"]({"backend": "stdio"})
+    barrier = threading.Barrier(2)
+    result = {}
+    def create():
+        barrier.wait()
+        try:
+            state.get_or_create("pane", {})
+            result["created"] = True
+        except module["AgentDrainingError"]:
+            result["created"] = False
+    def fence():
+        barrier.wait()
+        result["health"] = state.begin_drain(False, False)
+    threads = [threading.Thread(target=create), threading.Thread(target=fence)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    health = state.health()
+    if result["created"]:
+        hard_create_wins += 1
+        assert health["activeSessions"] == 1
+    else:
+        hard_fence_wins += 1
+        assert health["activeSessions"] == 0 and health["draining"] is True
+
+for index in range(100):
+    state = module["AgentState"]({"backend": "stdio"})
+    old = state.get_or_create("old", {})
+    old.exited = True
+    with state.lock:
+        state.update_pending = True
+        state.restart_when_idle = True
+    barrier = threading.Barrier(2)
+    result = {}
+    def create_pending():
+        barrier.wait()
+        try:
+            state.get_or_create("new", {})
+            result["created"] = True
+        except module["AgentDrainingError"]:
+            result["created"] = False
+    def transition_pending():
+        barrier.wait()
+        state._restart_if_still_idle()
+    threads = [threading.Thread(target=create_pending), threading.Thread(target=transition_pending)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    health = state.health()
+    if result["created"]:
+        pending_create_wins += 1
+        assert health["activeSessions"] == 1 and state.restart_requested is False
+    else:
+        pending_fence_wins += 1
+        assert health["activeSessions"] == 0 and health["draining"] is True and state.restart_requested is True
+
+print(json.dumps({
+    "hardCreateWins": hard_create_wins,
+    "hardFenceWins": hard_fence_wins,
+    "pendingCreateWins": pending_create_wins,
+    "pendingFenceWins": pending_fence_wins,
+}))
+`;
+  const result = spawnSync("python3", ["-c", source], { cwd: repoRoot, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  const outcomes = JSON.parse(result.stdout);
+  assert.equal(outcomes.hardCreateWins + outcomes.hardFenceWins, 100);
+  assert.equal(outcomes.pendingCreateWins + outcomes.pendingFenceWins, 100);
 });
 
 test("Windows agent heartbeat advertises its live callback credentials", () => {
@@ -252,7 +395,7 @@ print(json.dumps({
   assert.equal(payload.rollout.running, false);
 });
 
-test("Windows agent answers terminal queries locally and suppresses delayed browser duplicates", () => {
+test("Windows agent filters delayed browser duplicates from bundled terminal replies", () => {
   const source = String.raw`
 import json
 import runpy
@@ -291,6 +434,14 @@ backend.write_terminal_response(b"\x1b[?62;22c")
 backend.write_terminal_response(b"\x1b[?62;22c")
 backend.write_terminal_response(b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\")
 backend.write_terminal_response(b"\x1b]11;rgb:0000/0000/0000\x1b\\")
+backend.write_terminal_response(
+    b"\x1b[?62;22c\x1b[>1;0;0c\x1bP>|libghostty 0.1.0-dev\x1b\\"
+)
+backend.write_terminal_response(
+    b"\x1b]10;rgb:c0c0/caca/f5f5\x1b\\\x1b[24;80R"
+)
+backend.write_terminal_response(b"\x1b[4;1007;1305t\x1b[8;53;145t")
+backend.write_terminal_response(b"\x1b[?62;22cuser-input")
 __import__("time").sleep(0.01)
 backend.write_terminal_response(b"\x1b[?62;22c")
 backend.write_terminal_response(b"user-input")
@@ -306,7 +457,16 @@ print(json.dumps({
   const background = "\x1b]11;rgb:1a1a/1b1b/2626\x1b\\";
   assert.deepEqual(JSON.parse(result.stdout), {
     replies: ["\x1b[?62;22c", "\x1b[0n", "\x1b[?62;22c", foreground, background],
-    writes: ["\x1b[?62;22c", foreground, background, "user-input"],
+    writes: [
+      "\x1b[?62;22c",
+      foreground,
+      background,
+      "\x1b[>1;0;0c\x1bP>|libghostty 0.1.0-dev\x1b\\",
+      "\x1b[24;80R",
+      "\x1b[4;1007;1305t\x1b[8;53;145t",
+      "\x1b[?62;22cuser-input",
+      "user-input",
+    ],
   });
 });
 

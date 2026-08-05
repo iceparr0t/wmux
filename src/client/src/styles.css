@@ -3666,6 +3666,64 @@ button.active-tool {
   padding: clamp(14px, 4vw, 52px);
 }
 
+/* Once bootstrap is ready the app shell mounts underneath; the boot screen
+   keeps covering it while terminals attach behind the sequence. */
+.retro-boot-screen.retro-boot-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+}
+
+.retro-boot-zx-spectrum {
+  --retro-tape-header-a: #00d7d7;
+  --retro-tape-header-b: #d70000;
+  --retro-tape-data-a: #163bd7;
+  --retro-tape-data-b: #e6db00;
+}
+
+.retro-boot-amstrad-cpc {
+  --retro-tape-header-a: #0080ff;
+  --retro-tape-header-b: #ffea00;
+  --retro-tape-data-a: #001a8d;
+  --retro-tape-data-b: #ffe746;
+}
+
+.retro-boot-oric-atmos {
+  --retro-tape-header-a: #00d7d7;
+  --retro-tape-header-b: #d70000;
+  --retro-tape-data-a: #f3f3f3;
+  --retro-tape-data-b: #111;
+}
+
+.retro-boot-screen.retro-tape-border-header,
+.retro-boot-screen.retro-tape-border-data {
+  background-size: 34px 34px;
+  animation: retro-tape-border-shift 180ms linear infinite;
+}
+
+.retro-boot-screen.retro-tape-border-header {
+  background-image: repeating-linear-gradient(
+    135deg,
+    var(--retro-tape-header-a) 0 12px,
+    var(--retro-tape-header-b) 12px 24px
+  );
+}
+
+.retro-boot-screen.retro-tape-border-data {
+  background-image: repeating-linear-gradient(
+    135deg,
+    var(--retro-tape-data-a) 0 6px,
+    var(--retro-tape-data-b) 6px 12px
+  );
+  animation-duration: 110ms;
+}
+
+@keyframes retro-tape-border-shift {
+  to {
+    background-position: 34px 0;
+  }
+}
+
 .retro-boot-bezel {
   position: relative;
   width: var(--retro-framebuffer-width, min(920px, 100%));
@@ -3684,6 +3742,17 @@ button.active-tool {
   overflow: hidden;
   background: var(--retro-background);
   color: var(--retro-foreground);
+}
+
+.retro-boot-framebuffer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  pointer-events: none;
+  background:
+    repeating-linear-gradient(to bottom, transparent 0 2px, rgb(0 0 0 / 3%) 2px 3px),
+    radial-gradient(ellipse at center, transparent 68%, rgb(0 0 0 / 8%) 100%);
 }
 
 .retro-boot-terminal {
@@ -3707,8 +3776,9 @@ button.active-tool {
   display: grid;
   grid-template-rows: 22px minmax(0, 1fr);
   box-sizing: border-box;
-  border: 2px solid #000;
-  background: #aaa;
+  border: 2px solid #fff;
+  background: #0055aa;
+  box-shadow: inset 0 0 0 1px #f80;
 }
 
 .retro-amiga-shell-titlebar {
@@ -3717,9 +3787,9 @@ button.active-tool {
   align-items: center;
   min-width: 0;
   height: 22px;
-  border-bottom: 2px solid #000;
-  background: #6b8fc0;
-  color: #000;
+  border-bottom: 2px solid #f80;
+  background: #0055aa;
+  color: #fff;
   font-family: "Retro Amiga Topaz", monospace;
   font-size: 16px;
   line-height: 1;
@@ -3730,14 +3800,15 @@ button.active-tool {
   align-self: stretch;
   display: grid;
   place-items: center;
-  border-right: 2px solid #000;
-  background: #aaa;
+  border-right: 2px solid #f80;
+  background: #0055aa;
+  color: #fff;
 }
 
 .retro-amiga-shell-depth-gadget {
   position: relative;
   border-right: 0;
-  border-left: 2px solid #000;
+  border-left: 2px solid #f80;
 }
 
 .retro-amiga-shell-depth-gadget::before,
@@ -3746,7 +3817,7 @@ button.active-tool {
   position: absolute;
   width: 10px;
   height: 7px;
-  border: 2px solid #000;
+  border: 2px solid #fff;
 }
 
 .retro-amiga-shell-depth-gadget::before {
@@ -4441,6 +4512,35 @@ button.active-tool {
       var(--wmux-mobile-right-inset, max(0px, env(safe-area-inset-right)))
       var(--wmux-mobile-bottom-inset, max(0px, env(safe-area-inset-bottom)))
       var(--wmux-mobile-left-inset, max(0px, env(safe-area-inset-left)));
+  }
+
+  .retro-boot-screen.retro-tape-border-header,
+  .retro-boot-screen.retro-tape-border-data {
+    background: var(--wmux-browser-chrome);
+    animation: none;
+  }
+
+  .retro-boot-screen.retro-tape-border-header .retro-boot-bezel,
+  .retro-boot-screen.retro-tape-border-data .retro-boot-bezel {
+    background-size: 34px 34px;
+    animation: retro-tape-border-shift 180ms linear infinite;
+  }
+
+  .retro-boot-screen.retro-tape-border-header .retro-boot-bezel {
+    background-image: repeating-linear-gradient(
+      135deg,
+      var(--retro-tape-header-a) 0 12px,
+      var(--retro-tape-header-b) 12px 24px
+    );
+  }
+
+  .retro-boot-screen.retro-tape-border-data .retro-boot-bezel {
+    background-image: repeating-linear-gradient(
+      135deg,
+      var(--retro-tape-data-a) 0 6px,
+      var(--retro-tape-data-b) 6px 12px
+    );
+    animation-duration: 110ms;
   }
 
   .retro-boot-bezel,
@@ -7071,24 +7171,26 @@ button.active-tool {
   z-index: 1000;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  max-width: min(420px, calc(100vw - 32px));
+  gap: 6px;
+  width: min(560px, calc(100vw - 32px));
   pointer-events: none;
 }
 
 .wmux-toast {
   pointer-events: auto;
   display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 10px 12px;
-  border-radius: 8px;
+  align-items: center;
+  gap: 12px;
+  min-height: 38px;
+  padding: 8px 10px;
+  border-radius: 0;
   border: 1px solid var(--line);
-  background: var(--panel-2);
+  background: var(--black);
   color: var(--ivory);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-  font-size: 13px;
-  line-height: 1.4;
+  box-shadow: none;
+  font-family: var(--wmux-mono-font);
+  font-size: 12px;
+  line-height: 1.25;
   animation: wmux-toast-in 140ms ease-out;
 }
 
@@ -7102,25 +7204,47 @@ button.active-tool {
   border-left-width: 3px;
 }
 
+.wmux-toast-status {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.wmux-toast-error .wmux-toast-status {
+  color: var(--red);
+}
+
 .wmux-toast-message {
   flex: 1;
   word-break: break-word;
 }
 
+.wmux-toast-action,
 .wmux-toast-dismiss {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   border: none;
   background: transparent;
-  color: var(--muted);
+  color: var(--ivory);
+  font: inherit;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
   cursor: pointer;
-  padding: 0;
-  margin-top: 1px;
+  padding: 2px 3px;
+  text-transform: uppercase;
 }
 
+.wmux-toast-action:hover,
+.wmux-toast-action:focus-visible,
+.wmux-toast-dismiss:focus-visible,
 .wmux-toast-dismiss:hover {
-  color: var(--ivory);
+  color: var(--black);
+  background: var(--ivory);
+  outline: none;
 }
 
 @keyframes wmux-toast-in {
@@ -7267,7 +7391,17 @@ button.active-tool {
     right: calc(8px + var(--wmux-mobile-right-inset, 0px));
     bottom: calc(8px + env(safe-area-inset-bottom));
     left: calc(8px + var(--wmux-mobile-left-inset, 0px));
+    width: auto;
     max-width: none;
+  }
+
+  .wmux-toast {
+    min-height: 44px;
+  }
+
+  .wmux-toast-action,
+  .wmux-toast-dismiss {
+    min-height: 32px;
   }
 
   .wmux-toast-dismiss {
@@ -7309,6 +7443,11 @@ button.active-tool {
     transition: none;
   }
 
+  .retro-boot-screen.retro-tape-border-header,
+  .retro-boot-screen.retro-tape-border-data,
+  .retro-boot-screen.retro-tape-border-header .retro-boot-bezel,
+  .retro-boot-screen.retro-tape-border-data .retro-boot-bezel,
+  .retro-amiga-guru-alert,
   .mobile-agent-live.running,
   .mobile-agent-send-spinner,
   .workspace-state-dot.running,

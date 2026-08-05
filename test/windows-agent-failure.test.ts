@@ -25,6 +25,44 @@ const waitUntil = async (predicate: () => boolean, timeoutMs = 1000) => {
   }
 };
 
+const listen = (server: http.Server, port: number) => new Promise<void>((resolve, reject) => {
+  const onError = (error: Error) => {
+    server.off("listening", onListening);
+    reject(error);
+  };
+  const onListening = () => {
+    server.off("error", onError);
+    resolve();
+  };
+  server.once("error", onError);
+  server.once("listening", onListening);
+  server.listen(port, "127.0.0.1");
+});
+
+const closeServer = async (server: http.Server) => {
+  if (!server.listening) return;
+  const closed = once(server, "close");
+  server.close();
+  server.closeAllConnections();
+  await closed;
+};
+
+const listenOnAdjacentPorts = async (currentServer: http.Server, sideServer: http.Server) => {
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    await listen(currentServer, 0);
+    const address = currentServer.address();
+    assert.ok(address && typeof address === "object");
+    const currentPort = address.port;
+    try {
+      await listen(sideServer, currentPort + 1);
+      return { currentPort, sidePort: currentPort + 1 };
+    } catch {
+      await closeServer(currentServer);
+    }
+  }
+  throw new Error("could not reserve adjacent loopback ports after 32 attempts");
+};
+
 test("Windows agent updates use a bounded encoded SSH command with an explicit acknowledgement", () => {
   const invocation = buildWindowsAgentUpdateSshInvocation({
     id: "windows",
@@ -379,6 +417,238 @@ test("a new Windows pane stages and safely activates an outdated agent", async (
   session.detach();
   server.close();
   await once(server, "close");
+});
+
+test("an idle pinned Windows generation refreshes itself instead of the base agent", async () => {
+  const expectedRelease = expectedWindowsAgentReleaseVersion();
+  const expectedProtocol = expectedWindowsAgentProtocolVersion();
+  let helperBundleVersion = "stale";
+  let refreshedPort: number | undefined;
+  let created = false;
+  const server = http.createServer(async (request, response) => {
+    const path = request.url ?? "";
+    response.setHeader("content-type", "application/json");
+    if (request.method === "GET" && path === "/health") {
+      response.end(JSON.stringify({
+        ok: true,
+        releaseVersion: expectedRelease,
+        protocolVersion: expectedProtocol,
+        helperBundleVersion,
+        activeSessions: 0,
+        draining: false,
+      }));
+      return;
+    }
+    if (request.method === "GET" && path === "/sessions") {
+      response.end(JSON.stringify({ sessions: [] }));
+      return;
+    }
+    if (request.method === "POST" && path.startsWith("/sessions/__wmux_update_")) {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+        helperBundle?: { bundleVersion?: string };
+      };
+      helperBundleVersion = body.helperBundle?.bundleVersion ?? helperBundleVersion;
+      response.end(JSON.stringify({ id: path.split("/")[2], status: "running" }));
+      return;
+    }
+    if (request.method === "DELETE" && path.startsWith("/sessions/__wmux_update_")) {
+      response.end(JSON.stringify({ removed: true }));
+      return;
+    }
+    if (request.method === "POST" && path === "/sessions/pane_pinned_generation") {
+      created = true;
+      response.end(JSON.stringify({
+        id: "pane_pinned_generation",
+        pid: 321,
+        base: 0,
+        cursor: 0,
+      }));
+      return;
+    }
+    if (request.method === "GET" && path.startsWith("/sessions/pane_pinned_generation/output")) {
+      response.end(JSON.stringify({ base: 0, cursor: 0, dataBase64: "", exited: false }));
+      return;
+    }
+    response.writeHead(404).end(JSON.stringify({ error: "not_found" }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const generationPort = address.port;
+  const session = new WindowsAgentSession(
+    {
+      id: "pane_pinned_generation",
+      machineId: "windows",
+      title: "PowerShell",
+      status: "idle",
+      createdAt: new Date(0).toISOString(),
+    },
+    {
+      id: "windows",
+      name: "Windows",
+      kind: "powershell-ssh",
+      host: "127.0.0.1",
+      sessionBackend: "agent",
+      agentUrl: `http://127.0.0.1:${generationPort}`,
+    },
+    80,
+    24,
+    {},
+    async (_machine, rolloutPort) => {
+      refreshedPort = rolloutPort;
+      return rolloutPort;
+    },
+    1_000,
+    undefined,
+    generationPort - 1,
+  );
+  try {
+    await session.attachReady;
+    assert.equal(refreshedPort, generationPort);
+    assert.equal(created, true);
+    assert.equal(session.isExited, false);
+  } finally {
+    session.detach();
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("a concurrent create makes same-port refresh defer to a side-by-side generation", async () => {
+  const expectedRelease = expectedWindowsAgentReleaseVersion();
+  const expectedProtocol = expectedWindowsAgentProtocolVersion();
+  let concurrentSessions = 0;
+  let samePortRefreshes = 0;
+  let sidePortRefreshes = 0;
+  let currentDeletes = 0;
+  let sideCreates = 0;
+  let sideGenerationActive = false;
+  let sideAuthorization = "";
+  let sideEnvironment: Record<string, string> | undefined;
+  const currentServer = http.createServer((request, response) => {
+    const requestPath = request.url ?? "";
+    response.setHeader("content-type", "application/json");
+    if (request.method === "GET" && requestPath === "/health") {
+      response.end(JSON.stringify({
+        ok: true,
+        releaseVersion: expectedRelease,
+        protocolVersion: expectedProtocol,
+        helperBundleVersion: "stale",
+        activeSessions: concurrentSessions,
+        draining: false,
+      }));
+      return;
+    }
+    if (request.method === "GET" && requestPath === "/sessions") {
+      response.end(JSON.stringify({
+        sessions: concurrentSessions > 0
+          ? [{ id: "pane_concurrent", status: "running", pid: 44 }]
+          : [],
+      }));
+      return;
+    }
+    if (request.method === "POST" && requestPath.startsWith("/sessions/__wmux_update_")) {
+      response.end(JSON.stringify({ id: requestPath.split("/")[2], status: "running" }));
+      return;
+    }
+    if (request.method === "DELETE" && requestPath.startsWith("/sessions/")) {
+      currentDeletes += 1;
+      response.end(JSON.stringify({ removed: true }));
+      return;
+    }
+    response.writeHead(404).end(JSON.stringify({ error: "not_found" }));
+  });
+  const sideServer = http.createServer(async (request, response) => {
+    const requestPath = request.url ?? "";
+    response.setHeader("content-type", "application/json");
+    if (request.method === "GET" && requestPath === "/health") {
+      if (!sideGenerationActive) {
+        response.writeHead(404).end(JSON.stringify({ error: "not_found" }));
+        return;
+      }
+      response.end(JSON.stringify({
+        ok: true,
+        releaseVersion: expectedRelease,
+        protocolVersion: expectedProtocol,
+        helperBundleVersion: windowsHelperBundleVersion(),
+        activeSessions: sideCreates,
+      }));
+      return;
+    }
+    if (request.method === "POST" && requestPath === "/sessions/pane_refresh_race") {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      sideAuthorization = String(request.headers.authorization ?? "");
+      sideEnvironment = (JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+        env?: Record<string, string>;
+      }).env;
+      sideCreates += 1;
+      response.end(JSON.stringify({ id: "pane_refresh_race", pid: 45, base: 0, cursor: 0 }));
+      return;
+    }
+    if (request.method === "GET" && requestPath.startsWith("/sessions/pane_refresh_race/output")) {
+      response.end(JSON.stringify({ base: 0, cursor: 0, dataBase64: "", exited: false }));
+      return;
+    }
+    response.writeHead(404).end(JSON.stringify({ error: "not_found" }));
+  });
+  const { currentPort, sidePort } = await listenOnAdjacentPorts(currentServer, sideServer);
+  const selected: Array<{ port: number; origin: string }> = [];
+  const session = new WindowsAgentSession(
+    {
+      id: "pane_refresh_race",
+      machineId: "windows",
+      title: "PowerShell",
+      status: "idle",
+      createdAt: new Date(0).toISOString(),
+    },
+    {
+      id: "windows",
+      name: "Windows",
+      kind: "powershell-ssh",
+      host: "changed-dns.internal",
+      sessionBackend: "agent",
+      agentUrl: `http://127.0.0.1:${currentPort}`,
+      agentPort: currentPort,
+      agentToken: "pinned-token",
+    },
+    80,
+    24,
+    {},
+    async (_machine, rolloutPort) => {
+      if (rolloutPort === currentPort) {
+        samePortRefreshes += 1;
+        concurrentSessions = 1;
+        throw new Error("generation_refresh_busy");
+      }
+      assert.equal(rolloutPort, sidePort);
+      sidePortRefreshes += 1;
+      sideGenerationActive = true;
+      return sidePort;
+    },
+    1_000,
+    undefined,
+    currentPort - 1,
+  );
+  session.on("agentPort", (port, origin) => selected.push({ port, origin }));
+  try {
+    await session.attachReady;
+    assert.equal(session.isExited, false, session.replayOutput);
+    assert.equal(samePortRefreshes, 1);
+    assert.equal(sidePortRefreshes, 1);
+    assert.equal(concurrentSessions, 1, "the session that won the refresh race remains active");
+    assert.equal(currentDeletes, 1, "only the temporary helper staging session is deleted");
+    assert.equal(sideCreates, 1);
+    assert.equal(sideAuthorization, "Bearer pinned-token");
+    assert.equal(sideEnvironment?.WMUX_MACHINE_ID, "windows");
+    assert.deepEqual(selected, [{ port: sidePort, origin: `http://127.0.0.1:${sidePort}` }]);
+  } finally {
+    session.detach();
+    await Promise.all([closeServer(currentServer), closeServer(sideServer)]);
+  }
 });
 
 test("an acknowledged Windows agent update cannot leave pane startup waiting forever", async () => {
@@ -805,6 +1075,118 @@ test("Windows agent queues initial resize and input until session creation compl
   await once(server, "close");
 });
 
+test("Windows agent recreates a live pane when the remote agent loses its session", async () => {
+  let createCount = 0;
+  let reportMissingSession = false;
+  let remoteCols = 80;
+  let remoteRows = 24;
+  const createBodies: Array<Record<string, unknown>> = [];
+  const server = http.createServer(async (request, response) => {
+    const path = request.url ?? "";
+    response.setHeader("content-type", "application/json");
+    if (request.method === "POST" && path === "/sessions/pane_reboot") {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
+      createBodies.push(body);
+      remoteCols = Number(body.cols);
+      remoteRows = Number(body.rows);
+      createCount += 1;
+      response.end(JSON.stringify({
+        id: "pane_reboot",
+        pid: 100 + createCount,
+        base: 0,
+        cursor: 0,
+        cwd: "C:\\work",
+        cols: remoteCols,
+        rows: remoteRows,
+      }));
+      return;
+    }
+    if (request.method === "POST" && path === "/sessions/pane_reboot/resize") {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { cols: number; rows: number };
+      remoteCols = body.cols;
+      remoteRows = body.rows;
+      response.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    if (request.method === "GET" && path.startsWith("/sessions/pane_reboot/output")) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      if (reportMissingSession) {
+        reportMissingSession = false;
+        response.writeHead(404);
+        response.end(JSON.stringify({ error: "unknown_session" }));
+        return;
+      }
+      const cursor = Number(new URL(path, "http://agent.invalid").searchParams.get("cursor") ?? 0);
+      const output = Buffer.from(createCount === 1 ? "first-shell\r\n" : "second-shell\r\n");
+      const data = output.subarray(Math.min(cursor, output.length));
+      response.end(JSON.stringify({
+        base: 0,
+        startCursor: cursor,
+        cursor: output.length,
+        dataBase64: data.toString("base64"),
+        exited: false,
+        cols: remoteCols,
+        rows: remoteRows,
+      }));
+      return;
+    }
+    response.writeHead(404);
+    response.end(JSON.stringify({ error: "not_found" }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const session = new WindowsAgentSession(
+    {
+      id: "pane_reboot",
+      machineId: "windows",
+      title: "PowerShell",
+      status: "idle",
+      cwd: "C:\\work",
+      createdAt: new Date(0).toISOString(),
+    },
+    {
+      id: "windows",
+      name: "Windows",
+      kind: "powershell-ssh",
+      host: "127.0.0.1",
+      sessionBackend: "agent",
+      agentUrl: `http://127.0.0.1:${address.port}`,
+    },
+    80,
+    24,
+  );
+  const output: string[] = [];
+  session.on("output", (data) => output.push(data));
+  await session.attachReady;
+  await waitUntil(() => output.join("").includes("first-shell"));
+  assert.equal(session.pid, 101);
+  session.resize(120, 35);
+  await waitUntil(() => remoteCols === 120 && remoteRows === 35);
+
+  reportMissingSession = true;
+  await waitUntil(() => createCount === 2);
+  await waitUntil(() => output.join("").includes("second-shell"));
+  assert.equal(session.pid, 102);
+  assert.equal(createBodies.length, 2);
+  assert.equal(createBodies[1]?.cwd, "C:\\work");
+  assert.equal(createBodies[1]?.cols, 120);
+  assert.equal(createBodies[1]?.rows, 35);
+  assert.equal(createBodies[0]?.reuseRuntimeFiles, undefined);
+  assert.equal(createBodies[1]?.reuseRuntimeFiles, true);
+  assert.match(output.join(""), /Session agent restarted; opened a new shell for this pane/);
+  assert.doesNotMatch(output.join(""), /unknown_session/);
+
+  session.detach();
+  server.close();
+  await once(server, "close");
+});
+
 test("Windows agent preserves input request order", async () => {
   const inputBodies: Array<{ dataBase64?: string }> = [];
   const server = http.createServer((request, response) => {
@@ -869,6 +1251,112 @@ test("Windows agent preserves input request order", async () => {
   session.detach();
   server.close();
   await once(server, "close");
+});
+
+test("Windows agent coalesces resize bursts and repaints a settled alternate screen once", async () => {
+  const resizes: Array<{ cols: number; rows: number }> = [];
+  const historical = "\x1b[?1049h\x1b[2J\x1b[HREADY";
+  const historyBytes = Buffer.byteLength(historical);
+  let activeResizes = 0;
+  let maxActiveResizes = 0;
+  let remoteCols = 80;
+  let remoteRows = 24;
+  const server = http.createServer(async (request, response) => {
+    const path = request.url ?? "";
+    response.setHeader("content-type", "application/json");
+    if (request.method === "POST" && path === "/sessions/pane_resize_burst") {
+      response.end(JSON.stringify({
+        id: "pane_resize_burst",
+        pid: 123,
+        base: 0,
+        cursor: historyBytes,
+        cols: remoteCols,
+        rows: remoteRows,
+      }));
+      return;
+    }
+    if (request.method === "POST" && path.endsWith("/resize")) {
+      activeResizes += 1;
+      maxActiveResizes = Math.max(maxActiveResizes, activeResizes);
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { cols: number; rows: number };
+      resizes.push(body);
+      if (resizes.length === 1) await new Promise((resolve) => setTimeout(resolve, 80));
+      remoteCols = body.cols;
+      remoteRows = body.rows;
+      activeResizes -= 1;
+      response.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    if (request.method === "GET" && path.includes("/output")) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      const cursor = Number(new URL(path, "http://agent.invalid").searchParams.get("cursor") ?? 0);
+      response.end(JSON.stringify({
+        base: 0,
+        startCursor: cursor,
+        cursor: historyBytes,
+        cols: remoteCols,
+        rows: remoteRows,
+        resizes: [],
+        dataBase64: cursor === 0 ? Buffer.from(historical).toString("base64") : "",
+        exited: false,
+      }));
+      return;
+    }
+    response.writeHead(404);
+    response.end(JSON.stringify({ error: "not_found" }));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const session = new WindowsAgentSession(
+    {
+      id: "pane_resize_burst",
+      machineId: "windows",
+      title: "PowerShell",
+      status: "idle",
+      createdAt: new Date(0).toISOString(),
+    },
+    {
+      id: "windows",
+      name: "Windows",
+      kind: "powershell-ssh",
+      host: "127.0.0.1",
+      sessionBackend: "agent",
+      agentUrl: `http://127.0.0.1:${address.port}`,
+    },
+    80,
+    24,
+  );
+  const output: string[] = [];
+  session.on("output", (data) => output.push(data));
+  try {
+    await session.attachReady;
+    session.resize(85, 25);
+    session.resize(87, 26);
+    session.resize(90, 28);
+    await waitUntil(() => resizes.length === 1);
+    session.resize(100, 31);
+    session.resize(110, 35);
+
+    await waitUntil(() => remoteCols === 110 && remoteRows === 35);
+    await waitUntil(() => output.length === 1, 2000);
+    assert.deepEqual(resizes, [
+      { cols: 90, rows: 28 },
+      { cols: 110, rows: 35 },
+    ]);
+    assert.equal(maxActiveResizes, 1);
+    assert.equal(output.length, 1);
+    assert.match(output[0] ?? "", /^\x1bc\x1b\[\?1049h/);
+    const checkpoint = (session as unknown as { checkpoint: TerminalCheckpoint }).checkpoint;
+    assert.deepEqual(checkpoint.dimensions, { cols: 110, rows: 35 });
+  } finally {
+    session.detach();
+    server.close();
+    await once(server, "close");
+  }
 });
 
 test("Windows agent hydrates a 24-row replay before attaching it to a taller split", async () => {

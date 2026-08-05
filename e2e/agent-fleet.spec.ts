@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "./fixtures";
+import { awaitAppShell, expect, test, type Page } from "./fixtures";
 import { e2eRegistrationToken } from "./config-auth.js";
 
 interface FleetWorkspace {
@@ -119,9 +119,7 @@ test("shows three concurrent agents on two machines within one event revision", 
     }
 
     await navigateToApp(page);
-    await expect(page.locator("main.app-shell")).toBeVisible({
-      timeout: 20_000,
-    });
+    await awaitAppShell(page);
     await page.keyboard.press("Control+K");
     const palette = page.getByRole("dialog", { name: "Command palette" });
     const search = palette.getByPlaceholder(

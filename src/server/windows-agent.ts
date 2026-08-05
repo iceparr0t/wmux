@@ -3,7 +3,6 @@ import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
-import net from "node:net";
 import {
   WINDOWS_AGENT_LONG_POLL,
   WINDOWS_AGENT_PATHS,
@@ -24,13 +23,17 @@ import {
 } from "./windows-helpers.js";
 import { appendBoundedReplay } from "./replay-buffer.js";
 import { captureOsc7 } from "./osc7.js";
+import {
+  sessionAgentOriginAtPort,
+  sessionAgentOriginForEndpoint,
+} from "./session-agent-origin.js";
 import { selectAttachReplay, TerminalCheckpoint, type AttachReplay } from "./terminal-checkpoint.js";
 
 interface AgentEvents {
   output: [string];
   title: [string];
   cwd: [string];
-  agentPort: [number];
+  agentPort: [number, string];
   phase: [PaneStartupPhase, string];
   exit: [number | null];
 }
@@ -46,15 +49,23 @@ const MAX_REPLAY_BYTES = 2 * 1024 * 1024;
 const SESSION_CREATE_TIMEOUT_MS = 30_000;
 const UPDATE_ACTIVATION_TIMEOUT_MS = 30_000;
 const UPDATE_RESTART_TIMEOUT_MS = 60_000;
+const LIVE_RESIZE_SETTLE_MS = 100;
+const RESIZE_REPAINT_QUIET_MS = 120;
+const RESIZE_REPAINT_MAX_WAIT_MS = 1000;
 
 export const windowsAgentUrl = (machine: MachineConfig): string | undefined => {
-  if (machine.agentUrl) return machine.agentUrl.replace(/\/+$/, "");
-  if (machine.kind === "local" && machine.sessionBackend === "agent") {
-    return `http://127.0.0.1:${machine.agentPort ?? 3481}`;
-  }
-  if (!machine.host) return undefined;
-  const host = net.isIP(machine.host) === 6 ? `[${machine.host}]` : machine.host;
-  return `http://${host}:${machine.agentPort ?? 3481}`;
+  return sessionAgentOriginForEndpoint(machine);
+};
+
+const agentPortFromUrl = (url: string): number => {
+  const parsed = new URL(url);
+  if (parsed.port) return Number(parsed.port);
+  return parsed.protocol === "https:" ? 443 : 80;
+};
+
+export const windowsAgentPort = (machine: MachineConfig): number => {
+  const url = windowsAgentUrl(machine);
+  return url ? agentPortFromUrl(url) : machine.agentPort ?? 3481;
 };
 
 export const shouldUseWindowsAgent = (machine: MachineConfig): boolean =>
@@ -301,7 +312,14 @@ export class WindowsAgentSession extends EventEmitter<AgentEvents> {
   private cwdCaptureBuffer = "";
   private observedCwdFromOutput = false;
   private ready = false;
+  private desiredCols: number;
+  private desiredRows: number;
   private pendingResize: { cols: number; rows: number } | undefined;
+  private resizeInFlight: Promise<void> | undefined;
+  private resizeSettleTimer: ReturnType<typeof setTimeout> | undefined;
+  private resizeRepaintTimer: ReturnType<typeof setTimeout> | undefined;
+  private resizeRepaintDeadline = 0;
+  private resizeRepaintSawOutput = false;
   private pendingInput: Array<{ data: string; terminalResponse: boolean }> = [];
   private inputQueue: Promise<void> = Promise.resolve();
   private stopped = false;
@@ -323,6 +341,7 @@ export class WindowsAgentSession extends EventEmitter<AgentEvents> {
     private readonly activateUpdate: WindowsAgentUpdateActivator = activateWindowsAgentUpdate,
     private readonly updateRestartTimeoutMs = UPDATE_RESTART_TIMEOUT_MS,
     private readonly restoredCheckpoint?: AttachReplay,
+    private readonly configuredBaseAgentPort?: number,
     private readonly runtimeFiles: BackendRuntimeFile[] = [],
   ) {
     super();
@@ -332,6 +351,8 @@ export class WindowsAgentSession extends EventEmitter<AgentEvents> {
     });
     this.cwd = pane.cwd ?? "";
     this.agentUrl = windowsAgentUrl(machine);
+    this.desiredCols = cols;
+    this.desiredRows = rows;
     queueMicrotask(() => void this.start());
   }
 
@@ -354,6 +375,10 @@ export class WindowsAgentSession extends EventEmitter<AgentEvents> {
       this.checkpoint,
       true,
     );
+    if (current.kind === "checkpoint") {
+      const seeded = this.checkpoint.snapshotWithScrollbackSeed();
+      if (seeded) current.data = seeded;
+    }
     if (!this.restoredCheckpoint || this.liveOutputObserved) return current;
     return this.restoredCheckpoint;
   }
@@ -383,6 +408,7 @@ export class WindowsAgentSession extends EventEmitter<AgentEvents> {
     }
     this.inputQueue = this.inputQueue.then(async () => {
       if (this.exited || this.stopped) return;
+      await this.flushPendingResize();
       await this.post(WINDOWS_AGENT_PATHS.input(this.pane.id), {
         dataBase64: Buffer.from(data, "utf8").toString("base64"),
         terminalResponse,
@@ -392,16 +418,19 @@ export class WindowsAgentSession extends EventEmitter<AgentEvents> {
 
   resize(cols: number, rows: number): void {
     if (this.exited || this.stopped || cols < 2 || rows < 1) return;
+    this.desiredCols = cols;
+    this.desiredRows = rows;
+    if (!sameSize(this.checkpoint.dimensions, cols, rows)) {
+      this.checkpoint.reframe(cols, rows);
+    }
+    // The browser has already resized its renderer. Keep this checkpoint for
+    // later attaches only: emitting its RIS-based snapshot here would clear
+    // live scrollback and flash a full-screen repaint for every drag step.
+    this.pendingResize = { cols, rows };
     if (!this.ready) {
-      this.pendingResize = { cols, rows };
       return;
     }
-    if (sameSize(this.checkpoint.dimensions, cols, rows)) return;
-    this.checkpoint.reframe(cols, rows);
-    void this.post(WINDOWS_AGENT_PATHS.resize(this.pane.id), { cols, rows })
-      .catch((error) => this.reportTransportFailure("resize", error));
-    const snapshot = this.checkpoint.snapshot();
-    if (snapshot) this.emit("output", snapshot);
+    this.schedulePendingResize();
   }
 
   kill(): void {
@@ -411,6 +440,8 @@ export class WindowsAgentSession extends EventEmitter<AgentEvents> {
   disposeRemote(): Promise<boolean> {
     if (this.disposal) return this.disposal;
     this.stopped = true;
+    this.cancelResizeSettle();
+    this.cancelResizeRepaint();
     this.checkpoint.dispose();
     this.resolveAttachReady();
     this.disposal = this.delete(WINDOWS_AGENT_PATHS.session(this.pane.id))
@@ -430,6 +461,8 @@ export class WindowsAgentSession extends EventEmitter<AgentEvents> {
   detach(): void {
     if (this.stopped) return;
     this.stopped = true;
+    this.cancelResizeSettle();
+    this.cancelResizeRepaint();
     this.checkpoint.dispose();
     this.resolveAttachReady();
   }
@@ -489,51 +522,12 @@ export class WindowsAgentSession extends EventEmitter<AgentEvents> {
       this.runtimeFiles.length = 0;
       const response = await this.post<AgentSessionResponse>(
         WINDOWS_AGENT_PATHS.session(this.pane.id),
-        {
-          cols: this.cols,
-          rows: this.rows,
-          cwd: this.cwd || this.machine.cwd || "",
-          shell: this.machine.shell || "",
-          loadPowerShellProfile: this.machine.loadPowerShellProfile === true,
-          agentProfileOptionalAuth: this.machine.source === "registered",
-          helperBundle: {
-            bundleVersion: helperBundle?.bundleVersion ?? "",
-            files: helperBundle?.files ?? [],
-          },
-          runtimeFiles: wireRuntimeFiles,
-          env: {
-            WMUX_MACHINE_ID: this.machine.id,
-            WMUX_MACHINE_NAME: this.machine.name,
-            ...this.extraEnv,
-          },
-        },
+        this.sessionCreatePayload(this.cols, this.rows, helperBundle, wireRuntimeFiles),
         SESSION_CREATE_TIMEOUT_MS,
       );
-      this.pidValue = response.pid ?? 0;
-      this.cursor = typeof response.base === "number" ? response.base : 0;
-      if (response.cwd) {
-        this.cwd = response.cwd;
-        this.emit("cwd", response.cwd);
-      }
-      const historyBytes = Math.max(0, (response.cursor ?? this.cursor) - this.cursor);
-      const replayCols = response.cols ?? (historyBytes > 0 ? 80 : this.cols);
-      const replayRows = response.rows ?? (historyBytes > 0 ? 24 : this.rows);
-      this.checkpoint.reframe(replayCols, replayRows);
-      if (historyBytes > 0) this.reportPhase("replaying", "Restoring terminal state…");
-      await this.hydrateReplay(response.cursor ?? this.cursor);
-      if (historyBytes > 0 && response.cols && response.rows) {
-        this.liveOutputObserved = true;
-      }
+      await this.acceptSession(response, this.cols, this.rows, false);
       this.ready = true;
-      const pendingResize = this.pendingResize;
-      this.pendingResize = undefined;
-      if (pendingResize && !sameSize(this.checkpoint.dimensions, pendingResize.cols, pendingResize.rows)) {
-        this.checkpoint.reframe(pendingResize.cols, pendingResize.rows);
-        await this.post(WINDOWS_AGENT_PATHS.resize(this.pane.id), pendingResize);
-      }
-      const pendingInput = this.pendingInput;
-      this.pendingInput = [];
-      for (const input of pendingInput) this.postInput(input.data, input.terminalResponse);
+      await this.flushPendingOperations();
       this.resolveAttachReady();
       this.emit("title", this.machine.name);
       void this.poll();
@@ -554,6 +548,182 @@ export class WindowsAgentSession extends EventEmitter<AgentEvents> {
       this.resolveAttachReady();
       this.emit("exit", 1);
     }
+  }
+
+  private sessionCreatePayload(
+    cols: number,
+    rows: number,
+    helperBundle?: WindowsHelperBundle,
+    runtimeFiles: Array<{ purpose: string; dataBase64: string; sha256: string }> = [],
+    reuseRuntimeFiles = false,
+  ): Record<string, unknown> {
+    return {
+      cols,
+      rows,
+      cwd: this.cwd || this.machine.cwd || "",
+      shell: this.machine.shell || "",
+      loadPowerShellProfile: this.machine.loadPowerShellProfile === true,
+      agentProfileOptionalAuth: this.machine.source === "registered",
+      helperBundle: {
+        bundleVersion: helperBundle?.bundleVersion ?? "",
+        files: helperBundle?.files ?? [],
+      },
+      runtimeFiles,
+      ...(reuseRuntimeFiles ? { reuseRuntimeFiles: true } : {}),
+      env: {
+        WMUX_MACHINE_ID: this.machine.id,
+        WMUX_MACHINE_NAME: this.machine.name,
+        ...this.extraEnv,
+      },
+    };
+  }
+
+  private async acceptSession(
+    response: AgentSessionResponse,
+    fallbackCols: number,
+    fallbackRows: number,
+    recreated: boolean,
+  ): Promise<void> {
+    if (recreated) {
+      this.checkpoint.dispose();
+      this.checkpoint = new TerminalCheckpoint(fallbackCols, fallbackRows, this.extraEnv);
+      this.replay = [];
+      this.replayBytes = 0;
+      this.replayTruncated = false;
+      this.cwdCaptureBuffer = "";
+      this.observedCwdFromOutput = false;
+      // A new remote process invalidates both the restored checkpoint and the
+      // old live screen. Clear it before replaying the replacement shell.
+      this.liveOutputObserved = true;
+      this.liveResetEmitted = true;
+      this.appendAndEmit(
+        `\x1bc\r\n[wmux] Session agent restarted; opened a new shell for this pane.\r\n`,
+      );
+    }
+    this.pidValue = response.pid ?? 0;
+    this.cursor = typeof response.base === "number" ? response.base : 0;
+    if (response.cwd) {
+      this.cwd = response.cwd;
+      this.emit("cwd", response.cwd);
+    }
+    const historyBytes = Math.max(0, (response.cursor ?? this.cursor) - this.cursor);
+    const replayCols = response.cols ?? (historyBytes > 0 ? 80 : fallbackCols);
+    const replayRows = response.rows ?? (historyBytes > 0 ? 24 : fallbackRows);
+    this.checkpoint.reframe(replayCols, replayRows);
+    if (historyBytes > 0) this.reportPhase("replaying", "Restoring terminal state…");
+    await this.hydrateReplay(response.cursor ?? this.cursor);
+    if (historyBytes > 0 && response.cols && response.rows) {
+      this.liveOutputObserved = true;
+    }
+  }
+
+  private async flushPendingOperations(): Promise<void> {
+    await this.flushPendingResize();
+    const pendingInput = this.pendingInput;
+    this.pendingInput = [];
+    for (const input of pendingInput) this.postInput(input.data, input.terminalResponse);
+  }
+
+  private startPendingResize(): void {
+    if (!this.ready || this.resizeInFlight || this.stopped || this.exited) return;
+    const next = this.pendingResize;
+    if (!next) return;
+    this.pendingResize = undefined;
+    const request = this.post<void>(WINDOWS_AGENT_PATHS.resize(this.pane.id), next)
+      .then(() => this.armResizeRepaint())
+      .catch((error) => this.reportTransportFailure("resize", error));
+    // The agent accepts requests concurrently, so permit only one resize on
+    // the wire and retain just the newest geometry while it is in flight.
+    this.resizeInFlight = request;
+    void request.finally(() => {
+      if (this.resizeInFlight !== request) return;
+      this.resizeInFlight = undefined;
+      if (this.pendingResize) this.schedulePendingResize();
+    });
+  }
+
+  private schedulePendingResize(): void {
+    this.cancelResizeSettle();
+    this.resizeSettleTimer = setTimeout(() => {
+      this.resizeSettleTimer = undefined;
+      this.startPendingResize();
+    }, LIVE_RESIZE_SETTLE_MS);
+    this.resizeSettleTimer.unref?.();
+  }
+
+  private cancelResizeSettle(): void {
+    if (this.resizeSettleTimer) clearTimeout(this.resizeSettleTimer);
+    this.resizeSettleTimer = undefined;
+  }
+
+  private armResizeRepaint(): void {
+    this.resizeRepaintDeadline = Date.now() + RESIZE_REPAINT_MAX_WAIT_MS;
+    this.resizeRepaintSawOutput = false;
+    this.scheduleResizeRepaint(RESIZE_REPAINT_MAX_WAIT_MS);
+  }
+
+  private noteResizeRepaintOutput(): void {
+    if (!this.resizeRepaintDeadline) return;
+    this.resizeRepaintSawOutput = true;
+    this.scheduleResizeRepaint(RESIZE_REPAINT_QUIET_MS);
+  }
+
+  private scheduleResizeRepaint(delayMs: number): void {
+    if (this.resizeRepaintTimer) clearTimeout(this.resizeRepaintTimer);
+    this.resizeRepaintTimer = setTimeout(() => {
+      this.resizeRepaintTimer = undefined;
+      if (this.pendingResize || this.resizeInFlight) {
+        this.scheduleResizeRepaint(RESIZE_REPAINT_QUIET_MS);
+        return;
+      }
+      if (!this.resizeRepaintSawOutput && Date.now() < this.resizeRepaintDeadline) {
+        this.scheduleResizeRepaint(this.resizeRepaintDeadline - Date.now());
+        return;
+      }
+      this.resizeRepaintDeadline = 0;
+      this.resizeRepaintSawOutput = false;
+      if (!this.checkpoint.isAlternateScreen) return;
+      const snapshot = this.checkpoint.snapshot();
+      if (snapshot) this.emit("output", snapshot);
+    }, Math.max(0, delayMs));
+    this.resizeRepaintTimer.unref?.();
+  }
+
+  private cancelResizeRepaint(): void {
+    if (this.resizeRepaintTimer) clearTimeout(this.resizeRepaintTimer);
+    this.resizeRepaintTimer = undefined;
+    this.resizeRepaintDeadline = 0;
+    this.resizeRepaintSawOutput = false;
+  }
+
+  private async flushPendingResize(): Promise<void> {
+    while (!this.stopped && !this.exited) {
+      this.cancelResizeSettle();
+      this.startPendingResize();
+      const request = this.resizeInFlight;
+      if (!request) return;
+      await request;
+    }
+  }
+
+  private async recreateMissingSession(): Promise<void> {
+    this.ready = false;
+    this.cancelResizeSettle();
+    await this.resizeInFlight;
+    const dimensions = { cols: this.desiredCols, rows: this.desiredRows };
+    const helperBundle = shouldUseWindowsAgent(this.machine)
+      ? buildWindowsHelperBundle(this.machine)
+      : undefined;
+    const response = await this.post<AgentSessionResponse>(
+      WINDOWS_AGENT_PATHS.session(this.pane.id),
+      this.sessionCreatePayload(dimensions.cols, dimensions.rows, helperBundle, [], true),
+      SESSION_CREATE_TIMEOUT_MS,
+    );
+    if (this.stopped || this.exited) return;
+    await this.acceptSession(response, dimensions.cols, dimensions.rows, true);
+    this.ready = true;
+    await this.flushPendingOperations();
+    this.emit("title", this.machine.name);
   }
 
   private async ensureCurrentAgent(helperBundle: WindowsHelperBundle): Promise<boolean> {
@@ -637,11 +807,26 @@ export class WindowsAgentSession extends EventEmitter<AgentEvents> {
     }
 
     if (activeSessions === 0) {
-      // Nothing is owned by the outdated base process, so replace it in place.
-      // Existing side-by-side generations have independent tasks and remain
-      // available to panes already pinned to them.
+      // Nothing is owned by the outdated process, so replace it in place.
+      // A pane restored on a side-by-side generation must refresh that exact
+      // generation instead of arming an unrelated base-agent restart.
       this.reportPhase("starting-generation", "Updating the Windows agent…");
-      await this.activateUpdate(this.machine);
+      const currentPort = this.currentAgentPort();
+      try {
+        await this.activateUpdate(
+          this.machine,
+          currentPort === this.baseAgentPort() ? undefined : currentPort,
+        );
+      } catch (error) {
+        // The service helper atomically fences an observed-idle generation and
+        // refuses replacement if a concurrent create won first. Re-probe and
+        // use another rollout slot instead of terminating that new session.
+        const rolloutPort = await this.selectRolloutPort();
+        if (rolloutPort === currentPort) throw error;
+        this.reportPhase("starting-generation", `Starting Windows agent generation ${rolloutPort}…`);
+        await this.activateAndRouteGeneration(rolloutPort, helperBundle);
+        return !this.stopped;
+      }
     } else {
       const currentGeneration = await this.findCurrentGeneration(helperBundle);
       if (currentGeneration !== undefined) {
@@ -653,40 +838,8 @@ export class WindowsAgentSession extends EventEmitter<AgentEvents> {
 
       const rolloutPort = await this.selectRolloutPort();
       this.reportPhase("starting-generation", `Starting Windows agent generation ${rolloutPort}…`);
-      const activatedPort = await this.activateUpdate(this.machine, rolloutPort);
-      if (typeof activatedPort === "number") {
-        const basePort = this.baseAgentPort();
-        const activatedUrl = this.urlForAgentPort(activatedPort);
-        let current: WindowsAgentHealth;
-        try {
-          current = await requestJson<WindowsAgentHealth>(
-            "GET",
-            `${activatedUrl}${WINDOWS_AGENT_PATHS.health}`,
-            undefined,
-            3000,
-            authHeaders(this.machine),
-          );
-        } catch (error) {
-          throw new Error(
-            `new Windows agent generation on port ${activatedPort} is not reachable from wmux; `
-            + `allow inbound TCP ${basePort}-${basePort + 8} from the wmux server `
-            + `(wmux-windows-setup configure-agent-firewall <wmux-server-internal-ip>): ${formatError(error)}`,
-          );
-        }
-        const currentRelease = current.releaseVersion ?? current.version;
-        if (
-          current.ok !== true
-          || currentRelease !== expectedRelease
-          || (current.protocolVersion ?? 0) < expectedProtocol
-          || current.helperBundleVersion !== helperBundle.bundleVersion
-        ) {
-          throw new Error(`new Windows agent generation on port ${activatedPort} did not report the staged version`);
-        }
-        // Persist the selected generation only after it is reachable and reports
-        // the staged version. Otherwise a failed rollout would strand retries on
-        // an unavailable adjacent port instead of the still-running base agent.
-        this.routeToAgentPort(activatedPort);
-        this.appendAndEmit(`\r\n[wmux] Updated Windows agent generation is ready on port ${activatedPort}; opening pane.\r\n`);
+      const activatedPort = await this.activateAndRouteGeneration(rolloutPort, helperBundle);
+      if (activatedPort !== undefined) {
         return !this.stopped;
       }
 
@@ -723,20 +876,18 @@ export class WindowsAgentSession extends EventEmitter<AgentEvents> {
   }
 
   private baseAgentPort(): number {
-    if (this.machine.agentPort) return this.machine.agentPort;
-    if (!this.agentUrl) return 3481;
-    const parsed = new URL(this.agentUrl);
-    return parsed.port ? Number(parsed.port) : parsed.protocol === "https:" ? 443 : 80;
+    return this.configuredBaseAgentPort ?? windowsAgentPort(this.machine);
+  }
+
+  private currentAgentPort(): number {
+    return this.agentUrl ? agentPortFromUrl(this.agentUrl) : windowsAgentPort(this.machine);
   }
 
   private urlForAgentPort(port: number): string {
     if (!this.agentUrl) throw new Error(`machine ${this.machine.id} is missing Windows agent URL`);
-    const parsed = new URL(this.agentUrl);
-    parsed.port = String(port);
-    parsed.pathname = "";
-    parsed.search = "";
-    parsed.hash = "";
-    return parsed.toString().replace(/\/+$/, "");
+    const candidate = sessionAgentOriginAtPort(this.agentUrl, port);
+    if (!candidate) throw new Error(`machine ${this.machine.id} has an invalid Windows agent origin`);
+    return candidate;
   }
 
   private async generationHealth(port: number, timeoutMs = 750): Promise<WindowsAgentHealth | undefined> {
@@ -783,9 +934,48 @@ export class WindowsAgentSession extends EventEmitter<AgentEvents> {
     throw new Error("all Windows agent rollout ports are occupied by active generations");
   }
 
+  private async activateAndRouteGeneration(
+    rolloutPort: number,
+    helperBundle: WindowsHelperBundle,
+  ): Promise<number | undefined> {
+    const activatedPort = await this.activateUpdate(this.machine, rolloutPort);
+    if (typeof activatedPort !== "number") return undefined;
+    const basePort = this.baseAgentPort();
+    const activatedUrl = this.urlForAgentPort(activatedPort);
+    let current: WindowsAgentHealth;
+    try {
+      current = await requestJson<WindowsAgentHealth>(
+        "GET",
+        `${activatedUrl}${WINDOWS_AGENT_PATHS.health}`,
+        undefined,
+        3000,
+        authHeaders(this.machine),
+      );
+    } catch (error) {
+      throw new Error(
+        `new Windows agent generation on port ${activatedPort} is not reachable from wmux; `
+        + `allow inbound TCP ${basePort}-${basePort + 8} from the wmux server `
+        + `(wmux-windows-setup configure-agent-firewall <wmux-server-internal-ip>): ${formatError(error)}`,
+      );
+    }
+    const currentRelease = current.releaseVersion ?? current.version;
+    if (
+      current.ok !== true
+      || currentRelease !== expectedWindowsAgentReleaseVersion()
+      || (current.protocolVersion ?? 0) < expectedWindowsAgentProtocolVersion()
+      || current.helperBundleVersion !== helperBundle.bundleVersion
+    ) {
+      throw new Error(`new Windows agent generation on port ${activatedPort} did not report the staged version`);
+    }
+    // Pin only a reachable generation that reports the staged identity.
+    this.routeToAgentPort(activatedPort);
+    this.appendAndEmit(`\r\n[wmux] Updated Windows agent generation is ready on port ${activatedPort}; opening pane.\r\n`);
+    return activatedPort;
+  }
+
   private routeToAgentPort(port: number): void {
     this.agentUrl = this.urlForAgentPort(port);
-    this.emit("agentPort", port);
+    this.emit("agentPort", port, this.agentUrl);
   }
 
   private reportPendingUpdate(actual: string, expected: string, activeSessions: number): void {
@@ -851,6 +1041,17 @@ export class WindowsAgentSession extends EventEmitter<AgentEvents> {
         }
       } catch (error) {
         if (this.stopped) return;
+        if (isUnknownAgentSessionError(error)) {
+          try {
+            await this.recreateMissingSession();
+            continue;
+          } catch (recoveryError) {
+            if (this.stopped) return;
+            this.reportTransportFailure("session recovery", recoveryError);
+            await delay(1000);
+            continue;
+          }
+        }
         this.appendAndEmit(`\r\n[wmux] Windows agent polling failed: ${formatError(error)}\r\n`);
         await delay(1000);
       }
@@ -881,6 +1082,12 @@ export class WindowsAgentSession extends EventEmitter<AgentEvents> {
     }
     this.appendAndEmit(data.subarray(offset).toString("utf8"), emit);
     this.cursor = endCursor;
+    // A long poll can describe geometry captured before a newer browser
+    // resize. Preserve its byte-boundary replay above, then converge the
+    // attach checkpoint on the latest requested viewport.
+    if (!sameSize(this.checkpoint.dimensions, this.desiredCols, this.desiredRows)) {
+      this.checkpoint.reframe(this.desiredCols, this.desiredRows);
+    }
   }
 
   private async get<T>(path: string, timeoutMs = 5000): Promise<T> {
@@ -916,6 +1123,7 @@ export class WindowsAgentSession extends EventEmitter<AgentEvents> {
       this.liveResetEmitted = true;
       this.liveOutputObserved = true;
     }
+    this.noteResizeRepaintOutput();
   }
 
   private appendReplay(data: string): void {
@@ -1071,6 +1279,26 @@ export const activateWindowsAgentUpdate: WindowsAgentUpdateActivator = async (ma
   });
 };
 
+class AgentHttpError extends Error {
+  readonly agentCode?: string;
+
+  constructor(readonly statusCode: number, rawBody: string) {
+    super(`HTTP ${statusCode}${rawBody ? `: ${rawBody.slice(0, 200)}` : ""}`);
+    this.name = "AgentHttpError";
+    try {
+      const payload = JSON.parse(rawBody) as { error?: unknown };
+      if (typeof payload.error === "string") this.agentCode = payload.error;
+    } catch {
+      // Preserve the HTTP failure even when the agent returned non-JSON text.
+    }
+  }
+}
+
+const isUnknownAgentSessionError = (error: unknown): boolean =>
+  error instanceof AgentHttpError
+  && error.statusCode === 404
+  && error.agentCode === "unknown_session";
+
 const requestJson = <T>(
   method: string,
   rawUrl: string,
@@ -1103,7 +1331,7 @@ const requestJson = <T>(
         response.on("end", () => {
           const raw = Buffer.concat(chunks).toString("utf8");
           if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
-            reject(new Error(`HTTP ${response.statusCode ?? 0}${raw ? `: ${raw.slice(0, 200)}` : ""}`));
+            reject(new AgentHttpError(response.statusCode ?? 0, raw));
             return;
           }
           try {

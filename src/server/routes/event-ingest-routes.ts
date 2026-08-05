@@ -7,6 +7,8 @@ import {
   routePolicy,
 } from "./route.js";
 
+const SUCCESS_CLEANUP_GRACE_MS = 30_000;
+
 export const eventIngestRoutes: readonly ApiRoute[] = [
   {
     id: "notification-create",
@@ -68,7 +70,14 @@ export const eventIngestRoutes: readonly ApiRoute[] = [
         message: body.message,
         prompt: body.prompt,
         body: body.body,
+        coalesce: body.coalesce,
       });
+      if (result.agentEvent.status === "completed") {
+        deps.state.scheduleWorkspaceCleanupAfterSuccess(
+          result.workspace.id,
+          SUCCESS_CLEANUP_GRACE_MS,
+        );
+      }
       sendJson(201, { ...result, state: deps.currentPayload() });
     },
   },
@@ -147,6 +156,12 @@ export const eventIngestRoutes: readonly ApiRoute[] = [
         startedAt: body.startedAt,
         completedAt: body.completedAt,
       });
+      if (run.status === "completed") {
+        deps.state.scheduleWorkspaceCleanupAfterSuccess(
+          run.workspaceId,
+          SUCCESS_CLEANUP_GRACE_MS,
+        );
+      }
       sendJson(201, { run, state: deps.currentPayload() });
     },
   },

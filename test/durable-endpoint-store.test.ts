@@ -42,6 +42,91 @@ test("durable endpoint records survive restart with owner-only permissions", () 
   }
 });
 
+test("static remote and session-agent endpoints are persisted while local multiplexers stay audit-owned", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-endpoint-static-"));
+  const filePath = path.join(directory, "session-endpoints.json");
+  try {
+    const store = new DurableEndpointStore(filePath);
+    const remote = store.bind("pane-remote", {
+      id: "static-remote",
+      name: "Static remote",
+      kind: "ssh",
+      host: "100.64.0.20",
+      user: "wmux",
+      sessionBackend: "auto",
+      source: "config",
+    }, "durable-multiplexer");
+    const agent = store.bind("pane-agent", {
+      id: "static-agent",
+      name: "Static agent",
+      kind: "powershell-ssh",
+      host: "100.64.0.21",
+      user: "wmux",
+      sessionBackend: "agent",
+      agentPort: 3481,
+      agentToken: "static-agent-secret",
+      source: "config",
+    }, "windows-agent");
+    const local = store.bind("pane-local", {
+      id: "local",
+      name: "Local",
+      kind: "local",
+      sessionBackend: "tmux",
+      source: "config",
+    }, "durable-multiplexer");
+
+    assert.equal(remote?.machine.source, "config");
+    assert.equal(agent?.machine.source, "config");
+    assert.equal(agent?.machine.agentToken, "static-agent-secret");
+    assert.equal(local, undefined);
+    assert.deepEqual(
+      store.snapshot().map((record) => record.paneId).sort(),
+      ["pane-agent", "pane-remote"],
+    );
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("version 1 endpoint ledgers migrate atomically to configured source support", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-endpoint-migrate-"));
+  const filePath = path.join(directory, "session-endpoints.json");
+  const recordId = "84eb13dc-cf36-487d-b243-746f84359a0a";
+  try {
+    fs.writeFileSync(filePath, `${JSON.stringify({
+      schemaVersion: 1,
+      records: [{
+        id: recordId,
+        paneId: "pane-legacy",
+        backend: "windows-agent",
+        status: "active",
+        machine: {
+          id: "legacy-registered",
+          name: "Legacy registered",
+          kind: "powershell-ssh",
+          host: "100.64.0.22",
+          sessionBackend: "agent",
+          agentPort: 3481,
+          agentToken: "legacy-secret",
+          source: "registered",
+        },
+        createdAt: "2026-07-30T10:00:00.000Z",
+        updatedAt: "2026-07-30T10:00:00.000Z",
+      }],
+    }, null, 2)}\n`, { mode: 0o600 });
+
+    const store = new DurableEndpointStore(filePath);
+    assert.equal(store.find(recordId)?.machine.source, "registered");
+    assert.equal(
+      JSON.parse(fs.readFileSync(filePath, "utf8")).schemaVersion,
+      CURRENT_DURABLE_ENDPOINT_SCHEMA_VERSION,
+    );
+    assert.equal(fs.statSync(`${filePath}.bak`).mode & 0o777, 0o600);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("reassignment strands the old endpoint and binds the replacement separately", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-endpoint-reassign-"));
   const filePath = path.join(directory, "session-endpoints.json");
@@ -77,6 +162,35 @@ test("reassignment strands the old endpoint and binds the replacement separately
     assert.equal(store.recordsForPane("pane-one").length, 2);
     assert.equal(store.find(first.id).status, "active");
     assert.equal(store.find(second.id).status, "stranded");
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("reconciliation retains a pane-pinned adjacent Windows agent generation", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-endpoint-generation-"));
+  try {
+    const store = new DurableEndpointStore(path.join(directory, "session-endpoints.json"));
+    const generation: MachineConfig = {
+      id: "windows",
+      name: "Windows",
+      kind: "powershell-ssh",
+      host: "windows-new.internal",
+      sessionBackend: "agent",
+      agentUrl: "http://100.64.0.20:3482",
+      agentPort: 3482,
+      agentToken: "agent-secret",
+      source: "config",
+    };
+    const record = store.bind("pane-generation", generation, "windows-agent");
+    assert.ok(record);
+    store.reconcile(
+      new Set(["pane-generation"]),
+      [{ ...generation, agentUrl: "http://100.64.0.30:3481", agentPort: 3481 }],
+      new Map([["pane-generation", generation]]),
+    );
+    assert.equal(store.find(record.id)?.status, "active");
+    assert.equal(store.activeForPane("pane-generation")?.machine.agentUrl, "http://100.64.0.20:3482");
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

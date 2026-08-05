@@ -107,7 +107,9 @@ export interface MachineStatus {
 export interface PaneState {
   id: string;
   machineId: string;
-  /** Windows agent generation port pinned for restart-safe side-by-side rollouts. */
+  /** Session-agent origin pinned for restart-safe side-by-side rollouts. */
+  agentUrl?: string;
+  /** Windows agent generation port retained for compatibility and display. */
   agentPort?: number;
   title: string;
   cwd?: string;
@@ -214,6 +216,7 @@ export type RepositoryReviewErrorCode =
 
 export type TitleSource = "default" | "auto" | "user";
 export type WorkspaceCreator = "user" | "agent";
+export type WorkspaceCleanupPolicy = "on-success";
 export type WorkspaceReorderPosition = "before" | "after" | "into" | "out-of";
 export type SplitDirection = "horizontal" | "vertical";
 
@@ -235,6 +238,9 @@ export interface Workspace {
   id: string;
   name: string;
   createdBy?: WorkspaceCreator;
+  /** Agent-owned one-shot work may close after success and always has a bounded lifetime. */
+  cleanupPolicy?: WorkspaceCleanupPolicy;
+  cleanupAt?: string;
   /** Parent is represented by preorder placement in workspaces, never an order key. */
   parentWorkspaceId?: string;
   nameSource?: TitleSource;
@@ -626,12 +632,15 @@ export type PaneServerMessage =
       pid: number;
       title: string;
       status: PaneState["status"];
-      resizeOwner?: boolean;
+      cols: number;
+      rows: number;
+      resizeOwner: boolean;
       replay: string;
       replayKind: PaneReplayKind;
       outputOnly?: boolean;
       waitForRefresh?: true;
     }
+  | { type: "size"; paneId: string; cols: number; rows: number; resizeOwner: boolean }
   | { type: "output"; paneId: string; data: string; inputSequence?: number }
   | { type: "title"; paneId: string; title: string }
   | { type: "exit"; paneId: string; code: number | null }

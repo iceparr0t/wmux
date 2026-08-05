@@ -90,7 +90,8 @@ export function RetroGraphicalBootScreen({
 
   useEffect(() => {
     if (!ready || authRequired || phase !== "ready") return;
-    const timeout = window.setTimeout(onComplete, 3_500);
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const timeout = window.setTimeout(onComplete, reducedMotion ? 0 : 3_500);
     return () => window.clearTimeout(timeout);
   }, [authRequired, onComplete, phase, ready]);
 
@@ -152,7 +153,7 @@ export function RetroGraphicalBootScreen({
   return (
     <main
       ref={hostRef}
-      className={`retro-boot-screen retro-graphical-boot retro-graphical-${shell}`}
+      className={`retro-boot-screen retro-graphical-boot retro-graphical-${shell}${ready ? " retro-boot-overlay" : ""}`}
       style={style}
       data-boot-profile={profile.id}
       data-boot-presentation="graphical"

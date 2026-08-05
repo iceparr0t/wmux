@@ -322,6 +322,8 @@ with tempfile.TemporaryDirectory() as home:
     module["stage_runtime_files"](payload, "pane-agent")
     capability_path = payload["env"]["WMUX_AGENT_INPUT_CAPABILITY_PATH"]
     credential_path = payload["env"]["WMUX_AGENT_INPUT_CREDENTIAL_PATH"]
+    recovered_payload = {"runtimeFiles": [], "reuseRuntimeFiles": True, "env": {}}
+    module["stage_runtime_files"](recovered_payload, "pane-agent")
     capability_mode = oct(os.stat(capability_path).st_mode & 0o777)
     with open(capability_path, "rb") as handle:
         capability_value = handle.read().decode("ascii")
@@ -345,6 +347,8 @@ with tempfile.TemporaryDirectory() as home:
         "capabilityValue": capability_value,
         "registrationInEnv": "WMUX_AGENT_INPUT_REGISTRATION_CAPABILITY" in payload["env"],
         "broadTokenPreservedForSession": payload["env"].get("WMUX_TOKEN"),
+        "recoveredCapabilityPath": recovered_payload["env"].get("WMUX_AGENT_INPUT_CAPABILITY_PATH"),
+        "recoveredCredentialPath": recovered_payload["env"].get("WMUX_AGENT_INPUT_CREDENTIAL_PATH"),
         "symlinkRefused": refused,
         "outside": outside_value,
     }))
@@ -359,6 +363,8 @@ with tempfile.TemporaryDirectory() as home:
   assert.equal(staged.capabilityValue, "aic_agent_runtime_capability\n");
   assert.equal(staged.registrationInEnv, false);
   assert.equal(staged.broadTokenPreservedForSession, "broad-session-token");
+  assert.equal(staged.recoveredCapabilityPath, staged.capabilityPath);
+  assert.equal(staged.recoveredCredentialPath, staged.credentialPath);
   assert.equal(staged.symlinkRefused, true);
   assert.equal(staged.outside, "outside");
 });
@@ -438,7 +444,7 @@ test("feature-disabled, legacy POSIX, and Windows agent sessions start without a
           : { ok: true, protocolVersion: 6, releaseVersion: "", capabilities: [] }));
         return;
       }
-      if (request.method === "POST") {
+      if (request.method === "POST" && /^\/sessions\/[^/]+$/.test(request.url ?? "")) {
         const chunks: Buffer[] = [];
         for await (const chunk of request) chunks.push(Buffer.from(chunk));
         captured.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));

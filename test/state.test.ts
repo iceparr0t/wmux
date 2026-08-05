@@ -6,7 +6,7 @@ import { test } from "node:test";
 import { AgentSessionService } from "../src/server/agent-sessions.js";
 import { StateIdConflictError, StateStore, WorkspaceDepthError } from "../src/server/state.js";
 import { CURRENT_STATE_SCHEMA_VERSION, parsePersistedState } from "../src/server/state-schema.js";
-import type { MachineConfig } from "../src/server/types.js";
+import type { MachineConfig, PersistedState } from "../src/server/types.js";
 
 const machines: MachineConfig[] = [{ id: "local", name: "Local", kind: "local" }];
 const agentServices = new WeakMap<StateStore, AgentSessionService>();
@@ -295,6 +295,84 @@ test("version 4 delegations migrate explicit fleet attention reasons", () => {
   });
 });
 
+test("version 6 state migrates with existing workspaces retained indefinitely", () => {
+  withTempState((filePath) => {
+    const previous = new StateStore(machines, filePath).snapshot() as unknown as Record<string, unknown>;
+    previous.schemaVersion = 6;
+    fs.writeFileSync(filePath, JSON.stringify(previous));
+
+    const migrated = new StateStore(machines, filePath).snapshot();
+    assert.equal(migrated.schemaVersion, CURRENT_STATE_SCHEMA_VERSION);
+    assert.equal(migrated.workspaces[0].cleanupPolicy, undefined);
+    assert.equal(migrated.workspaces[0].cleanupAt, undefined);
+  });
+});
+
+test("both parent-v7 state shapes migrate losslessly into the unified v8 schema", () => {
+  withTempState((filePath) => {
+    const base = new StateStore(machines, filePath).snapshot();
+    const workspace = base.workspaces[0];
+    const tab = workspace.tabs[0];
+    const pane = tab.panes[0];
+    const notification = {
+      id: "note_v7_question",
+      workspaceId: workspace.id,
+      tabId: tab.id,
+      paneId: pane.id,
+      title: "Question",
+      subtitle: "input required",
+      body: "Choose an option",
+      createdAt: "2026-08-05T00:00:00.000Z",
+      read: false,
+      agentInputRequestId: "request_v7",
+      href: `/workspaces/${workspace.id}/tabs/${tab.id}?pane=${pane.id}`,
+    };
+    const variants: Array<{ name: string; mutate: (state: typeof base) => void }> = [
+      { name: "question-parent", mutate: (state) => { state.notifications = [notification]; } },
+      { name: "cleanup-parent", mutate: (state) => {
+        state.workspaces[0].createdBy = "agent";
+        state.workspaces[0].cleanupPolicy = "on-success";
+        state.workspaces[0].cleanupAt = "2026-08-06T00:00:00.000Z";
+      } },
+      { name: "combined", mutate: (state) => {
+        state.notifications = [notification];
+        state.workspaces[0].createdBy = "agent";
+        state.workspaces[0].cleanupPolicy = "on-success";
+        state.workspaces[0].cleanupAt = "2026-08-06T00:00:00.000Z";
+      } },
+      { name: "legacy-valid", mutate: () => undefined },
+    ];
+
+    for (const variant of variants) {
+      const candidate = structuredClone(base);
+      candidate.schemaVersion = 7;
+      variant.mutate(candidate);
+      const parsed = parsePersistedState(candidate);
+      assert.equal(parsed.migrated, true, variant.name);
+      assert.equal(parsed.state.schemaVersion, 8, variant.name);
+      assert.deepEqual(parsed.state.notifications, candidate.notifications, variant.name);
+      assert.equal(parsed.state.workspaces[0].cleanupPolicy, candidate.workspaces[0].cleanupPolicy, variant.name);
+      assert.equal(parsed.state.workspaces[0].cleanupAt, candidate.workspaces[0].cleanupAt, variant.name);
+    }
+  });
+});
+
+test("v7 migration persists v8 and v8 explicitly refuses newer rollback state", () => {
+  withTempState((filePath, dir) => {
+    const previous = new StateStore(machines, filePath).snapshot();
+    previous.schemaVersion = 7;
+    fs.writeFileSync(filePath, JSON.stringify(previous));
+    const migrated = new StateStore(machines, filePath);
+    assert.equal(migrated.snapshot().schemaVersion, 8);
+    assert.equal(JSON.parse(fs.readFileSync(filePath, "utf8")).schemaVersion, 8);
+    assert.throws(
+      () => parsePersistedState({ schemaVersion: 9 }),
+      /newer than this wmux build supports \(8\)/,
+    );
+    assert.equal(fs.readdirSync(dir).some((name) => name.includes(".corrupt-")), false);
+  });
+});
+
 test("state recovers from the last validated backup", () => {
   withTempState((filePath, dir) => {
     const store = new StateStore(machines, filePath);
@@ -319,7 +397,7 @@ test("newer state schemas refuse downgrade without moving or overwriting the fil
   });
 });
 
-test("current v6 state truncates an oversized notification body without losing workspace metadata", () => {
+test("current state truncates an oversized notification body without losing workspace metadata", () => {
   withTempState((filePath, dir) => {
     const seeded = new StateStore(machines, filePath).snapshot();
     seeded.workspaces[0].name = "Operator-owned workspace";
@@ -359,7 +437,7 @@ test("current v6 state truncates an oversized notification body without losing w
   });
 });
 
-test("current v6 backup truncates an oversized notification body without quarantine or workspace loss", () => {
+test("current backup truncates an oversized notification body without quarantine or workspace loss", () => {
   withTempState((filePath, dir) => {
     const seeded = new StateStore(machines, filePath).snapshot();
     seeded.workspaces[0].name = "Backup workspace";
@@ -434,6 +512,44 @@ test("server-only PowerShell profile preferences are not persisted in state", ()
     ], filePath).snapshot();
     assert.equal(snapshot.machines[0].loadPowerShellProfile, undefined);
     assert.doesNotMatch(fs.readFileSync(filePath, "utf8"), /loadPowerShellProfile/);
+  });
+});
+
+test("stale persisted machine endpoints cannot quarantine valid workspace state", () => {
+  withTempState((filePath, dir) => {
+    const initial = new StateStore(machines, filePath).snapshot();
+    initial.workspaces[0].name = "Keep this workspace";
+    initial.machines = [{
+      id: "epoch",
+      name: "Epoch",
+      kind: "powershell-ssh",
+      host: "epoch.lan",
+      sessionBackend: "agent",
+      agentPort: 3481,
+    }];
+    const stale = JSON.stringify(initial);
+    fs.writeFileSync(filePath, stale);
+    fs.writeFileSync(`${filePath}.bak`, stale);
+
+    const currentMachines: MachineConfig[] = [{
+      id: "epoch",
+      name: "Epoch",
+      kind: "powershell-ssh",
+      host: "epoch.lan",
+      sessionBackend: "agent",
+      agentUrl: "http://10.0.0.25:3481",
+      agentPort: 3481,
+    }];
+    const recovered = new StateStore(currentMachines, filePath).snapshot();
+
+    assert.equal(recovered.workspaces[0].name, "Keep this workspace");
+    assert.equal(recovered.machines[0].agentUrl, "http://10.0.0.25:3481");
+    assert.equal(fs.readdirSync(dir).some((name) => name.includes(".corrupt-")), false);
+    for (const persistedPath of [filePath, `${filePath}.bak`]) {
+      const persisted = JSON.parse(fs.readFileSync(persistedPath, "utf8")) as PersistedState;
+      assert.equal(persisted.workspaces[0].name, "Keep this workspace");
+      assert.equal(persisted.machines[0].agentUrl, "http://10.0.0.25:3481");
+    }
   });
 });
 
@@ -536,15 +652,16 @@ test("workspace reordering persists and ignores no-op moves", () => {
   });
 });
 
-test("Windows agent generation ports persist across restart", () => {
+test("Windows agent generation origins and ports persist across restart", () => {
   withTempState((filePath) => {
     const store = new StateStore(machines, filePath);
     const pane = store.snapshot().workspaces[0].tabs[0].panes[0];
-    store.updatePane(pane.id, { agentPort: 3482 });
+    store.updatePane(pane.id, { agentUrl: "http://100.64.0.25:3482", agentPort: 3482 });
     store.flush();
 
     const reloadedPane = new StateStore(machines, filePath).findPane(pane.id);
     assert.equal(reloadedPane?.agentPort, 3482);
+    assert.equal(reloadedPane?.agentUrl, "http://100.64.0.25:3482");
   });
 });
 
@@ -561,6 +678,69 @@ test("agent-created workspace origin persists while user workspaces remain unmar
     const reloaded = new StateStore(machines, filePath).snapshot();
     assert.equal(reloaded.workspaces.find((workspace) => workspace.id === userWorkspace.id)?.createdBy, undefined);
     assert.equal(reloaded.workspaces.find((workspace) => workspace.id === agentWorkspace.id)?.createdBy, "agent");
+  });
+});
+
+test("agent workspace cleanup policy persists, accelerates on success, and can be disarmed", () => {
+  withTempState((filePath) => {
+    const store = new StateStore(machines, filePath);
+    const originalCleanupAt = "2026-07-31T12:00:00.000Z";
+    const workspace = store.createWorkspace(
+      "local",
+      undefined,
+      "agent",
+      undefined,
+      undefined,
+      { policy: "on-success", cleanupAt: originalCleanupAt },
+    );
+
+    assert.equal(workspace.cleanupPolicy, "on-success");
+    assert.equal(workspace.cleanupAt, originalCleanupAt);
+    assert.deepEqual(store.expiredAgentWorkspaceIds(Date.parse(originalCleanupAt) - 1), []);
+    assert.deepEqual(store.expiredAgentWorkspaceIds(Date.parse(originalCleanupAt)), [workspace.id]);
+
+    const successAt = Date.parse("2026-07-29T12:00:00.000Z");
+    assert.equal(store.scheduleWorkspaceCleanupAfterSuccess(workspace.id, 5_000, successAt), true);
+    assert.equal(
+      store.snapshot().workspaces.find((candidate) => candidate.id === workspace.id)?.cleanupAt,
+      "2026-07-29T12:00:05.000Z",
+    );
+    store.flush();
+    assert.equal(
+      new StateStore(machines, filePath).snapshot().workspaces.find(
+        (candidate) => candidate.id === workspace.id,
+      )?.cleanupPolicy,
+      "on-success",
+    );
+
+    const retained = store.configureWorkspaceCleanup(workspace.id);
+    assert.equal(retained.cleanupPolicy, undefined);
+    assert.equal(retained.cleanupAt, undefined);
+    assert.deepEqual(store.expiredAgentWorkspaceIds(Number.MAX_SAFE_INTEGER), []);
+  });
+});
+
+test("user workspaces cannot be armed for automatic cleanup", () => {
+  withTempState((filePath) => {
+    const store = new StateStore(machines, filePath);
+    assert.throws(
+      () => store.createWorkspace(
+        "local",
+        undefined,
+        "user",
+        undefined,
+        undefined,
+        { policy: "on-success", cleanupAt: "2026-07-31T12:00:00.000Z" },
+      ),
+      /only agent workspaces/,
+    );
+    assert.throws(
+      () => store.configureWorkspaceCleanup(
+        store.snapshot().workspaces[0].id,
+        { policy: "on-success", cleanupAt: "2026-07-31T12:00:00.000Z" },
+      ),
+      /only agent workspaces/,
+    );
   });
 });
 
@@ -1010,5 +1190,72 @@ test("a new running event reconciles a prior turn without a stop hook", () => {
     assert.equal(current.summary, "Second turn");
     assert.equal(previous.status, "interrupted");
     assert.equal(previous.summary, "codex interrupted");
+  });
+});
+
+test("coalesced active hook observations do not interrupt or duplicate the current event", () => {
+  withTempState((filePath) => {
+    const store = new StateStore(machines, filePath);
+    const paneId = store.snapshot().workspaces[0].tabs[0].panes[0].id;
+    const first = agentsFor(store).recordAgentEvent({
+      paneId,
+      agent: "codex",
+      status: "running",
+      summary: "codex running",
+      coalesce: true,
+    });
+    const duplicate = agentsFor(store).recordAgentEvent({
+      paneId,
+      agent: "codex",
+      status: "running",
+      summary: "codex running",
+      coalesce: true,
+    });
+
+    assert.equal(duplicate.agentEvent.id, first.agentEvent.id);
+    assert.equal(store.snapshot().agentEvents.length, 1);
+    assert.equal(store.snapshot().agentEvents[0].status, "running");
+
+    agentsFor(store).recordAgentEvent({
+      paneId,
+      agent: "codex",
+      status: "completed",
+      summary: "Step complete",
+    });
+    const continuation = agentsFor(store).recordAgentEvent({
+      paneId,
+      agent: "codex",
+      status: "running",
+      summary: "codex running",
+      coalesce: true,
+    });
+    assert.notEqual(continuation.agentEvent.id, first.agentEvent.id);
+    assert.equal(store.snapshot().agentEvents[0].status, "running");
+    assert.equal(store.snapshot().agentEvents[1].status, "completed");
+  });
+});
+
+test("coalesced runless hooks inherit and preserve the current delegation", () => {
+  withTempState((filePath) => {
+    const store = new StateStore(machines, filePath);
+    const paneId = store.snapshot().workspaces[0].tabs[0].panes[0].id;
+    const first = agentsFor(store).recordAgentEvent({
+      paneId,
+      runId: "run-coalesced",
+      agent: "codex",
+      status: "running",
+      summary: "Starting",
+    });
+    const duplicate = agentsFor(store).recordAgentEvent({
+      paneId,
+      agent: "codex",
+      status: "running",
+      summary: "codex running",
+      coalesce: true,
+    });
+
+    assert.equal(duplicate.agentEvent.id, first.agentEvent.id);
+    assert.equal(store.snapshot().agentEvents.length, 1);
+    assert.equal(agentsFor(store).delegationForRun("run-coalesced")?.state, "running");
   });
 });

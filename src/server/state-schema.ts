@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { machineSchema } from "./config.js";
+import { normalizeSessionAgentOrigin } from "./session-agent-origin.js";
 import type {
   DelegationAttentionReason,
   DelegationRecord,
@@ -7,7 +8,7 @@ import type {
   PersistedState,
 } from "./types.js";
 
-export const CURRENT_STATE_SCHEMA_VERSION = 7;
+export const CURRENT_STATE_SCHEMA_VERSION = 8;
 
 export class UnsupportedStateVersionError extends Error {
   constructor(readonly version: number) {
@@ -24,6 +25,10 @@ const timestampSchema = z.string().min(1).max(80);
 const paneSchema = z.object({
   id: idSchema,
   machineId: idSchema,
+  agentUrl: z.string().max(2048).refine(
+    (value) => normalizeSessionAgentOrigin(value) !== undefined,
+    "agentUrl must be a private/internal HTTP IPv4 origin",
+  ).optional(),
   agentPort: z.number().int().min(1).max(65535).optional(),
   title: z.string().max(500),
   cwd: z.string().max(8192).optional(),
@@ -57,6 +62,8 @@ const workspaceSchema = z.object({
   id: idSchema,
   name: z.string().max(500),
   createdBy: z.enum(["user", "agent"]).optional(),
+  cleanupPolicy: z.literal("on-success").optional(),
+  cleanupAt: timestampSchema.optional(),
   parentWorkspaceId: idSchema.optional(),
   nameSource: titleSourceSchema.optional(),
   descriptor: z.string().max(2000).optional(),
@@ -167,6 +174,23 @@ const persistedStateSchema = z.object({
       context.addIssue({ code: "custom", path: ["workspaces", workspaceIndex, "id"], message: "duplicate workspace id" });
     }
     workspaceIds.add(workspace.id);
+    if (
+      (workspace.cleanupPolicy || workspace.cleanupAt)
+      && workspace.createdBy !== "agent"
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["workspaces", workspaceIndex, "cleanupPolicy"],
+        message: "only agent workspaces may have automatic cleanup",
+      });
+    }
+    if (Boolean(workspace.cleanupPolicy) !== Boolean(workspace.cleanupAt)) {
+      context.addIssue({
+        code: "custom",
+        path: ["workspaces", workspaceIndex, "cleanupAt"],
+        message: "workspace cleanup policy and deadline must be configured together",
+      });
+    }
     if (workspace.parentWorkspaceId === workspace.id) context.addIssue({ code: "custom", path: ["workspaces", workspaceIndex, "parentWorkspaceId"], message: "workspace cannot parent itself" });
     const tabIds = new Set<string>();
     for (const [tabIndex, tab] of workspace.tabs.entries()) {
@@ -421,10 +445,20 @@ export const migrateV5ToV6State = (
     : record.delegations,
 });
 
-/** v7 notifications may carry stable, contentless agent-input deep links. */
-export const migrateV6ToV7State = (record: Record<string, unknown>): Record<string, unknown> => ({
+/** v7 was independently released with either notification links or workspace lifetimes. */
+export const migrateV6ToV7State = (
+  record: Record<string, unknown>,
+): Record<string, unknown> => ({
   ...record,
   schemaVersion: 7,
+});
+
+/** v8 unifies both valid v7 shapes and adds a restart-pinned session-agent origin. */
+export const migrateV7ToV8State = (
+  record: Record<string, unknown>,
+): Record<string, unknown> => ({
+  ...record,
+  schemaVersion: 8,
 });
 
 export const parsePersistedState = (input: unknown): ParsedPersistedState => {
@@ -445,6 +479,7 @@ export const parsePersistedState = (input: unknown): ParsedPersistedState => {
     && rawVersion !== 4
     && rawVersion !== 5
     && rawVersion !== 6
+    && rawVersion !== 7
     && rawVersion !== CURRENT_STATE_SCHEMA_VERSION
   ) {
     throw new Error("state schemaVersion must be a supported integer");
@@ -465,9 +500,12 @@ export const parsePersistedState = (input: unknown): ParsedPersistedState => {
   const v6Candidate = rawVersion !== undefined && rawVersion >= 6
     ? record
     : migrateV5ToV6State(v5Candidate);
-  const candidate = rawVersion === CURRENT_STATE_SCHEMA_VERSION
+  const v7Candidate = rawVersion !== undefined && rawVersion >= 7
     ? record
     : migrateV6ToV7State(v6Candidate);
+  const candidate = rawVersion === CURRENT_STATE_SCHEMA_VERSION
+    ? record
+    : migrateV7ToV8State(v7Candidate);
   const normalized = normalizeNotificationBodies(candidate);
   return {
     state: persistedStateSchema.parse(normalized.record),

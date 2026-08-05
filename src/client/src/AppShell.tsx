@@ -41,6 +41,8 @@ import { compactMiddlePath, normalizeUserPath } from "./path-display";
 import { formatSessionReference } from "./session-reference";
 import { ScreenStreamViewer } from "./ScreenStream";
 import { Toasts, useToasts } from "./Toasts";
+import { hidePendingWorkspaceCloses } from "./workspace-close";
+import { WORKSPACE_CLOSE_GRACE_MS } from "../../shared/workspace-close";
 import { useAppRouting } from "./useAppRouting";
 import { useStoreLifecycle } from "./store/use-store-lifecycle";
 import { useKeyboardShortcuts } from "./useKeyboardShortcuts";
@@ -52,7 +54,11 @@ import { writeBrowserClipboard } from "./clipboard";
 import { summarizeWorkspaceVersion } from "./workspace-version";
 import { useMobileViewportState } from "./mobile-viewport";
 import { loadMachineTargetId, persistMachineTargetId, resolveMachineTargetId } from "./machine-target";
-import { workspacePresentationDescriptor, workspacePresentationMachineId } from "./workspace-presentation";
+import {
+  workspacePresentationDescriptor,
+  workspacePresentationMachineId,
+  workspacePresentationTarget,
+} from "./workspace-presentation";
 import {
   contextMobileSurfaceMode,
   legacyMobileSurfaceModeStorageKey,
@@ -66,6 +72,7 @@ import {
 import {
   deriveWorkspaceTree,
   expandWorkspaceAncestors,
+  orderWorkspaceRowsForDisplay,
   pruneCollapsedWorkspaceIds,
   pruneFavoriteWorkspaceIds,
   rebaseCollapsedWorkspaceIds,
@@ -127,10 +134,24 @@ interface PendingAction {
   label: string;
 }
 
+interface PendingWorkspaceClose {
+  request: ReturnType<typeof api.scheduleWorkspaceClose>;
+  toastId: number;
+  restoreTabId?: string;
+}
+
 export function AppShell() {
   const mobileViewport = useMobileViewportState();
   const store = useAppStore();
-  const state = useAppState();
+  const authoritativeState = useAppState();
+  const [pendingWorkspaceIds, setPendingWorkspaceIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const pendingWorkspaceCloses = useRef(new Map<string, PendingWorkspaceClose>());
+  const state = useMemo(
+    () => hidePendingWorkspaceCloses(authoritativeState, pendingWorkspaceIds),
+    [authoritativeState, pendingWorkspaceIds],
+  );
   useEffect(() => {
     const url = new URL(window.location.href);
     if (!url.searchParams.has("legacy")) return;
@@ -140,6 +161,26 @@ export function AppShell() {
   const [newMachineId, setNewMachineId] = useState(() => loadMachineTargetId(window.localStorage));
   const [bootComplete, setBootComplete] = useState(false);
   const { toasts, pushToast, dismissToast } = useToasts();
+  useEffect(() => {
+    if (!authoritativeState) return;
+    const authoritativeWorkspaceIds = new Set(
+      authoritativeState.workspaces.map((workspace) => workspace.id),
+    );
+    const closedWorkspaceIds = [...pendingWorkspaceCloses.current.keys()].filter(
+      (workspaceId) => !authoritativeWorkspaceIds.has(workspaceId),
+    );
+    if (closedWorkspaceIds.length === 0) return;
+    for (const workspaceId of closedWorkspaceIds) {
+      const pending = pendingWorkspaceCloses.current.get(workspaceId);
+      if (pending) dismissToast(pending.toastId);
+      pendingWorkspaceCloses.current.delete(workspaceId);
+    }
+    setPendingWorkspaceIds((current) => {
+      const next = new Set(current);
+      for (const workspaceId of closedWorkspaceIds) next.delete(workspaceId);
+      return next;
+    });
+  }, [authoritativeState, dismissToast]);
   const {
     sidebarCollapsed,
     sidebarWidth,
@@ -433,17 +474,18 @@ export function AppShell() {
     () =>
       openTuiWorkspaceTree.rows.flatMap((treeRow) => {
         const workspace = treeRow.workspace;
-        const presentationMachineId = workspacePresentationMachineId(workspace);
+        const latestAgent = latestAgentByWorkspaceId.get(workspace.id);
+        const presentation = workspacePresentationTarget(workspace, latestAgent);
+        const presentationMachineId = presentation.machineId;
         const machine = machineFor(displayMachines, presentationMachineId);
         const sourceMachine = machineFor(machines, presentationMachineId);
         const affinityMachine = machineFor(machines, workspace.machineId);
         const latestUnread = latestUnreadByWorkspaceId.get(workspace.id);
-        const latestAgent = latestAgentByWorkspaceId.get(workspace.id);
         const latestAgentName = latestAgent ? workspaceAgentName(latestAgent) : undefined;
         const latestAgentStatusLabel = latestAgent ? workspaceAgentStatusLabel(latestAgent) : undefined;
-        const tab = workspace.tabs.find((candidate) => candidate.id === workspace.activeTabId) ?? workspace.tabs[0];
+        const tab = presentation.tab;
         if (!tab) return [];
-        const pane = tab.panes.find((candidate) => candidate.id === tab.activePaneId) ?? tab.panes[0];
+        const pane = presentation.pane;
         const cwd = normalizeUserPath(pane?.cwd);
         const descriptor = dedupeAgentDescriptor(
           latestUnread?.body ||
@@ -509,7 +551,10 @@ export function AppShell() {
     () =>
       displayMachines.map((machine) => {
         const machineWorkspaces = (state?.workspaces ?? []).filter(
-          (workspace) => workspacePresentationMachineId(workspace) === machine.id,
+          (workspace) => workspacePresentationTarget(
+            workspace,
+            latestAgentByWorkspaceId.get(workspace.id),
+          ).machineId === machine.id,
         );
         const activeAgentCount = machineWorkspaces.filter((workspace) => {
           const agent = latestAgentByWorkspaceId.get(workspace.id);
@@ -528,6 +573,16 @@ export function AppShell() {
         };
       }),
     [displayMachines, latestAgentByWorkspaceId, state?.workspaces],
+  );
+  // The same visible order the sidebar renders; digit and previous/next
+  // workspace shortcuts index into this list.
+  const displayOrderedWorkspaces = useMemo(
+    () => orderWorkspaceRowsForDisplay(
+      openTuiWorkspaces,
+      openTuiMachines.map((machine) => machine.id),
+      settings.groupSidebarSessionsByHost,
+    ),
+    [openTuiMachines, openTuiWorkspaces, settings.groupSidebarSessionsByHost],
   );
   const openTuiActivityRows = useMemo<OpenTuiActivityRow[]>(
     () => {
@@ -585,6 +640,13 @@ export function AppShell() {
       token: ++terminalFocusToken.current,
     });
   }, []);
+
+  // Nothing focuses the active terminal while the boot overlay covers the
+  // shell, so request focus once when the overlay lifts.
+  useEffect(() => {
+    if (!bootComplete || mobileViewport.isMobile) return;
+    if (activeWorkspace && activeTab) requestTerminalFocus(activeWorkspace.id, activeTab.id);
+  }, [bootComplete]);
 
   const { refresh, activateWorkspaceTab, activatePane } = useAppRouting({
     store,
@@ -723,19 +785,39 @@ export function AppShell() {
   }, [persistFavoriteWorkspaceIds, store]);
 
   useEffect(() => {
-    if (!state) return;
+    if (!authoritativeState) return;
     if (desiredCollapsedWorkspaceIds.current) return;
-    let desired = pruneCollapsedWorkspaceIds(state.workspaces, state.settings.collapsedWorkspaceIds);
-    if (activeWorkspace) desired = expandWorkspaceAncestors(state.workspaces, desired, activeWorkspace.id);
-    if (!sameWorkspaceIds(desired, state.settings.collapsedWorkspaceIds)) void persistCollapsedWorkspaceIds(desired);
-  }, [activeWorkspace?.id, persistCollapsedWorkspaceIds, state?.settings.collapsedWorkspaceIds, state?.workspaces]);
+    let desired = pruneCollapsedWorkspaceIds(
+      authoritativeState.workspaces,
+      authoritativeState.settings.collapsedWorkspaceIds,
+    );
+    if (activeWorkspace) {
+      desired = expandWorkspaceAncestors(
+        authoritativeState.workspaces,
+        desired,
+        activeWorkspace.id,
+      );
+    }
+    if (!sameWorkspaceIds(desired, authoritativeState.settings.collapsedWorkspaceIds)) {
+      void persistCollapsedWorkspaceIds(desired);
+    }
+  }, [
+    activeWorkspace?.id,
+    authoritativeState?.settings.collapsedWorkspaceIds,
+    authoritativeState?.workspaces,
+    persistCollapsedWorkspaceIds,
+  ]);
 
   useEffect(() => {
-    if (!state || desiredFavoriteWorkspaceIds.current) return;
-    const currentIds = state.settings.favoriteWorkspaceIds ?? [];
-    const desired = pruneFavoriteWorkspaceIds(state.workspaces, currentIds);
+    if (!authoritativeState || desiredFavoriteWorkspaceIds.current) return;
+    const currentIds = authoritativeState.settings.favoriteWorkspaceIds ?? [];
+    const desired = pruneFavoriteWorkspaceIds(authoritativeState.workspaces, currentIds);
     if (!sameWorkspaceIds(desired, currentIds)) void persistFavoriteWorkspaceIds(desired);
-  }, [persistFavoriteWorkspaceIds, state?.settings.favoriteWorkspaceIds, state?.workspaces]);
+  }, [
+    authoritativeState?.settings.favoriteWorkspaceIds,
+    authoritativeState?.workspaces,
+    persistFavoriteWorkspaceIds,
+  ]);
 
   const activeWorkspaceUnreadCount = activeWorkspace ? unreadByWorkspaceId.get(activeWorkspace.id) ?? 0 : 0;
   useEffect(() => {
@@ -1016,6 +1098,80 @@ export function AppShell() {
     await refresh(response.state);
   });
 
+  const revealPendingWorkspace = useCallback((workspaceId: string) => {
+    setPendingWorkspaceIds((current) => {
+      if (!current.has(workspaceId)) return current;
+      const next = new Set(current);
+      next.delete(workspaceId);
+      return next;
+    });
+  }, []);
+
+  const undoWorkspaceClose = useCallback(async (workspaceId: string): Promise<void> => {
+    const pending = pendingWorkspaceCloses.current.get(workspaceId);
+    if (!pending) return;
+    pendingWorkspaceCloses.current.delete(workspaceId);
+    revealPendingWorkspace(workspaceId);
+    dismissToast(pending.toastId);
+
+    await pending.request.catch(() => undefined);
+    try {
+      const response = await api.cancelWorkspaceClose(workspaceId);
+      await refresh(response.state);
+      if (response.cancelled && pending.restoreTabId) {
+        activateWorkspaceTab(workspaceId, pending.restoreTabId, { replaceHistory: true });
+      } else if (!response.cancelled) {
+        pushToast("The workspace close deadline had already passed.", "info", {
+          status: "closed",
+        });
+      }
+    } catch (error) {
+      pushToast(`Undo close failed: ${describeActionError(error)}`);
+      void loadBootstrapRef.current();
+    }
+  }, [activateWorkspaceTab, dismissToast, pushToast, refresh, revealPendingWorkspace]);
+
+  const scheduleWorkspaceClose = useCallback((workspaceId: string): void => {
+    if (pendingWorkspaceCloses.current.has(workspaceId)) return;
+    const workspace = store.get()?.workspaces.find(
+      (candidate) => candidate.id === workspaceId,
+    );
+    if (!workspace) return;
+
+    setPendingWorkspaceIds((current) => new Set(current).add(workspaceId));
+    const request = api.scheduleWorkspaceClose(workspaceId);
+    const toastId = pushToast(
+      `${workspace.name} hidden. Closing in 10 seconds.`,
+      "info",
+      {
+        action: {
+          label: "[U] UNDO",
+          accessibleLabel: `Undo close ${workspace.name}`,
+          run: () => void undoWorkspaceClose(workspaceId),
+        },
+        dismissible: false,
+        durationMs: WORKSPACE_CLOSE_GRACE_MS,
+        status: "pending",
+      },
+    );
+    pendingWorkspaceCloses.current.set(workspaceId, {
+      request,
+      toastId,
+      ...(store.get()?.activeWorkspaceId === workspaceId
+        ? { restoreTabId: workspace.activeTabId }
+        : {}),
+    });
+
+    void request.catch((error) => {
+      const pending = pendingWorkspaceCloses.current.get(workspaceId);
+      if (!pending || pending.request !== request) return;
+      pendingWorkspaceCloses.current.delete(workspaceId);
+      revealPendingWorkspace(workspaceId);
+      dismissToast(toastId);
+      pushToast(`Close workspace failed: ${describeActionError(error)}`);
+    });
+  }, [dismissToast, pushToast, revealPendingWorkspace, store, undoWorkspaceClose]);
+
   const closeActiveTab = () => {
     if (!activeWorkspace || !activeTab) return;
     const run = () => closeTabById(activeWorkspace.id, activeTab.id);
@@ -1034,7 +1190,7 @@ export function AppShell() {
   const requestCloseWorkspace = (workspaceId: string, returnFocus?: HTMLElement | null) => {
     const workspace = store.get()?.workspaces.find((candidate) => candidate.id === workspaceId);
     if (!workspace) return;
-    const run = () => closeWorkspaceById(workspace.id);
+    const run = () => scheduleWorkspaceClose(workspace.id);
     if (!mobileViewport.isMobile) {
       void run();
       return;
@@ -1053,7 +1209,10 @@ export function AppShell() {
     "Closing agent group...",
     async (machineId: string) => {
       const workspaceIds = (store.get()?.workspaces ?? [])
-        .filter((workspace) => workspacePresentationMachineId(workspace) === machineId)
+        .filter((workspace) => workspacePresentationTarget(
+          workspace,
+          latestAgentByWorkspaceId.get(workspace.id),
+        ).machineId === machineId)
         .map((workspace) => workspace.id);
       let latestState: BootstrapPayload | undefined;
       try {
@@ -1110,16 +1269,17 @@ export function AppShell() {
 
   const activateWorkspaceAt = (index: number) => {
     if (!state) return;
-    const workspace = state.workspaces[index];
+    const row = displayOrderedWorkspaces[index];
+    const workspace = row ? state.workspaces.find((candidate) => candidate.id === row.id) : undefined;
     const tab = workspace?.tabs.find((candidate) => candidate.id === workspace.activeTabId) ?? workspace?.tabs[0];
     if (workspace && tab) activateWorkspaceTab(workspace.id, tab.id);
   };
 
   const activateWorkspaceRelative = (delta: number) => {
-    if (!state || !activeWorkspace) return;
-    const current = state.workspaces.findIndex((workspace) => workspace.id === activeWorkspace.id);
+    if (!activeWorkspace || displayOrderedWorkspaces.length === 0) return;
+    const current = displayOrderedWorkspaces.findIndex((row) => row.id === activeWorkspace.id);
     if (current === -1) return;
-    const next = modulo(current + delta, state.workspaces.length);
+    const next = modulo(current + delta, displayOrderedWorkspaces.length);
     activateWorkspaceAt(next);
   };
 
@@ -1166,7 +1326,7 @@ export function AppShell() {
   useKeyboardShortcuts({
     keybindings,
     apple: appleKeybindings,
-    modalOpen: settingsOpen || machineManagerOpen || commandPaletteOpen || diagnosticsOpen || agentFleetOpen,
+    modalOpen: !bootComplete || settingsOpen || machineManagerOpen || commandPaletteOpen || diagnosticsOpen || agentFleetOpen,
     openCommandPalette,
     openSettings,
     toggleSidebar,
@@ -1180,8 +1340,8 @@ export function AppShell() {
     focusPaneRelative,
     activateWorkspaceRelative,
     activateTabRelative,
-    activateWorkspaceAtDigit: state
-      ? (digit) => activateWorkspaceAt(digit === 9 ? state.workspaces.length - 1 : digit - 1)
+    activateWorkspaceAtDigit: state && displayOrderedWorkspaces.length > 0
+      ? (digit) => activateWorkspaceAt(digit === 9 ? displayOrderedWorkspaces.length - 1 : digit - 1)
       : null,
     activateTabAtDigit: activeWorkspace
       ? (digit) => activateTabAt(digit === 9 ? activeWorkspace.tabs.length - 1 : digit - 1)
@@ -1528,18 +1688,6 @@ export function AppShell() {
       </div>
     );
   }
-  if (!state || !bootComplete || authRequired) {
-    return (
-      <RetroBootScreen
-        authRequired={authRequired}
-        isMobile={mobileViewport.isMobile}
-        ready={Boolean(state) && !authRequired}
-        onAuthenticated={() => void loadBootstrap()}
-        onComplete={finishBoot}
-      />
-    );
-  }
-
   const appClassName = [
     "app-shell",
     sidebarCollapsed ? "sidebar-collapsed" : "",
@@ -1550,12 +1698,19 @@ export function AppShell() {
     .filter(Boolean)
     .join(" ");
 
+  // The shell mounts as soon as state is available so terminals attach while
+  // the boot overlay still covers the screen. RetroBootScreen must keep a
+  // stable position in this fragment; remounting it would restart the boot
+  // sequence with a fresh profile mid-transition.
   return (
+    <>
+    {state && !authRequired ? (
     <ColorSchemeProvider id={settings.colorScheme}>
     <main
       className={appClassName}
       style={appStyle}
       aria-busy={pendingActions.length > 0}
+      aria-hidden={!bootComplete || undefined}
     >
       <Toasts toasts={toasts} dismissToast={dismissToast} />
       {pendingActions.length > 0 ? (
@@ -1943,6 +2098,17 @@ export function AppShell() {
       ) : null}
     </main>
     </ColorSchemeProvider>
+    ) : null}
+    {!state || !bootComplete || authRequired ? (
+      <RetroBootScreen
+        authRequired={authRequired}
+        isMobile={mobileViewport.isMobile}
+        ready={Boolean(state) && !authRequired}
+        onAuthenticated={() => void loadBootstrap()}
+        onComplete={finishBoot}
+      />
+    ) : null}
+    </>
   );
 }
 

@@ -3,7 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import type { WebSocket } from "ws";
-import { isTerminalProtocolResponse } from "../shared/terminal-protocol.js";
+import { OscColorQueryParser } from "../shared/terminal-color-queries.js";
+import {
+  isTerminalColorResponse,
+  isTerminalProtocolResponse,
+} from "../shared/terminal-protocol.js";
 import type { BrowserAuthMode } from "./auth.js";
 import { AgentSessionService } from "./agent-sessions.js";
 import type { MachineConfig, MachineSource, PaneClientMessage, PaneServerMessage, PaneState } from "./types.js";
@@ -29,11 +33,20 @@ import {
   type StagedPasteImage,
 } from "./paste-image-staging.js";
 import { DurableEndpointStore } from "./durable-endpoint-store.js";
+import { cleanupStrandedDurableEndpoints } from "./durable-endpoint-cleanup.js";
+import { WORKSPACE_CLOSE_GRACE_MS } from "../shared/workspace-close.js";
 import {
   KittyGraphicsSourceError,
   readKittyGraphicsSource,
   type KittyGraphicsSourceRequest,
 } from "./kitty-graphics-source.js";
+import { terminalThemeFromEnvironment } from "./terminal-theme.js";
+import { windowsAgentPort } from "./windows-agent.js";
+import {
+  normalizeSessionAgentOrigin,
+  sessionAgentOriginAtPort,
+  sessionAgentOriginForEndpoint,
+} from "./session-agent-origin.js";
 
 export type ClientMessage = PaneClientMessage;
 
@@ -41,6 +54,7 @@ interface SocketState {
   paneId: string;
   cols: number;
   rows: number;
+  foreground: boolean;
   inputSequence?: number;
 }
 
@@ -100,6 +114,33 @@ export const resolveDisposalMachine = (
   machineId: string | undefined,
 ): MachineConfig | undefined => sessionMachine ?? currentMachines.find((machine) => machine.id === machineId);
 
+export const resolvePersistedPaneMachine = (
+  pane: PaneState,
+  configuredMachine: MachineConfig,
+  recoveredEndpoint?: MachineConfig,
+): MachineConfig => {
+  if (configuredMachine.sessionBackend !== "agent") return configuredMachine;
+  if (pane.agentUrl) {
+    const pinnedOrigin = normalizeSessionAgentOrigin(pane.agentUrl);
+    if (!pinnedOrigin) throw new Error(`pane ${pane.id} has an invalid persisted session-agent origin`);
+    const pinnedPort = Number(new URL(pinnedOrigin).port);
+    if (pane.agentPort !== undefined && pane.agentPort !== pinnedPort) {
+      throw new Error(`pane ${pane.id} has inconsistent persisted session-agent endpoint fields`);
+    }
+    return { ...configuredMachine, agentUrl: pinnedOrigin, agentPort: pinnedPort };
+  }
+  if (pane.agentPort === undefined) return configuredMachine;
+  const recoveredOrigin = recoveredEndpoint?.agentPort === pane.agentPort
+    ? sessionAgentOriginForEndpoint(recoveredEndpoint)
+    : undefined;
+  const baseOrigin = recoveredOrigin ?? sessionAgentOriginForEndpoint(configuredMachine);
+  const pinnedOrigin = baseOrigin
+    ? sessionAgentOriginAtPort(baseOrigin, pane.agentPort)
+    : undefined;
+  if (!pinnedOrigin) throw new Error(`pane ${pane.id} is missing its persisted session-agent origin`);
+  return { ...configuredMachine, agentUrl: pinnedOrigin, agentPort: pane.agentPort };
+};
+
 const sameMachineEndpoint = (left: MachineConfig, right: MachineConfig): boolean =>
   JSON.stringify({
     kind: left.kind,
@@ -124,6 +165,8 @@ const sameMachineEndpoint = (left: MachineConfig, right: MachineConfig): boolean
 // mark; resume once every consumer drains below the low-water mark.
 const BACKPRESSURE_HIGH_WATER = 4 * 1024 * 1024;
 const BACKPRESSURE_LOW_WATER = 1 * 1024 * 1024;
+const AGENT_WORKSPACE_CLEANUP_SWEEP_MS = 5_000;
+const STRANDED_ENDPOINT_CLEANUP_SWEEP_MS = 60_000;
 
 export class SessionManager {
   private sessions = new Map<string, BackendSession>();
@@ -131,6 +174,7 @@ export class SessionManager {
   private sockets = new Map<string, Set<WebSocket>>();
   private outputWatchers = new Map<string, Set<WebSocket>>();
   private resizeOwners = new Map<string, WebSocket>();
+  private paneSizes = new Map<string, { cols: number; rows: number }>();
   private socketState = new Map<WebSocket, SocketState>();
   private ignoredSessionExits = new WeakSet<BackendSession>();
   private sessionMachines = new Map<string, MachineConfig>();
@@ -141,6 +185,13 @@ export class SessionManager {
   private durableCwdRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private durableCwdRefreshInFlight = new Set<string>();
   private durableCwdLastReadAt = new Map<string, number>();
+  private pendingWorkspaceCloses = new Map<string, {
+    closeAt: string;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
+  private readonly agentWorkspaceCleanupTimer: ReturnType<typeof setInterval>;
+  private readonly strandedEndpointCleanupTimer: ReturnType<typeof setInterval>;
+  private strandedEndpointCleanupRunning = false;
   private readonly currentMachines: () => MachineConfig[];
   private readonly terminalCheckpoints: TerminalCheckpointStore;
   private readonly durableEndpoints: DurableEndpointStore;
@@ -179,13 +230,40 @@ export class SessionManager {
         process.env.WMUX_SESSION_ENDPOINT_PATH
           ?? path.join(state.storageDirectory(), "session-endpoints.json"),
       );
+    const persistedPanes = state.snapshot().workspaces.flatMap((workspace) =>
+      workspace.tabs.flatMap((tab) => tab.panes));
+    const configuredMachines = this.currentMachines();
+    const configuredById = new Map(configuredMachines.map((machine) => [machine.id, machine]));
+    const persistedPaneMachines = new Map<string, MachineConfig>();
+    for (const pane of persistedPanes) {
+      const configured = configuredById.get(pane.machineId);
+      if (!configured) continue;
+      persistedPaneMachines.set(
+        pane.id,
+        resolvePersistedPaneMachine(
+          pane,
+          configured,
+          this.durableEndpoints.activeForPane(pane.id)?.machine,
+        ),
+      );
+    }
     this.durableEndpoints.reconcile(
-      new Set(
-        state.snapshot().workspaces.flatMap((workspace) =>
-          workspace.tabs.flatMap((tab) => tab.panes.map((pane) => pane.id))),
-      ),
-      this.currentMachines(),
+      new Set(persistedPanes.map((pane) => pane.id)),
+      configuredMachines,
+      persistedPaneMachines,
     );
+    this.sweepExpiredAgentWorkspaces();
+    this.agentWorkspaceCleanupTimer = setInterval(
+      () => this.sweepExpiredAgentWorkspaces(),
+      AGENT_WORKSPACE_CLEANUP_SWEEP_MS,
+    );
+    this.agentWorkspaceCleanupTimer.unref?.();
+    this.sweepStrandedEndpoints();
+    this.strandedEndpointCleanupTimer = setInterval(
+      () => this.sweepStrandedEndpoints(),
+      STRANDED_ENDPOINT_CLEANUP_SWEEP_MS,
+    );
+    this.strandedEndpointCleanupTimer.unref?.();
   }
 
   hasLiveSessionsForMachine(machineId: string): boolean {
@@ -286,7 +364,7 @@ export class SessionManager {
     if (!this.sockets.has(paneId)) this.sockets.set(paneId, new Set());
     const paneSockets = this.sockets.get(paneId);
     paneSockets?.add(socket);
-    this.socketState.set(socket, { paneId, ...initialSize });
+    this.socketState.set(socket, { paneId, ...initialSize, foreground: false });
     let session: BackendSession;
     try {
       session = this.ensureSession(pane, initialSize.cols, initialSize.rows);
@@ -298,41 +376,60 @@ export class SessionManager {
       return;
     }
     this.send(socket, { type: "starting", paneId, phase: "connecting", label: "Opening terminal…" });
-    const resizeOwner = this.ensureResizeOwner(paneId, socket, session, initialSize);
+    this.ensureResizeOwner(paneId, socket, session, initialSize);
 
     socket.on("message", (raw) => {
       const message = this.parse(raw.toString());
       if (!message) return;
       if (message.type === "input") {
+        const terminalResponse = message.terminalResponse || isTerminalProtocolResponseInput(message.data);
+        if (terminalResponse) {
+          // The server owns palette query replies. Ignore color replies from
+          // older browser clients so they cannot inject a duplicate answer.
+          if (isTerminalColorResponse(message.data)) return;
+          // Every attached browser renders pane output and can therefore answer
+          // terminal queries. Only the authoritative viewer may forward that
+          // answer or a multi-viewer pane will inject duplicate replies into
+          // the application that issued the query.
+          if (this.resizeOwners.get(paneId) !== socket) return;
+          this.backends.get(paneId)?.write(session, message.data, true);
+          return;
+        }
         const socketState = this.socketState.get(socket);
         if (socketState && message.sequence !== undefined) socketState.inputSequence = message.sequence;
         this.promoteResizeOwner(paneId, socket, session);
         if (isAgentInterruptInput(message.data)) {
           this.agentSessions.interruptAgentForPane(paneId);
         }
-        const terminalResponse = message.terminalResponse || isTerminalProtocolResponseInput(message.data);
-        if (!terminalResponse) this.advancePaneInputEpoch(paneId);
-        this.backends.get(paneId)?.write(session, message.data, terminalResponse);
+        this.advancePaneInputEpoch(paneId);
+        this.backends.get(paneId)?.write(session, message.data, false);
       }
       if (message.type === "resize") {
         const size = normalizeSize(message.cols, message.rows);
-        this.socketState.set(socket, { ...this.socketState.get(socket), paneId, ...size });
-        if (message.foreground === false) {
-          this.releaseResizeOwner(paneId, socket);
-          return;
-        }
+        const foreground = message.foreground !== false;
+        this.socketState.set(socket, {
+          ...this.socketState.get(socket),
+          paneId,
+          ...size,
+          foreground,
+        });
+        // A resize report must not transfer ownership merely because browser
+        // chrome temporarily moved focus. Explicit pane activation, input,
+        // and owner disconnect remain the ownership handoff paths.
         if (this.resizeOwners.get(paneId) === socket) {
-          this.backends.get(paneId)?.resize(session, size.cols, size.rows);
+          this.applyResizeOwnerSize(paneId, socket, session);
         }
       }
       if (message.type === "activate") {
         const size = normalizeSize(message.cols, message.rows);
-        this.socketState.set(socket, { ...this.socketState.get(socket), paneId, ...size });
-        if (message.foreground === false) {
-          this.releaseResizeOwner(paneId, socket);
-          return;
-        }
-        this.activateResizeOwner(paneId, socket, session);
+        const foreground = message.foreground !== false;
+        this.socketState.set(socket, {
+          ...this.socketState.get(socket),
+          paneId,
+          ...size,
+          foreground,
+        });
+        if (foreground) this.activateResizeOwner(paneId, socket, session);
       }
     });
 
@@ -345,13 +442,15 @@ export class SessionManager {
     const sendReady = () => {
       if (socket.readyState !== socket.OPEN || !this.socketState.has(socket)) return;
       const attachReplay = this.replayOutputFor(pane, session);
+      const size = this.paneSizes.get(paneId) ?? initialSize;
       this.send(socket, {
         type: "ready",
         paneId,
         pid: session.pid,
         title: pane.title,
         status: pane.status,
-        resizeOwner,
+        ...size,
+        resizeOwner: this.resizeOwners.get(paneId) === socket,
         replay: attachReplay.data,
         replayKind: attachReplay.kind,
         ...(this.shouldUseDurableClientRefresh(pane) && attachReplay.kind === "raw" && attachReplay.data === ""
@@ -383,12 +482,15 @@ export class SessionManager {
     const sendReady = () => {
       if (socket.readyState !== socket.OPEN || !this.outputWatchers.get(paneId)?.has(socket)) return;
       const replay = this.outputReplayFor(session);
+      const authoritativeSize = this.paneSizes.get(paneId) ?? size;
       this.send(socket, {
         type: "ready",
         paneId,
         pid: session.pid,
         title: pane.title,
         status: pane.status,
+        ...authoritativeSize,
+        resizeOwner: false,
         replay: replay.data,
         replayKind: replay.kind,
         outputOnly: true,
@@ -436,11 +538,61 @@ export class SessionManager {
   }
 
   closeWorkspace(workspaceId: string): boolean {
+    this.cancelWorkspaceClose(workspaceId);
     const machineIds = this.machineIdsForWorkspace(workspaceId);
     const paneIds = this.state.removeWorkspace(workspaceId);
     for (const paneId of paneIds) this.disposePaneProcess(paneId, machineIds.get(paneId));
     if (paneIds.length > 0) this.onPaneReferencesChanged();
     return paneIds.length > 0;
+  }
+
+  scheduleWorkspaceClose(
+    workspaceId: string,
+    delayMs = WORKSPACE_CLOSE_GRACE_MS,
+  ): string | undefined {
+    const workspaceExists = this.state.snapshot().workspaces.some(
+      (workspace) => workspace.id === workspaceId,
+    );
+    if (!workspaceExists) return undefined;
+    const existing = this.pendingWorkspaceCloses.get(workspaceId);
+    if (existing) return existing.closeAt;
+    if (!Number.isFinite(delayMs) || delayMs < 0) {
+      throw new RangeError("workspace close delay must be a non-negative finite number");
+    }
+
+    const closeAt = new Date(Date.now() + delayMs).toISOString();
+    const timer = setTimeout(() => {
+      this.pendingWorkspaceCloses.delete(workspaceId);
+      this.closeWorkspace(workspaceId);
+    }, delayMs);
+    timer.unref?.();
+    this.pendingWorkspaceCloses.set(workspaceId, { closeAt, timer });
+    return closeAt;
+  }
+
+  cancelWorkspaceClose(workspaceId: string): boolean {
+    const pending = this.pendingWorkspaceCloses.get(workspaceId);
+    if (!pending) return false;
+    clearTimeout(pending.timer);
+    this.pendingWorkspaceCloses.delete(workspaceId);
+    return true;
+  }
+
+  sweepExpiredAgentWorkspaces(nowMs = Date.now()): string[] {
+    const closed: string[] = [];
+    for (const workspaceId of this.state.expiredAgentWorkspaceIds(nowMs)) {
+      if (this.closeWorkspace(workspaceId)) closed.push(workspaceId);
+    }
+    return closed;
+  }
+
+  private sweepStrandedEndpoints(): void {
+    if (this.strandedEndpointCleanupRunning) return;
+    this.strandedEndpointCleanupRunning = true;
+    void cleanupStrandedDurableEndpoints(this.durableEndpoints)
+      .finally(() => {
+        this.strandedEndpointCleanupRunning = false;
+      });
   }
 
   writePane(paneId: string, data: string, cols = 96, rows = 32): boolean {
@@ -460,13 +612,14 @@ export class SessionManager {
       ?? this.durableEndpoints.activeForPane(pane.id)?.machine;
     const configuredMachine = this.currentMachines().find((candidate) => candidate.id === pane.machineId);
     if (!configuredMachine) throw new Error(`machine ${pane.machineId} not found`);
-    const machine = pane.agentPort && configuredMachine.kind === "powershell-ssh"
-      ? { ...configuredMachine, agentPort: pane.agentPort, agentUrl: undefined }
-      : configuredMachine;
+    const machine = resolvePersistedPaneMachine(pane, configuredMachine, previousSessionMachine);
+    const windowsAgentBasePort = pane.agentPort && configuredMachine.kind === "powershell-ssh"
+      ? windowsAgentPort(configuredMachine)
+      : undefined;
     if (machine.source === "registered" && machine.online === false) {
       throw new Error(`machine ${pane.machineId} is offline`);
     }
-    const backend = createSessionBackend(machine, this.pasteImages);
+    const backend = createSessionBackend(machine, this.pasteImages, { windowsAgentBasePort });
     const agentInputBinding = createAgentInputSessionBinding(
       pane.id,
       backend,
@@ -549,8 +702,13 @@ export class SessionManager {
     this.state.updatePane(pane.id, { status: "running", exitCode: undefined, title: pane.title });
     this.cancelPaneCwdRefresh(pane.id);
     this.schedulePaneCwdRefresh(pane, machine, session);
+    const colorQueryParser = new OscColorQueryParser();
+    const currentTerminalTheme = () => terminalThemeFromEnvironment(this.terminalEnvironment());
 
     session.on("output", (data) => {
+      for (const response of colorQueryParser.push(data, currentTerminalTheme).responses) {
+        backend.write(session, response, true);
+      }
       this.broadcastOutput(pane.id, data);
       this.applyBackpressure(pane.id, session);
       this.scheduleTerminalCheckpoint(pane.id, session);
@@ -566,12 +724,17 @@ export class SessionManager {
     session.on("cwd", (cwd) => {
       this.state.updatePane(pane.id, { cwd });
     });
-    session.on("agentPort", (agentPort) => {
+    session.on("agentPort", (agentPort, agentUrl) => {
+      const pinnedOrigin = sessionAgentOriginAtPort(agentUrl, agentPort);
+      if (!pinnedOrigin) {
+        console.warn(`wmux: ignored invalid session-agent origin update for ${pane.id}`);
+        return;
+      }
       machine.agentPort = agentPort;
-      machine.agentUrl = undefined;
+      machine.agentUrl = pinnedOrigin;
       this.sessionMachines.set(pane.id, structuredClone(machine));
       this.durableEndpoints.updateActive(pane.id, machine);
-      this.state.updatePane(pane.id, { agentPort });
+      this.state.updatePane(pane.id, { agentPort, agentUrl: pinnedOrigin });
     });
     session.on("phase", (phase, label) => {
       this.broadcast(pane.id, { type: "starting", paneId: pane.id, phase, label });
@@ -600,6 +763,7 @@ export class SessionManager {
       this.sessions.delete(pane.id);
       const exitedAgentInputBinding = this.agentInputSessionBindings.get(pane.id);
       this.resizeOwners.delete(pane.id);
+      this.paneSizes.delete(pane.id);
       const context = this.state.findPaneContext(pane.id);
       if (!context) return;
 
@@ -630,6 +794,7 @@ export class SessionManager {
       } else if (context.workspace.tabs.length > 1) {
         this.state.removeTab(context.workspace.id, context.tab.id);
       } else {
+        this.cancelWorkspaceClose(context.workspace.id);
         this.state.closeWorkspaceAfterExit(context.workspace.id);
       }
       this.onPaneReferencesChanged();
@@ -761,6 +926,8 @@ export class SessionManager {
 
   /** Detach every live client and clear timers. Called on process shutdown. */
   disposeAll(): void {
+    clearInterval(this.agentWorkspaceCleanupTimer);
+    clearInterval(this.strandedEndpointCleanupTimer);
     try {
       this.terminalCheckpoints.flush();
     } catch (error) {
@@ -775,6 +942,8 @@ export class SessionManager {
     this.durableCwdLastReadAt.clear();
     for (const timer of this.pausedSessions.values()) clearInterval(timer);
     this.pausedSessions.clear();
+    for (const pending of this.pendingWorkspaceCloses.values()) clearTimeout(pending.timer);
+    this.pendingWorkspaceCloses.clear();
     for (const [paneId, session] of this.sessions) {
       const binding = this.agentInputSessionBindings.get(paneId);
       if (binding) this.agentInputSourceRetirer?.(paneId, binding);
@@ -786,6 +955,9 @@ export class SessionManager {
     this.sessionMachines.clear();
     this.agentInputSessionBindings.clear();
     this.paneInputEpochs.clear();
+    this.resizeOwners.clear();
+    this.paneSizes.clear();
+    this.socketState.clear();
     this.pasteImages.dispose();
   }
 
@@ -835,6 +1007,7 @@ export class SessionManager {
     this.cancelPaneCwdRefresh(pane.id);
     this.sessions.delete(pane.id);
     this.resizeOwners.delete(pane.id);
+    this.paneSizes.delete(pane.id);
     const backend = this.backends.get(pane.id);
     if (backend) {
       backend.detach(existing);
@@ -854,37 +1027,32 @@ export class SessionManager {
     socket: WebSocket,
     session: BackendSession,
     size: { cols: number; rows: number },
-  ): boolean {
+  ): void {
     const owner = this.resizeOwners.get(paneId);
     const paneSockets = this.sockets.get(paneId);
     if (owner && paneSockets?.has(owner) && owner.readyState === owner.OPEN) {
-      return owner === socket;
+      return;
     }
     this.resizeOwners.set(paneId, socket);
+    this.paneSizes.set(paneId, size);
     this.backends.get(paneId)?.resize(session, size.cols, size.rows);
-    return true;
   }
 
   private promoteResizeOwner(paneId: string, socket: WebSocket, session: BackendSession): void {
-    if (this.resizeOwners.get(paneId) === socket) return;
     const state = this.socketState.get(socket);
     if (!state) return;
-    this.resizeOwners.set(paneId, socket);
-    this.backends.get(paneId)?.resize(session, state.cols, state.rows);
+    state.foreground = true;
+    this.applyResizeOwnerSize(paneId, socket, session);
   }
 
   private activateResizeOwner(paneId: string, socket: WebSocket, session: BackendSession): void {
     const state = this.socketState.get(socket);
     if (!state) return;
-    const owner = this.resizeOwners.get(paneId);
-    const paneSockets = this.sockets.get(paneId);
-    if (owner && owner !== socket && paneSockets?.has(owner) && owner.readyState === owner.OPEN) return;
-    this.resizeOwners.set(paneId, socket);
-    this.backends.get(paneId)?.resize(session, state.cols, state.rows);
-  }
-
-  private releaseResizeOwner(paneId: string, socket: WebSocket): void {
-    if (this.resizeOwners.get(paneId) === socket) this.resizeOwners.delete(paneId);
+    // `activate` is sent only for the visible pane in the focused browser.
+    // Transfer ownership here so its settled geometry reaches the PTY before
+    // the user's first input. A connected background viewer must not pin the
+    // pane to its stale grid until input promotion happens.
+    this.applyResizeOwnerSize(paneId, socket, session);
   }
 
   private reassignResizeOwner(paneId: string, closedSocket: WebSocket, session: BackendSession): void {
@@ -893,21 +1061,50 @@ export class SessionManager {
       return;
     }
 
-    const nextSocket = [...(this.sockets.get(paneId) ?? [])].find((candidate) => candidate.readyState === candidate.OPEN);
+    const candidates = [...(this.sockets.get(paneId) ?? [])].filter(
+      (candidate) => candidate.readyState === candidate.OPEN,
+    );
+    const foregroundSocket = candidates.find((candidate) => this.socketState.get(candidate)?.foreground);
+    const nextSocket = foregroundSocket ?? candidates[0];
     if (!nextSocket) {
       this.resizeOwners.delete(paneId);
       this.deleteEmptySocketSet(paneId);
       return;
     }
 
-    const nextSize = this.socketState.get(nextSocket);
+    if (foregroundSocket) {
+      this.applyResizeOwnerSize(paneId, foregroundSocket, session);
+      return;
+    }
     this.resizeOwners.set(paneId, nextSocket);
-    if (nextSize && !session.isExited) {
-      this.backends.get(paneId)?.resize(
-        session,
-        nextSize.cols,
-        nextSize.rows,
-      );
+    this.broadcastPaneSize(paneId);
+  }
+
+  private applyResizeOwnerSize(paneId: string, socket: WebSocket, session: BackendSession): void {
+    const state = this.socketState.get(socket);
+    if (!state) return;
+    const previousOwner = this.resizeOwners.get(paneId);
+    const previousSize = this.paneSizes.get(paneId);
+    const sizeChanged = !previousSize || previousSize.cols !== state.cols || previousSize.rows !== state.rows;
+    this.resizeOwners.set(paneId, socket);
+    this.paneSizes.set(paneId, { cols: state.cols, rows: state.rows });
+    if (sizeChanged && !session.isExited) {
+      this.backends.get(paneId)?.resize(session, state.cols, state.rows);
+    }
+    if (previousOwner !== socket || sizeChanged) this.broadcastPaneSize(paneId);
+  }
+
+  private broadcastPaneSize(paneId: string): void {
+    const size = this.paneSizes.get(paneId);
+    if (!size) return;
+    const owner = this.resizeOwners.get(paneId);
+    for (const socket of this.sockets.get(paneId) ?? []) {
+      this.send(socket, {
+        type: "size",
+        paneId,
+        ...size,
+        resizeOwner: owner === socket,
+      });
     }
   }
 
@@ -920,6 +1117,7 @@ export class SessionManager {
     const backend = this.backends.get(paneId);
     const sessionMachine = this.sessionMachines.get(paneId);
     const endpointRecords = this.durableEndpoints.recordsForPane(paneId);
+    this.durableEndpoints.markPaneStranded(paneId);
     this.cancelPaneCwdRefresh(paneId);
     this.sessions.delete(paneId);
     this.backends.delete(paneId);
@@ -927,6 +1125,7 @@ export class SessionManager {
     this.agentInputSessionBindings.delete(paneId);
     this.paneInputEpochs.delete(paneId);
     this.resizeOwners.delete(paneId);
+    this.paneSizes.delete(paneId);
     this.terminalCheckpoints.delete(paneId);
     const fallbackMachineId = machineId ?? session?.pane.machineId ?? this.state.findPane(paneId)?.machineId;
     const machine = resolveDisposalMachine(sessionMachine, this.currentMachines(), fallbackMachineId);

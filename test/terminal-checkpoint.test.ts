@@ -75,6 +75,35 @@ test("truncated normal-screen history restores the authoritative current screen"
   }
 });
 
+test("cross-size replay restores the authoritative cursor from a checkpoint", () => {
+  const rawReplay =
+    "\x1b[2J\x1b[Habcdefghijklmnopqrst"
+    + "\x1b[2;1HABCDEFGHIJKLMNOPQRST"
+    + "\x1b[3;1H01234567890123456789"
+    + "\x1b[5;11H\x1b[?25l";
+  const source = new TerminalCheckpoint(20, 6);
+  const rawAtNewSize = new TerminalCheckpoint(10, 6);
+  const restored = new TerminalCheckpoint(10, 6);
+  try {
+    source.write(rawReplay);
+    source.resize(10, 6);
+    rawAtNewSize.write(rawReplay);
+
+    assert.notDeepEqual(rawAtNewSize.cursor(), source.cursor());
+
+    const replay = selectAttachReplay(rawReplay, false, source, true);
+    assert.equal(replay.kind, "checkpoint");
+    restored.write(replay.data);
+
+    assert.deepEqual(restored.screenLines(), source.screenLines());
+    assert.deepEqual(restored.cursor(), source.cursor());
+  } finally {
+    source.dispose();
+    rawAtNewSize.dispose();
+    restored.dispose();
+  }
+});
+
 test("checkpoint snapshots retain split private input-mode sequences", () => {
   const checkpoint = new TerminalCheckpoint(10, 2);
   try {
@@ -83,6 +112,20 @@ test("checkpoint snapshots retain split private input-mode sequences", () => {
     const snapshot = checkpoint.snapshot();
     assert.match(snapshot, /\x1b\[\?2004h/);
     assert.match(snapshot, /\x1b\[\?1000h/);
+  } finally {
+    checkpoint.dispose();
+  }
+});
+
+test("normal-screen checkpoints can seed the visible viewport into scrollback", () => {
+  const checkpoint = new TerminalCheckpoint(12, 3);
+  try {
+    checkpoint.write(Array.from({ length: 12 }, (_, index) => `line-${String(index + 1).padStart(2, "0")}`)
+      .join("\r\n"));
+    const replay = checkpoint.snapshotWithScrollbackSeed();
+    assert.match(replay, /line-01\r\nline-02\r\n/);
+    assert.match(replay, /line-10\r\nline-11\r\nline-12/);
+    assert.equal(replay.split("line-12").length - 1, 2);
   } finally {
     checkpoint.dispose();
   }
@@ -99,6 +142,21 @@ test("Windows-style reframing keeps the viewport and cursor anchored from the to
     assert.deepEqual(checkpoint.cursor(), { x: 4, y: 2, visible: true });
     assert.match(checkpoint.screenLines()[2], /^PS> /);
     assert.equal(checkpoint.screenLines()[5].trim(), "");
+  } finally {
+    checkpoint.dispose();
+  }
+});
+
+test("Windows-style reframing carries scrollback across resize boundaries without duplicating the viewport", () => {
+  const checkpoint = new TerminalCheckpoint(12, 3);
+  try {
+    checkpoint.write(Array.from({ length: 12 }, (_, index) => `line-${String(index + 1).padStart(2, "0")}`)
+      .join("\r\n"));
+    checkpoint.reframe(18, 5);
+    checkpoint.reframe(10, 4);
+    const replay = checkpoint.snapshotWithScrollbackSeed();
+    assert.match(replay, /line-01\r\nline-02\r\n/);
+    assert.equal(replay.split("line-12").length - 1, 2);
   } finally {
     checkpoint.dispose();
   }

@@ -1,4 +1,4 @@
-import { createNestedWorkspacePair, expect, test, type E2eWorkspace } from "./fixtures";
+import { awaitAppShell, createNestedWorkspacePair, expect, test, type E2eWorkspace } from "./fixtures";
 import { e2eRegistrationToken } from "./config-auth.js";
 
 test("navigates, persists, targets spaces, and moves nested workspaces", async ({ page, request }, testInfo) => {
@@ -15,10 +15,36 @@ test("navigates, persists, targets spaces, and moves nested workspaces", async (
   const rootItem = () => page.locator(`a[role="treeitem"][href^="/workspaces/${root.id}/"]`);
   const childItem = () => page.locator(`a[role="treeitem"][href^="/workspaces/${child.id}/"]`);
   const childActionName = isMobile ? `Workspace options for ${child.name}` : `Move ${child.name}`;
+  const undoChildClose = async () => {
+    await expect(childItem()).toHaveCount(0);
+    const toast = page.locator(".wmux-toast").filter({ hasText: child.name });
+    await expect(toast).toContainText("[PENDING]");
+    await expect(toast).toContainText("Closing in 10 seconds");
+    await expect.poll(async () => {
+      const response = await request.get("/api/bootstrap");
+      const payload = await response.json() as { workspaces: E2eWorkspace[] };
+      return payload.workspaces.some((workspace) => workspace.id === child.id);
+    }).toBe(true);
+    expect(await toast.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return {
+        borderRadius: style.borderRadius,
+        boxShadow: style.boxShadow,
+        fontFamily: style.fontFamily,
+      };
+    })).toMatchObject({
+      borderRadius: "0px",
+      boxShadow: "none",
+      fontFamily: expect.stringContaining("Fira Code"),
+    });
+    await toast.getByRole("button", { name: `Undo close ${child.name}` }).click();
+    await expect(childItem()).toBeVisible();
+    await expect(toast).toHaveCount(0);
+  };
 
   try {
     await page.goto(rootPath);
-    await expect(page.locator("main.app-shell")).toBeVisible({ timeout: 20_000 });
+    await awaitAppShell(page);
     await openWorkspaceNavigation();
     await expect(rootItem()).toHaveAttribute("aria-level", "1");
     await expect(rootItem()).toHaveAttribute("aria-expanded", "true");
@@ -35,7 +61,7 @@ test("navigates, persists, targets spaces, and moves nested workspaces", async (
     }).toContain(root.id);
 
     await page.reload();
-    await expect(page.locator("main.app-shell")).toBeVisible({ timeout: 20_000 });
+    await awaitAppShell(page);
     await openWorkspaceNavigation();
     await expect(rootItem()).toHaveAttribute("aria-expanded", "false");
     await expect(childItem()).toHaveCount(0);
@@ -95,12 +121,7 @@ test("navigates, persists, targets spaces, and moves nested workspaces", async (
       await moveDialog.getByRole("button", { name: "Close workspace", exact: true }).click();
       const closeDialog = page.getByRole("dialog", { name: "Close workspace?" });
       await closeDialog.getByRole("button", { name: "Close workspace" }).click();
-      await expect.poll(async () => {
-        const response = await request.get("/api/bootstrap");
-        const payload = await response.json() as { workspaces: E2eWorkspace[] };
-        return payload.workspaces.some((workspace) => workspace.id === child.id);
-      }).toBe(false);
-      await expect(childItem()).toHaveCount(0);
+      await undoChildClose();
     } else {
       await childItem().press("Shift+F10");
       const agentMenu = page.getByRole("menu", { name: `Agent actions: ${child.name}` });
@@ -119,21 +140,178 @@ test("navigates, persists, targets spaces, and moves nested workspaces", async (
       }).toBe(true);
 
       await page.reload();
-      await expect(page.locator("main.app-shell")).toBeVisible({ timeout: 20_000 });
+      await awaitAppShell(page);
       await expect(childItem()).toHaveAttribute("data-favorite", "true");
       await childItem().press("Shift+F10");
       await expect(agentMenu.getByRole("menuitem", { name: /Unfavorite$/ })).toBeVisible();
       await agentMenu.getByRole("menuitem", { name: "Close agent" }).click();
-      await expect.poll(async () => {
-        const response = await request.get("/api/bootstrap");
-        const payload = await response.json() as { workspaces: E2eWorkspace[] };
-        return payload.workspaces.some((workspace) => workspace.id === child.id);
-      }).toBe(false);
-      await expect(childItem()).toHaveCount(0);
+      await undoChildClose();
     }
   } finally {
     await request.delete(`/api/workspaces/${child.id}`);
     await request.delete(`/api/workspaces/${root.id}`);
+  }
+});
+
+test("Agents rail keeps an inactive agent tab on its reporting host", async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== "chromium", "one desktop host-grouping run covers shared presentation logic");
+  let workspaceId: string | undefined;
+
+  try {
+    const workspaceResponse = await request.post("/api/workspaces", {
+      data: { machineId: "local" },
+    });
+    expect(workspaceResponse.ok()).toBeTruthy();
+    const workspace = (await workspaceResponse.json() as {
+      workspace: E2eWorkspace & {
+        tabs: Array<{ id: string; activePaneId: string; panes: Array<{ id: string }> }>;
+      };
+    }).workspace;
+    workspaceId = workspace.id;
+    const agentTab = workspace.tabs[0]!;
+
+    const agentEvent = await request.post("/api/agent-events", {
+      data: {
+        workspaceId: workspace.id,
+        tabId: agentTab.id,
+        paneId: agentTab.activePaneId,
+        agent: "codex",
+        status: "completed",
+        title: "Agent remains discoverable",
+        summary: "Waiting for another turn",
+      },
+    });
+    expect(agentEvent.ok()).toBeTruthy();
+
+    const supportMachineId = "agent-support-fixture";
+    const supportTabId = "tab_agent_support_fixture";
+    const supportPaneId = "pane_agent_support_fixture";
+    await page.routeWebSocket("**/ws/events", (webSocket) => webSocket.close());
+    await page.route("**/api/bootstrap", async (route) => {
+      const response = await route.fetch();
+      const payload = await response.json() as {
+        machines: Array<Record<string, unknown> & { id: string; name: string }>;
+        workspaces: Array<E2eWorkspace & {
+          machineId: string;
+          tabs: Array<{
+            id: string;
+            title: string;
+            activePaneId: string;
+            layout: { type: "pane"; paneId: string };
+            panes: Array<Record<string, unknown> & { id: string; machineId: string }>;
+            createdAt: string;
+          }>;
+        }>;
+      };
+      const fixtureWorkspace = payload.workspaces.find(
+        (candidate) => candidate.id === workspace.id,
+      );
+      const fixtureAgentTab = fixtureWorkspace?.tabs.find(
+        (candidate) => candidate.id === agentTab.id,
+      );
+      const fixtureAgentPane = fixtureAgentTab?.panes.find(
+        (candidate) => candidate.id === agentTab.activePaneId,
+      );
+      const localMachine = payload.machines.find(
+        (candidate) => candidate.id === "local",
+      );
+      if (!fixtureWorkspace || !fixtureAgentTab || !fixtureAgentPane || !localMachine) {
+        await route.fulfill({ response });
+        return;
+      }
+      const supportTab = {
+        ...fixtureAgentTab,
+        id: supportTabId,
+        title: "Support",
+        activePaneId: supportPaneId,
+        layout: { type: "pane" as const, paneId: supportPaneId },
+        panes: [{
+          ...fixtureAgentPane,
+          id: supportPaneId,
+          machineId: supportMachineId,
+          title: "Support",
+        }],
+      };
+      await route.fulfill({
+        response,
+        json: {
+          ...payload,
+          machines: [
+            ...payload.machines,
+            { ...localMachine, id: supportMachineId, name: "Agent Support" },
+          ],
+          workspaces: payload.workspaces.map((candidate) =>
+            candidate.id === workspace.id
+              ? {
+                  ...candidate,
+                  activeTabId: supportTabId,
+                  tabs: [...candidate.tabs, supportTab],
+                }
+              : candidate),
+        },
+      });
+    });
+
+    await page.goto(`/workspaces/${workspace.id}/tabs/${supportTabId}`);
+    await awaitAppShell(page);
+    const agentItem = page.locator(`a[role="treeitem"][href^="/workspaces/${workspace.id}/"]`);
+    await expect(agentItem).toHaveAttribute(
+      "href",
+      `/workspaces/${workspace.id}/tabs/${agentTab.id}`,
+    );
+    await expect(agentItem).toHaveAttribute("data-agent-machine", "local");
+
+    await agentItem.press("Enter");
+    await expect(page).toHaveURL(new RegExp(`/workspaces/${workspace.id}/tabs/${agentTab.id}$`));
+  } finally {
+    if (workspaceId) {
+      await request.delete(`/api/workspaces/${workspaceId}`).catch(() => undefined);
+    }
+  }
+});
+
+test("workspace close grace hides immediately, restores on undo, and closes after its deadline", async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== "chromium", "one desktop deadline run covers the server-owned timer");
+  test.setTimeout(45_000);
+  const targetResponse = await request.post("/api/workspaces", { data: { machineId: "local" } });
+  expect(targetResponse.ok()).toBeTruthy();
+  const target = (await targetResponse.json() as { workspace: E2eWorkspace }).workspace;
+  const targetPath = `/workspaces/${target.id}/tabs/${target.activeTabId}`;
+  const targetItem = page.locator(`a[role="treeitem"][href^="/workspaces/${target.id}/"]`);
+  const closeFromPalette = async () => {
+    await page.keyboard.press("Control+K");
+    const palette = page.getByRole("dialog", { name: "Command palette" });
+    await palette.locator("input").fill("Close current workspace");
+    await page.keyboard.press("Enter");
+  };
+
+  try {
+    await page.goto(targetPath);
+    await awaitAppShell(page);
+    await expect(targetItem).toBeVisible();
+
+    await closeFromPalette();
+    await expect(targetItem).toHaveCount(0);
+    const firstToast = page.locator(".wmux-toast").filter({ hasText: target.name });
+    await expect(firstToast).toContainText("[PENDING]");
+    await expect.poll(async () => {
+      const payload = await (await request.get("/api/bootstrap")).json() as { workspaces: E2eWorkspace[] };
+      return payload.workspaces.some((workspace) => workspace.id === target.id);
+    }).toBe(true);
+
+    await firstToast.getByRole("button", { name: `Undo close ${target.name}` }).click();
+    await expect(targetItem).toBeVisible();
+    await expect(page).toHaveURL(new RegExp(`${targetPath}$`));
+
+    await closeFromPalette();
+    await expect(targetItem).toHaveCount(0);
+    await expect.poll(async () => {
+      const payload = await (await request.get("/api/bootstrap")).json() as { workspaces: E2eWorkspace[] };
+      return payload.workspaces.some((workspace) => workspace.id === target.id);
+    }, { timeout: 15_000 }).toBe(false);
+    await expect(page.locator(".wmux-toast").filter({ hasText: target.name })).toHaveCount(0);
+  } finally {
+    await request.delete(`/api/workspaces/${target.id}`).catch(() => undefined);
   }
 });
 
@@ -151,7 +329,7 @@ test("mobile sidebar opens and activates workspaces by touch", async ({ page, re
 
   try {
     await page.goto(rootPath);
-    await expect(page.locator("main.app-shell")).toBeVisible({ timeout: 20_000 });
+    await awaitAppShell(page);
     await expect(mobileActions).toHaveCount(3);
     await expect(mobileActions.nth(0)).toHaveAccessibleName("Open workspaces and hosts");
     await expect(mobileActions.nth(1)).toHaveAccessibleName("Open chat");
@@ -217,7 +395,10 @@ test("desktop agent group menu closes every workspace on its host", async ({ pag
     }
 
     await page.reload();
-    await expect(page.locator("main.app-shell")).toBeVisible({ timeout: 20_000 });
+    await awaitAppShell(page);
+    // Keyboard focus on the chrome needs the asynchronously initialized
+    // terminal, not just the mounted shell.
+    await expect(page.locator(".terminal-pane.active")).toHaveClass(/terminal-ready/, { timeout: 10_000 });
     const group = page.getByRole("navigation", { name: "Spaces" })
       .getByRole("button", { name: new RegExp(`^${machineName},`) });
     await group.focus();
@@ -259,7 +440,7 @@ test("keeps the loaded UI and recovers when a wake-up bootstrap briefly fails", 
   });
 
   await page.evaluate(() => window.dispatchEvent(new Event("online")));
-  await expect(page.locator("main.app-shell")).toBeVisible();
+  await awaitAppShell(page);
   await expect(page.getByText(/wmux failed to load/i)).toHaveCount(0);
   await expect.poll(() => failures).toBe(2);
   await expect.poll(() => requests, { timeout: 10_000 }).toBeGreaterThanOrEqual(3);

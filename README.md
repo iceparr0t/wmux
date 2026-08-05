@@ -459,14 +459,11 @@ Automation, helper, registration, and registered-host credentials cannot access 
 - Fresh installs use the low-contrast Flock scheme, while the original wmux palette and the bundled terminal schemes remain available in Settings.
   Hidden cached tabs suspend terminal sockets by default while preserving their mounted terminal views; choose live streaming to retain the previous behavior.
   The terminal font family remains config-owned.
-- New local, SSH, and Windows panes receive the selected scheme as
-  `WMUX_COLOR_SCHEME` plus `WMUX_COLOR_MODE=dark|light`. Browser terminals
-  answer OSC 4/10/11 palette queries from the live scheme, including after a
-  settings change. Programs that render explicit RGB colors still own those
-  colors and are not recolored by the terminal palette. Windows panes also
-  seed their isolated ConPTY color table from the selected scheme. The
-  server-side VT checkpoint uses that same palette, so size-aware Windows
-  replay preserves semantic default colors instead of repainting them black.
+- New local, SSH, and Windows panes receive the selected scheme as `WMUX_COLOR_SCHEME` plus `WMUX_COLOR_MODE=dark|light`.
+  The wmux server answers OSC 4/10/11 palette queries from the live scheme, including before a browser attaches and after a settings change.
+  Programs that render explicit RGB colors still own those colors and are not recolored by the terminal palette.
+  Windows panes also seed their isolated ConPTY color table from the selected scheme.
+  The server-side VT checkpoint uses that same palette, so size-aware Windows replay preserves semantic default colors instead of repainting them black.
 - Pasting a PNG, JPEG, WebP, or GIF into a connected terminal stages a private
   temporary file in that pane's target filesystem and pastes its quoted native
   path. Local, POSIX SSH, PowerShell-over-SSH, and current Windows-agent panes
@@ -751,6 +748,17 @@ wmux-windows-setup configure-agent-firewall <wmux-server-internal-ip>
 wmux-windows-setup agent-status
 ```
 
+The default task uses `Interactive` logon when a desktop session exists and `S4U` on a headless host.
+To start before UI login while retaining the user's authenticated network credentials, opt into Task Scheduler password logon from an interactive private shell:
+
+```powershell
+wmux-windows-setup install-agent --logon-type Password
+```
+
+The password is prompted locally and retained only by Windows Task Scheduler; wmux does not put it in configuration, helper files, environment variables, or command arguments.
+Password mode pre-registers the base task, eight dormant rollout slots, and the update watcher so later automatic updates never need to recover the credential.
+After changing the Windows account password, close any active agent panes and run `wmux-windows-setup refresh-agent-credentials`.
+
 When `~/.wmux/url`, `registration-token`, and `heartbeat.json` are present, the
 base agent heartbeats automatically and reports its last success/failure in
 `/health`. Adjacent-port rollout generations never heartbeat, preventing two
@@ -771,20 +779,20 @@ Opt in from the machine's untracked config:
 }
 ```
 
-Managed configs use `backend: "auto"`: ConPTY is preferred and terminal-safe
-stdio is the fallback when `pywinpty` is unavailable. Existing explicit
-`"conpty"` or `"stdio"` values remain pinned. When the base agent is outdated
-and idle, new pane creation stages the update and safely restarts that base
-before attaching. If the base still owns panes, wmux instead starts a
-side-by-side agent generation; existing panes remain pinned to the agent that
-owns them, and generation ports are persisted so wmux restarts reconnect each
-pane correctly. The Windows firewall must allow the configured `agentPort` and
-the next eight ports from the wmux server (for the default, `3481-3489`);
-`configure-agent-firewall` installs that exact-source, bounded rule and requires
-an elevated PowerShell session. A pane shows rollout progress while its
-generation starts.
-Changing `loadPowerShellProfile` affects only newly created pane processes;
-reattaching an existing agent-owned pane does not rerun its profile.
+Generate `agentToken` with `openssl rand -hex 32` and add it before the first SSH bootstrap pane so the staged listener is protected from its first start.
+When the SSH `host` is a DNS name, also set `agentUrl` to the target's explicit private/internal IPv4 address and port, for example `"agentUrl": "http://100.64.0.30:3481"`.
+The current agent listener intentionally refuses hostname, IPv6, and public-address binds; `agentPort` must match the port in `agentUrl`.
+
+Managed configs use `backend: "auto"`: ConPTY is preferred and terminal-safe stdio is the fallback when `pywinpty` is unavailable.
+Existing explicit `"conpty"` or `"stdio"` values remain pinned.
+When the base agent is outdated and idle, new pane creation stages the update and safely restarts that base before attaching.
+If the base still owns panes, wmux instead starts a side-by-side agent generation; existing panes remain pinned to the agent that owns them, and generation ports are persisted so wmux restarts reconnect each pane correctly.
+Password-backed rollout retirement leaves its dormant, credentialed task slot registered while removing the generation config; full uninstall removes every task and its Task Scheduler credential.
+The Windows agent cannot preserve pane processes across a Windows reboot.
+When the agent returns without a previously live session, wmux recreates that pane ID once as a fresh shell at its last known cwd and dimensions, clears the stale terminal screen, and resumes polling instead of repeating `unknown_session` forever.
+The firewall must allow the configured `agentPort` and the next eight ports from the wmux server (for the default, `3481-3489`); `configure-agent-firewall` installs that exact-source, bounded rule and requires an elevated PowerShell session.
+A pane shows rollout progress while its generation starts.
+Changing `loadPowerShellProfile` affects only newly created pane processes; reattaching an existing agent-owned pane does not rerun its profile.
 
 For a manual in-place restart after the agent becomes idle, use:
 
@@ -815,6 +823,8 @@ scripts/install-session-agent-service.sh
 For a remote machine, bind the agent to its exact Tailscale or private address,
 allow the configured port only from the wmux server, and copy the generated
 token into that machine's untracked wmux configuration.
+When SSH uses a DNS name, set `agentUrl` to the agent's explicit private IPv4
+origin; wmux never derives agent requests from that changeable hostname.
 
 ```json
 {
@@ -857,9 +867,10 @@ Set `WMUX_AGENT_TIMELINE_PATH` to override that location.
 Working-tree snapshots linked from a timeline are archived as owner-only versioned files under `~/.wmux/repository-snapshots/`.
 Each pane's current VT screen is stored under `~/.wmux/pane-checkpoints/` as a bounded, versioned, owner-only ANSI checkpoint with an atomic rolling backup.
 Set `WMUX_TERMINAL_CHECKPOINT_DIR` to override that directory.
-Registered panes persist their server-only disposal endpoints in `~/.wmux/session-endpoints.json` with the same schema-versioned, atomic, owner-only, rolling-backup discipline.
+Registered panes, configured remote durable multiplexers, and configured session-agent panes persist their server-only disposal endpoints in `~/.wmux/session-endpoints.json` with the same schema-versioned, atomic, owner-only, rolling-backup discipline.
 Set `WMUX_SESSION_ENDPOINT_PATH` to override that location.
 The ledger can retain multiple endpoints for one pane when a dynamic machine ID is reassigned, and it is never included in browser bootstrap state.
+When an endpoint no longer belongs to persisted workspace state, wmux reconciles the exact recorded endpoint and removes its owned session automatically once the endpoint is reachable.
 
 | Backend | Survives browser refresh | Survives wmux restart |
 | --- | --- | --- |

@@ -23,6 +23,10 @@ import {
   type DelegationMode,
 } from "../shared/protocol.js";
 import { localMachine } from "./machines.js";
+import {
+  normalizeSessionAgentOrigin,
+  sessionAgentOriginForEndpoint,
+} from "./session-agent-origin.js";
 import type { MachineConfig } from "./types.js";
 
 const streamSchema = z.object({
@@ -87,6 +91,35 @@ export const machineSchema = z.object({
       path: ["sessionBackend"],
       message: "agent is only valid for local, ssh, and powershell-ssh machines",
     });
+  }
+  if (machine.sessionBackend === "agent") {
+    const parsedAgentUrl = machine.agentUrl
+      ? normalizeSessionAgentOrigin(machine.agentUrl)
+      : undefined;
+    if (machine.agentUrl && !parsedAgentUrl) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["agentUrl"],
+        message: "agentUrl must be a private/internal HTTP IPv4 origin with an explicit port and no credentials, path, query, or fragment",
+      });
+    }
+    if (!sessionAgentOriginForEndpoint(machine)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [machine.agentUrl ? "agentUrl" : "host"],
+        message: machine.host && !machine.agentUrl
+          ? "session-agent hosts addressed by DNS require agentUrl with an explicit private/internal IPv4 address"
+          : "session-agent endpoint must use an explicit private/internal IPv4 address",
+      });
+    }
+    if (parsedAgentUrl && machine.agentPort !== undefined
+      && Number(new URL(parsedAgentUrl).port) !== machine.agentPort) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["agentPort"],
+        message: "agentPort must match the explicit port in agentUrl",
+      });
+    }
   }
 });
 

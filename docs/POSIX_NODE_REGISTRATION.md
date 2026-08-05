@@ -89,6 +89,7 @@ Add the target to the wmux server's ignored `wmux.config.json`:
 ```
 
 Use `kind: "local"` and `agentUrl: "http://127.0.0.1:3481"` when the agent runs on the wmux server itself.
+When a remote SSH `host` is a DNS name, set `agentUrl` to the agent's explicit private IPv4 origin and keep `agentPort` aligned with it.
 Set `platform: "mac"` for a macOS target so release health compares against the macOS-suffixed wmux version.
 
 ## Dynamic registration

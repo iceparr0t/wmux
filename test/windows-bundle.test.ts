@@ -83,6 +83,26 @@ test("Windows agent config prefers ConPTY with stdio fallback", () => {
   assert.equal(buildWindowsHelperBundle(machine).agentConfig.streamEnabled, true);
 });
 
+test("Windows agent config uses an explicit private agent URL for hostname-based SSH targets", () => {
+  const bundle = buildWindowsHelperBundle({
+    ...machine,
+    agentUrl: "http://100.64.0.30:4581",
+    agentToken: "agent-secret",
+  });
+  assert.equal(bundle.agentConfig.host, "100.64.0.30");
+  assert.equal(bundle.agentConfig.port, 4581);
+  assert.equal(bundle.agentConfig.token, "agent-secret");
+
+  const bootstrap = buildWindowsPowerShellBootstrap({
+    ...machine,
+    agentUrl: "http://100.64.0.30:4581",
+    agentToken: "agent-secret",
+  }, undefined, {});
+  assert.match(bootstrap, /'streamEnabled', 'token'/);
+  assert.match(bootstrap, /Repair old hostname-based configs/);
+  assert.match(bootstrap, /-not \$ExistingAgentHostIsLiteral -and \$DefaultAgentHostIsLiteral/);
+});
+
 test("clipboard helper sends bearer auth and reads staged fallback files", () => {
   const bundle = buildWindowsHelperBundle(machine);
   const helper = bundle.files.find((file) => file.name === "wmux-copy.ps1");
@@ -111,6 +131,11 @@ test("agent-event helper sends bearer auth and maps Claude start hooks to runnin
   assert.ok(stateIndex >= 0 && stateIndex < helperIndex && helperIndex < publicIndex && publicIndex < legacyIndex, "agent-event URL precedence must favor refreshed state, helper, public, then legacy");
   assert.ok(content.includes("$HookEvent -eq 'UserPromptSubmit'"), "Claude start hooks must be recognized");
   assert.ok(content.includes("$Summary = 'claude running'"), "Claude start hooks must emit a fresh running summary");
+  assert.ok(content.includes("'PreToolUse'"), "Codex tool hooks must restore running state for automatic continuations");
+  assert.ok(content.includes("Start-CodexReconciler"), "Codex stop hooks must defer lifecycle reconciliation");
+  assert.ok(content.includes("transcriptOffset"), "Codex reconciliation must keep a stable bounded transcript window");
+  assert.ok(content.includes("task_started"), "Codex reconciliation must detect a newer turn");
+  assert.ok(content.includes("$Payload.coalesce = $true"), "repeated Codex tool hooks must be coalesced");
   assert.ok(content.includes("$Message = ''"), "start hooks must discard the previous assistant response");
   assert.ok(content.includes("-TimeoutSec 10"), "agent events must not hang indefinitely during delivery");
   const contextGuardIndex = content.indexOf("if (-not $Force -and -not $PaneId -and -not $WorkspaceId)");
@@ -127,6 +152,7 @@ test("Windows Codex hooks bypass the cmd shim and migrate wmux-owned entries", (
   assert.ok(content.includes("commandWindows"), "Codex hook must provide a Windows command override");
   assert.ok(content.includes("wmux-agent-event.ps1"), "Codex hook must invoke PowerShell directly");
   assert.ok(content.includes("$OwnedCommand"), "installer must migrate existing wmux hook entries");
+  assert.ok(content.includes("'PreToolUse'"), "Codex installer must register the tool lifecycle fallback");
 });
 
 test("bootstrap stages, verifies, then swaps and records the bundle version", () => {
@@ -270,7 +296,31 @@ test("Windows agent service drains staged updates and refuses unsafe restarts", 
   assert.ok(content.includes("the base agent cannot be retired"));
   assert.ok(content.includes("restartWhenIdle = $false"));
   assert.ok(content.includes("refusing to retire generation $Port with $ActiveSessions active pane session(s)"));
+  assert.ok(content.includes("generation_refresh_busy"));
+  assert.ok(content.includes("FencedHealth"));
+  assert.ok(content.includes("allowNewSessions = $false"));
   assert.ok(!content.includes("Start-Process -FilePath $PowerShell"));
+});
+
+test("Windows agent password logon pre-registers credentialed rollout tasks without persisting the password", () => {
+  const bundle = buildWindowsHelperBundle(machine);
+  const helper = bundle.files.find((file) => file.name === "wmux-windows-agent-service.ps1");
+  assert.ok(helper, "bundle includes wmux-windows-agent-service.ps1");
+  const content = Buffer.from(helper.dataBase64, "base64").toString("utf8");
+
+  assert.match(content, /--logon-type Interactive\|S4U\|Password/);
+  assert.match(content, /Read-Host "Enter the Windows password for \$Identity" -AsSecureString/);
+  assert.match(content, /WMUX_WINDOWS_AGENT_PASSWORD is not accepted/);
+  assert.match(content, /--password is not supported/);
+  assert.match(content, /Register-ScheduledTask -TaskName \$Name -InputObject \$Definition -User \$Identity -Password \$Password/);
+  assert.match(content, /function Install-PasswordTaskPool/);
+  assert.match(content, /for \(\$Offset = 1; \$Offset -le 8; \$Offset \+= 1\)/);
+  assert.match(content, /wmux-windows-agent-supervisor\.ps1/);
+  assert.match(content, /Password-backed rollout slot \$GenerationTaskName is missing/);
+  assert.match(content, /refresh-credentials/);
+  assert.match(content, /Password retained only by Windows Task Scheduler/);
+  assert.doesNotMatch(content, /WMUX_WINDOWS_AGENT_PASSWORD\s*=/);
+  assert.doesNotMatch(content, /WriteAllText\([^\n]*\$Password/);
 });
 
 test("Windows setup manages the bounded agent firewall range", () => {

@@ -20,8 +20,8 @@ import type { MachineVersionStatus, Workspace, WorkspaceReorderPosition } from "
 import { useOpenTuiTheme, type OpenTuiTheme } from "./color-scheme-context";
 import { WorkspaceMoveDialog } from "./WorkspaceMoveDialog";
 import {
-  remainingWorkspaceRowCount,
   groupSidebarWorkspaceRows,
+  remainingWorkspaceRowCount,
   workspacePointerMovePosition,
   type WorkspaceAgentStatus,
   type WorkspaceMoveIntent,
@@ -612,6 +612,7 @@ export function OpenTuiSidebar({
                 aria-expanded={workspace.hasChildren ? workspace.expanded : undefined}
                 aria-label={`${workspace.title}${groupSidebarSessionsByHost ? "" : `, host ${workspace.host}`}${workspace.favorite ? ", favorite" : ""}${workspace.agentCreated ? `, created by ${workspace.agentName ?? "an agent"}` : ""}${workspace.hiddenUnreadCount ? `, ${workspace.hiddenUnreadCount} hidden unread` : ""}${workspace.hiddenAgentStatus ? `, hidden descendant agent status ${workspace.hiddenAgentStatus}` : ""}`}
                 data-agent-created={workspace.agentCreated ? "true" : undefined}
+                data-agent-machine={workspace.machineId}
                 data-favorite={workspace.favorite ? "true" : "false"}
                 data-presentation-machine-id={workspace.machineId}
                 draggable={!pointerReorderDisabled && !movesDisabled}

@@ -1,5 +1,5 @@
 import path from "node:path";
-import { expect, test, type APIRequestContext, type Locator, type Page } from "./fixtures";
+import { awaitAppShell, expect, test, type APIRequestContext, type Locator, type Page } from "./fixtures";
 
 interface PredictionCell {
   col: number;
@@ -47,7 +47,10 @@ const routeTerminalFontFamily = async (page: Page, terminalFontFamily: string): 
   });
 };
 
-const delayTerminalOutput = async (page: Page, delayMs = 500): Promise<void> => {
+const terminalOutputDelayMs = 750;
+
+// Keep the synthetic echo comfortably behind browser input dispatch under concurrent runner load.
+const delayTerminalOutput = async (page: Page, delayMs = terminalOutputDelayMs): Promise<void> => {
   await page.routeWebSocket(/\/ws\/panes\//, (browserSocket) => {
     const serverSocket = browserSocket.connectToServer();
     browserSocket.onMessage((message) => serverSocket.send(message));
@@ -94,10 +97,10 @@ const openDelayedTerminal = async (
   const settings = await request.post("/api/settings", { data: { terminalFontSize: fontSize } });
   expect(settings.ok()).toBeTruthy();
   await page.goto("/");
-  await expect(page.locator("main.app-shell")).toBeVisible({ timeout: 20_000 });
+  await awaitAppShell(page);
   const workspace = await createWorkspace(request);
   await page.goto(`/workspaces/${workspace.id}/tabs/${workspace.activeTabId}`);
-  await expect(page.locator("main.app-shell")).toBeVisible({ timeout: 20_000 });
+  await awaitAppShell(page);
   const pane = page.locator(".terminal-pane.active");
   await expect(pane).toHaveClass(/terminal-ready/, { timeout: 20_000 });
   await pane.locator(".terminal-host textarea").evaluate((element: HTMLTextAreaElement) => element.focus());
@@ -226,18 +229,41 @@ const readTerminalColors = async (pane: Locator): Promise<{ foreground: string; 
 
 const armTerminalPrediction = async (page: Page, prediction: Locator): Promise<void> => {
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    await page.keyboard.type("a");
-    await page.waitForTimeout(750);
-    await page.keyboard.type("q");
     try {
+      if (!await prediction.getAttribute("data-armed-screen")) {
+        await page.keyboard.type("a");
+        await expect(prediction).toHaveAttribute("data-armed-screen", /^(normal|alternate)$/, { timeout: 2_000 });
+      }
+      await page.keyboard.type("q");
       await expect(prediction).toHaveAttribute("data-active", "true", { timeout: 400 });
       await expect(prediction).not.toHaveAttribute("data-active", "true", { timeout: 2_000 });
       return;
     } catch {
-      await page.waitForTimeout(750);
+      await page.waitForTimeout(250);
     }
   }
   throw new Error("Terminal prediction did not arm after three authoritative echoes");
+};
+
+// A late authoritative write (shell integration hooks, title updates) can
+// disarm the prediction between echoes, so a single keystroke occasionally
+// renders unpredicted by design; settle and re-arm instead of failing.
+const typeActivePrediction = async (
+  page: Page,
+  prediction: Locator,
+  character: string,
+): Promise<void> => {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await page.keyboard.type(character);
+    try {
+      await expect(prediction).toHaveAttribute("data-active", "true", { timeout: 1_000 });
+      return;
+    } catch {
+      await expect(prediction).not.toHaveAttribute("data-active", "true", { timeout: 3_000 });
+      await armTerminalPrediction(page, prediction);
+    }
+  }
+  throw new Error(`Prediction did not activate after typing ${JSON.stringify(character)}`);
 };
 
 const verifyDelayedGlyph = async (
@@ -248,7 +274,8 @@ const verifyDelayedGlyph = async (
   background?: string,
 ): Promise<void> => {
   await armTerminalPrediction(page, prediction);
-  await page.keyboard.type("xy");
+  await typeActivePrediction(page, prediction, "x");
+  await page.keyboard.type("y");
   await expect(prediction).toHaveAttribute("data-active", "true");
   const cells = await predictionCells(prediction);
   expect(cells).toHaveLength(2);
@@ -361,8 +388,7 @@ test("DPR changes clear stale prediction metrics before repainting", async ({
   const cdp = await page.context().newCDPSession(page);
   try {
     await armTerminalPrediction(page, prediction);
-    await page.keyboard.type("x");
-    await expect(prediction).toHaveAttribute("data-active", "true");
+    await typeActivePrediction(page, prediction, "x");
     const initialMetrics = await readPredictionMetrics(prediction);
     expect(initialMetrics.dpr).toBe(2);
     expect(initialMetrics.width).toBeGreaterThanOrEqual(8);
@@ -386,6 +412,9 @@ test("DPR changes clear stale prediction metrics before repainting", async ({
     }), metrics);
     expect(backingScale.x).toBeCloseTo(backingScale.expected, 8);
     expect(backingScale.y).toBeCloseTo(backingScale.expected, 8);
+    // Let the pre-check glyph receive its delayed authoritative echo before
+    // the helper begins a fresh prediction cycle.
+    await expect(prediction).not.toHaveAttribute("data-active", "true", { timeout: 2_000 });
     await verifyDelayedGlyph(page, pane, prediction);
   } finally {
     await cdp.send("Emulation.clearDeviceMetricsOverride");
@@ -421,8 +450,14 @@ test("prediction layout crosses a wrapped row and confirms without residue", asy
     await page.keyboard.press("Enter");
     await page.waitForTimeout(1_100);
     await page.keyboard.type("a");
-    await page.waitForTimeout(650);
-    await page.keyboard.type("xy");
+    await expect.poll(async () => {
+      const rawCursor = await prediction.getAttribute("data-armed-cursor");
+      if (!rawCursor) return undefined;
+      return (JSON.parse(rawCursor) as { x: number }).x;
+    }, { timeout: 2_000 }).toBe(cols - 1);
+    await page.keyboard.type("x");
+    await expect(prediction).toHaveAttribute("data-active", "true");
+    await page.keyboard.type("y");
     await expect(prediction).toHaveAttribute("data-active", "true");
     const cells = await predictionCells(prediction);
     expect(cells[0]!.col).toBe(cols - 1);
@@ -446,7 +481,7 @@ test("prediction layout crosses a wrapped row and confirms without residue", asy
 test("renders Unicode quadrant blocks as exact cell geometry", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "chromium", "canvas block rendering coverage");
   await page.goto("/");
-  await expect(page.locator("main.app-shell")).toBeVisible({ timeout: 20_000 });
+  await awaitAppShell(page);
   const projectRoot = process.cwd().replaceAll("\\", "/");
   const ghosttyUrl = `/@fs${path.posix.join(projectRoot, "node_modules/ghostty-web/dist/ghostty-web.es.js")}`;
   const result = await page.evaluate(async ({ ghosttyUrl }) => {
@@ -548,7 +583,7 @@ test("mobile WebKit prediction ink matches Ghostty canvas metrics", async ({ pag
   test.setTimeout(75_000);
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.goto("/");
-  await expect(page.locator("main.app-shell")).toBeVisible({ timeout: 20_000 });
+  await awaitAppShell(page);
   const projectRoot = process.cwd().replaceAll("\\", "/");
   const ghosttyUrl = `/@fs${path.posix.join(projectRoot, "node_modules/ghostty-web/dist/ghostty-web.es.js")}`;
   const predictionUrl = `/@fs${path.posix.join(projectRoot, "src/client/src/terminal-prediction-renderer.ts")}`;
