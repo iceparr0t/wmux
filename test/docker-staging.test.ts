@@ -83,9 +83,10 @@ LOG='${log}'; STATE='${state}'
 ctl() { [ -f "$STATE/control-$1" ]; }; has() { [ -f "$STATE/$1" ]; }
 val() { [ -f "$STATE/control-$1" ] && /bin/cat "$STATE/control-$1"; }
 [ -n "\${DOCKER_CONFIG-}" ] && [ -d "$DOCKER_CONFIG" ] || exit 60
-[ -z "$(/bin/ls -A "$DOCKER_CONFIG")" ] || exit 61
+[ -z "$(/bin/ls -A "$DOCKER_CONFIG")" ] || ctl sudo-artifacts || exit 61
 [ -z "\${NODE_OPTIONS-}\${TAR_OPTIONS-}\${GIT_DIR-}\${GIT_WORK_TREE-}\${HTTP_PROXY-}\${http_proxy-}" ] || exit 62
 if ctl sudo-only && [ "\${WMUX_TEST_SUDO-}" != 1 ]; then exit 59; fi
+if ctl sudo-artifacts && [ "\${WMUX_TEST_SUDO-}" = 1 ]; then chmod 700 "$DOCKER_CONFIG"; mkdir -p "$DOCKER_CONFIG/buildx"; : >"$DOCKER_CONFIG/buildx/current"; fi
 for arg in "$@"; do case "$arg" in '${approvedWorktreeRoot}'/*) exit 58;; esac; done
 if [ "$1" = context ] && [ "$2" = show ]; then printf 'default\n'; exit; fi
 if [ "$1" = context ] && [ "$2" = inspect ]; then printf 'unix:///var/run/docker.sock\n'; exit; fi
@@ -106,7 +107,7 @@ if [ "$1" = compose ]; then
         if(env.WMUX_BUILD_CONTEXT.startsWith("${approvedWorktreeRoot}/"))process.exit(58);fs.writeFileSync(process.argv[2],env.WMUX_BUILD_REVISION);fs.writeFileSync(process.argv[3],env.COMPOSE_PROJECT_NAME);fs.writeFileSync(process.argv[4],env.WMUX_PUBLISH_HOST);fs.writeFileSync(process.argv[5],env.WMUX_PUBLISH_PORT);fs.writeFileSync(process.argv[6],env.WMUX_BUILD_CONTEXT);
         const proxy={ALL_PROXY:"",FTP_PROXY:"",HTTPS_PROXY:"",HTTP_PROXY:"",NO_PROXY:"",all_proxy:"",ftp_proxy:"",http_proxy:"",https_proxy:"",no_proxy:""};
         const service={build:{context:env.WMUX_BUILD_CONTEXT,dockerfile:"deploy/docker/Dockerfile",args:{...proxy,WMUX_REVISION:env.WMUX_BUILD_REVISION,WMUX_VERSION:env.WMUX_BUILD_VERSION}},cap_drop:["ALL"],command:null,container_name:env.COMPOSE_PROJECT_NAME+"-wmux",cpus:2,entrypoint:null,environment:{WMUX_BROWSER_AUTH_MODE:"shared-or-login",WMUX_HOST:"",WMUX_PORT:"3478",WMUX_PUBLIC_URL:env.WMUX_PUBLIC_URL,WMUX_PUBLISH_HOST:env.WMUX_PUBLISH_HOST,WMUX_REGISTRATION_TOKEN:env.WMUX_REGISTRATION_TOKEN,WMUX_TOKEN:env.WMUX_TOKEN},image:env.WMUX_IMAGE,init:true,ipc:"private",logging:{driver:"local",options:{"max-file":"3","max-size":"10m"}},mem_limit:1073741824,memswap_limit:1073741824,networks:{default:null},pids_limit:512,ports:[{mode:"ingress",host_ip:env.WMUX_PUBLISH_HOST,target:3478,published:env.WMUX_PUBLISH_PORT,protocol:"tcp"}],read_only:true,restart:"no",security_opt:["no-new-privileges:true"],tmpfs:["/home/node/.wmux:rw,nosuid,nodev,mode=0700,size=256m,uid=1000,gid=1000","/tmp:rw,nosuid,nodev,noexec,mode=1777,size=64m,uid=1000,gid=1000","/run:rw,nosuid,nodev,noexec,mode=0755,size=8m,uid=1000,gid=1000"],user:"node"};
-        process.stdout.write(JSON.stringify({name:env.COMPOSE_PROJECT_NAME,networks:{default:{name:env.COMPOSE_PROJECT_NAME+"_default",driver:"bridge",ipam:{},internal:true}},services:{wmux:service}}));
+        process.stdout.write(JSON.stringify({name:env.COMPOSE_PROJECT_NAME,networks:{default:{name:env.COMPOSE_PROJECT_NAME+"_default",driver:"bridge",ipam:{}}},services:{wmux:service}}));
       ' "$env_file" "$STATE/revision" "$STATE/project" "$STATE/host" "$STATE/port" "$STATE/build-context";;
     *' up -d --build '*) touch "$STATE/container" "$STATE/network" "$STATE/image";;
     *' ps '*) has container && printf 'Up (healthy)\n';;
@@ -118,9 +119,9 @@ if [ "$1" = exec ]; then printf '1000\n'; exit; fi
 if [ "$1" = inspect ]; then
   if [ "$2" != --format ]; then has container; exit; fi
   case "$3" in *State.Health.Status*) printf 'healthy\n';; *'{{.Image}}'*) printf '${imageId}\n';; *'"HostConfig"'*)
-    node -e 'const [cid,nid,iid,p,r,host,port]=process.argv.slice(1);const h={Binds:null,CapDrop:["ALL"],DeviceRequests:null,Devices:[],IpcMode:"private",LogConfig:{Type:"local",Config:{"max-file":"3","max-size":"10m"}},Memory:1073741824,MemorySwap:1073741824,NanoCpus:2000000000,NetworkMode:p+"_default",PidMode:"",PidsLimit:512,PortBindings:{"3478/tcp":[{HostIp:host,HostPort:port}]},Privileged:false,ReadonlyRootfs:true,RestartPolicy:{Name:"no"},SecurityOpt:["no-new-privileges:true"],Tmpfs:{"/home/node/.wmux":"rw,nosuid,nodev,mode=700,size=268435456,uid=1000,gid=1000","/tmp":"rw,nosuid,nodev,noexec,mode=1777,size=67108864,uid=1000,gid=1000","/run":"rw,nosuid,nodev,noexec,mode=755,size=8388608,uid=1000,gid=1000"},VolumesFrom:null};process.stdout.write(JSON.stringify({Id:cid,Image:iid,Name:"/"+p+"-wmux",Config:{Image:"wmux-staging:"+r,Labels:{"com.docker.compose.project":p,"com.docker.compose.service":"wmux","org.opencontainers.image.revision":r},User:"node"},HostConfig:h,NetworkSettings:{Networks:{[p+"_default"]:{NetworkID:nid}}},Mounts:[]}))' "$cid" "$nid" "$iid" "$project" "$revision" "$host" "$port";; esac; exit
+    node -e 'const [cid,nid,iid,p,r,host,port,portMode]=process.argv.slice(1);const binding=[{HostIp:host,HostPort:port}];const h={Binds:null,CapDrop:["ALL"],DeviceRequests:null,Devices:[],IpcMode:"private",LogConfig:{Type:"local",Config:{"max-file":"3","max-size":"10m"}},Memory:1073741824,MemorySwap:1073741824,NanoCpus:2000000000,NetworkMode:p+"_default",PidMode:"",PidsLimit:512,PortBindings:{"3478/tcp":binding},Privileged:false,ReadonlyRootfs:true,RestartPolicy:{Name:"no"},SecurityOpt:["no-new-privileges:true"],Tmpfs:{"/home/node/.wmux":"rw,nosuid,nodev,mode=700,size=268435456,uid=1000,gid=1000","/tmp":"rw,nosuid,nodev,noexec,mode=1777,size=67108864,uid=1000,gid=1000","/run":"rw,nosuid,nodev,noexec,mode=755,size=8388608,uid=1000,gid=1000"},VolumesFrom:null};process.stdout.write(JSON.stringify({Id:cid,Image:iid,Name:"/"+p+"-wmux",Config:{Image:"wmux-staging:"+r,Labels:{"com.docker.compose.project":p,"com.docker.compose.service":"wmux","org.opencontainers.image.revision":r},User:"node"},HostConfig:h,NetworkSettings:{Networks:{[p+"_default"]:{NetworkID:nid}},Ports:portMode==="null"?null:{"3478/tcp":binding}},Mounts:[]}))' "$cid" "$nid" "$iid" "$project" "$revision" "$host" "$port" "$(ctl null-realized-ports && printf null || printf bound)";; esac; exit
 fi
-if [ "$1 $2" = 'network inspect' ]; then if [ "$3" != --format ]; then has network; exit; fi; printf '{"Driver":"bridge","Id":"%s","Internal":true,"Labels":{"com.docker.compose.project":"%s","com.docker.compose.network":"default"},"Name":"%s_default","Options":{}}\n' "$nid" "$project" "$project"; exit; fi
+if [ "$1 $2" = 'network inspect' ]; then if [ "$3" != --format ]; then has network; exit; fi; printf '{"Attachable":false,"Driver":"bridge","Id":"%s","Internal":false,"Labels":{"com.docker.compose.project":"%s","com.docker.compose.network":"default"},"Name":"%s_default","Options":{}}\n' "$nid" "$project" "$project"; exit; fi
 if [ "$1 $2" = 'image inspect' ]; then printf '{"Id":"${imageId}","Labels":{"org.opencontainers.image.revision":"%s"}}\n' "$revision"; exit; fi
 exit 72
 `);
@@ -141,6 +142,7 @@ chmod 700 node_modules/fake/playwright
 ln -s ../fake/playwright node_modules/.bin/playwright
 `);
   executable(path.join(bin, "sudo"), `#!/bin/sh
+case " $* " in *' remove-docker-config-tree '*) touch '${state}/sudo-cleanup';; esac
 [ "$1" = -n ] || exit 81
 shift
 [ "$1" = env ] || exit 82
@@ -158,9 +160,17 @@ exec env -i WMUX_TEST_SUDO=1 "$@"
   return { directory, repository, runtime, stateHome, state, bin, log, project, revision, port, environment, script: path.join(repository, "scripts/wmux-docker-staging") };
 }
 
-const run = (fixture: Fixture, command: string, changes: NodeJS.ProcessEnv = {}) => spawnSync("/bin/sh", [fixture.script, command], {
-  cwd: os.tmpdir(), env: { ...fixture.environment, ...changes }, encoding: "utf8", timeout: 30_000,
-});
+const run = (fixture: Fixture, command: string, changes: NodeJS.ProcessEnv = {}) => {
+  const result = spawnSync("/bin/sh", [fixture.script, command], {
+    cwd: os.tmpdir(), env: { ...fixture.environment, ...changes }, encoding: "utf8", timeout: 30_000,
+  });
+  const runtimeRoot = changes.WMUX_STAGING_RUNTIME_ROOT === ""
+    ? path.join(changes.XDG_STATE_HOME ?? fixture.stateHome, "wmux", "docker-staging")
+    : changes.WMUX_STAGING_RUNTIME_ROOT ?? fixture.runtime;
+  assert.equal(fs.existsSync(path.join(runtimeRoot, `.lock-${fixture.project}`)), false,
+    `operation lock remained after ${command} (status ${result.status}): ${result.stderr}`);
+  return result;
+};
 
 const startHttpFixture = (directory: string, mode: string, port: string): ChildProcess => {
   const server = path.join(directory, `server-${mode}.mjs`);
@@ -257,6 +267,57 @@ test("sudo Compose uses only the verified owner-local mirror, never the root-squ
     assert.equal(fs.existsSync(runtimeDirectory), false);
     assert.equal(fs.existsSync(identity.WMUX_WORKTREE), false);
   } finally { removeFixture(fixture); }
+});
+
+test("sudo Docker Buildx artifacts are removed after successful and failed operations", () => {
+  for (const failSelection of [false, true]) {
+    const fixture = makeFixture();
+    try {
+      fs.writeFileSync(path.join(fixture.state, "control-sudo-only"), "");
+      fs.writeFileSync(path.join(fixture.state, "control-sudo-artifacts"), "");
+      if (failSelection) fs.writeFileSync(path.join(fixture.state, "control-pre-resource-fail"), "");
+      const result = run(fixture, "up");
+      assert.equal(result.status === 0, !failSelection, result.stderr);
+      assert.equal(fs.existsSync(path.join(fixture.state, "sudo-cleanup")), false);
+      if (!failSelection) assert.equal(run(fixture, "down").status, 0);
+    } finally { removeFixture(fixture); }
+  }
+});
+
+test("Docker config cleanup accepts only the exact non-symlink lock child and handles root-owned Buildx state", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-docker-config-cleanup-")); fs.chmodSync(directory, 0o700);
+  const lock = path.join(directory, ".lock-wmux-staging-policy");
+  const config = path.join(lock, "docker-config");
+  const outside = path.join(lock, "outside");
+  fs.mkdirSync(config, { recursive: true, mode: 0o700 }); fs.mkdirSync(outside, { mode: 0o700 });
+  try {
+    const policy = (...args: string[]) => spawnSync(process.execPath, [sourcePolicy, ...args], { encoding: "utf8" });
+    assert.equal(policy("validate-docker-config-path", lock, config).status, 0);
+    assert.notEqual(policy("validate-docker-config-path", lock, outside).status, 0);
+    fs.rmdirSync(config); fs.symlinkSync(outside, config);
+    assert.notEqual(policy("validate-docker-config-path", lock, config).status, 0);
+    assert.notEqual(policy("remove-docker-config-tree", lock, config).status, 0);
+    assert.equal(fs.existsSync(outside), true);
+    fs.unlinkSync(config); fs.mkdirSync(path.join(config, "buildx"), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(config, "buildx", "current"), "stub\n", { mode: 0o600 });
+    const buildx = path.join(config, "buildx");
+    const chown = spawnSync("sudo", ["-n", "chown", "-R", "0:0", buildx], { encoding: "utf8" });
+    if (chown.status === 0) {
+      assert.equal(policy("docker-config-cleanup-authority", lock, config).stdout.trim(), "sudo");
+      assert.notEqual(policy("remove-docker-config-tree", lock, config).status, 0);
+      const elevated = spawnSync("sudo", ["-n", process.execPath, sourcePolicy, "remove-docker-config-tree", lock, config], { encoding: "utf8" });
+      assert.equal(elevated.status, 0, elevated.stderr);
+    } else {
+      assert.equal(policy("docker-config-cleanup-authority", lock, config).stdout.trim(), "direct");
+      assert.equal(policy("remove-docker-config-tree", lock, config).status, 0);
+    }
+    assert.equal(fs.existsSync(config), false);
+    assert.equal(fs.existsSync(outside), true);
+  } finally {
+    const buildx = path.join(config, "buildx");
+    if (fs.existsSync(buildx)) spawnSync("sudo", ["-n", "chown", "-R", `${process.getuid?.() ?? 0}:${process.getgid?.() ?? 0}`, buildx]);
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("local build-context drift is rejected and retained for audit", () => {
@@ -383,6 +444,9 @@ test("exact resource IDs are recorded, substitutions fail closed, and audited do
       const status = run(fixture, "status"); assert.notEqual(status.status, 0); assert.match(status.stderr, /substitution detected/);
       fs.rmSync(controlPath);
     }
+    const nullPorts = path.join(fixture.state, "control-null-realized-ports"); fs.writeFileSync(nullPorts, "");
+    { const status = run(fixture, "status"); assert.notEqual(status.status, 0); assert.match(status.stderr, /live realized ports must be an object/); }
+    fs.rmSync(nullPorts);
     const down = run(fixture, "down"); assert.equal(down.status, 0, down.stderr);
     assert.equal(fs.existsSync(path.join(fixture.state, "image")), true);
     const log = fs.readFileSync(fixture.log, "utf8");
@@ -431,7 +495,7 @@ test("bounded Node smoke rejects redirects, slow/endless, and oversized HTTP wit
 
 const baselineCompose = (revision = "f".repeat(40)) => {
   const project = "wmux-staging-policy"; const proxy = { ALL_PROXY: "", FTP_PROXY: "", HTTPS_PROXY: "", HTTP_PROXY: "", NO_PROXY: "", all_proxy: "", ftp_proxy: "", http_proxy: "", https_proxy: "", no_proxy: "" };
-  return { name: project, networks: { default: { name: `${project}_default`, driver: "bridge", ipam: {}, internal: true } }, services: { wmux: {
+  return { name: project, networks: { default: { name: `${project}_default`, driver: "bridge", ipam: {} } }, services: { wmux: {
     build: { context: "/candidate", dockerfile: "deploy/docker/Dockerfile", args: { ...proxy, WMUX_REVISION: revision, WMUX_VERSION: `staging-${revision.slice(0, 12)}` } }, cap_drop: ["ALL"], command: null, container_name: `${project}-wmux`, cpus: 2, entrypoint: null,
     environment: { WMUX_BROWSER_AUTH_MODE: "shared-or-login", WMUX_HOST: "", WMUX_PORT: "3478", WMUX_PUBLIC_URL: "http://100.64.0.10:13478", WMUX_PUBLISH_HOST: "100.64.0.10", WMUX_REGISTRATION_TOKEN: "b".repeat(64), WMUX_TOKEN: "a".repeat(64) }, image: `wmux-staging:${revision}`, init: true, ipc: "private", logging: { driver: "local", options: { "max-file": "3", "max-size": "10m" } }, mem_limit: 1073741824, memswap_limit: 1073741824, networks: { default: null }, pids_limit: 512,
     ports: [{ mode: "ingress", host_ip: "100.64.0.10", target: 3478, published: "13478", protocol: "tcp" }], read_only: true, restart: "no", security_opt: ["no-new-privileges:true"], tmpfs: ["/home/node/.wmux:rw,nosuid,nodev,mode=0700,size=256m,uid=1000,gid=1000", "/tmp:rw,nosuid,nodev,noexec,mode=1777,size=64m,uid=1000,gid=1000", "/run:rw,nosuid,nodev,noexec,mode=0755,size=8m,uid=1000,gid=1000"], user: "node",
@@ -451,6 +515,10 @@ test("Compose policy reads protected secrets by file path and rejects token or m
     }
     const emptyPid = structuredClone(baselineCompose()) as any; emptyPid.services.wmux.pid = "";
     assert.equal(validate(emptyPid).status, 0);
+    for (const field of ["internal", "attachable"]) {
+      const broadened = structuredClone(baselineCompose()) as any; broadened.networks.default[field] = true;
+      assert.notEqual(validate(broadened).status, 0, field);
+    }
     const mounted = structuredClone(baselineCompose()) as any; mounted.services.wmux.build.ssh = ["default"]; assert.notEqual(validate(mounted).status, 0);
     fs.writeFileSync(envFile, `WMUX_TOKEN=${"a".repeat(64)}\nWMUX_REGISTRATION_TOKEN=${"a".repeat(64)}\n`, { mode: 0o600 }); assert.notEqual(validate(baselineCompose()).status, 0);
   } finally { fs.rmSync(directory, { recursive: true, force: true }); }
@@ -460,7 +528,7 @@ test("dedicated staging artifacts preserve exact private publish and omit produc
   const compose = fs.readFileSync(path.join(sourceRoot, "deploy/docker/docker-compose.staging.yml"), "utf8");
   const script = fs.readFileSync(path.join(sourceRoot, "scripts/wmux-docker-staging"), "utf8");
   const policy = fs.readFileSync(sourcePolicy, "utf8");
-  assert.match(compose, /WMUX_PUBLISH_HOST.*WMUX_PUBLISH_PORT/); assert.match(compose, /internal: true/);
+  assert.match(compose, /WMUX_PUBLISH_HOST.*WMUX_PUBLISH_PORT/); assert.match(compose, /internal: false/); assert.match(compose, /attachable: false/);
   assert.doesNotMatch(compose, /^volumes:/m); assert.doesNotMatch(script, /docker-compose\.yml|--volumes|\bprune\b|git archive|candidate\.tar/);
   assert.match(script, /runtime_root=\$\{XDG_STATE_HOME:-\$\{HOME:\?HOME is required\}\/\.local\/state\}\/wmux\/docker-staging/);
   assert.doesNotMatch(script, /\.workspace\/deployments\/wmux-staging/);

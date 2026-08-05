@@ -215,13 +215,32 @@ lock_dir=$runtime_root/.lock-$project
 lock_owned=0
 inspect_output=
 docker_config=
+docker_sudo_marker=$lock_dir/.docker-sudo-used
+
+remove_docker_config() {
+  [ -n "$docker_config" ] && [ -e "$docker_config" ] || return 0
+  node_cmd "$policy" validate-docker-config-path "$lock_dir" "$docker_config" || return 1
+  cleanup_authority=$(node_cmd "$policy" docker-config-cleanup-authority "$lock_dir" "$docker_config") || return 1
+  if [ "$cleanup_authority" = sudo ]; then
+    [ -f "$docker_sudo_marker" ] || return 1
+    env -i PATH="$tool_path" HOME="${HOME:?HOME is required}" \
+      sudo -n env -i PATH="$tool_path" HOME=/root LC_ALL=C LANG=C \
+        node "$policy" remove-docker-config-tree "$lock_dir" "$docker_config"
+  elif [ "$cleanup_authority" = direct ]; then
+    node_cmd "$policy" remove-docker-config-tree "$lock_dir" "$docker_config"
+  else
+    return 1
+  fi
+  rm -f "$docker_sudo_marker"
+}
+
+release_docker_client() {
+  remove_docker_config || die "refusing to remove unsafe ephemeral Docker config; lock retained"
+}
 
 cleanup() {
   [ -z "$inspect_output" ] || rm -f "$inspect_output"
-  if [ -n "$docker_config" ] && [ -d "$docker_config" ]; then
-    chmod 700 "$docker_config" 2>/dev/null || true
-    rmdir "$docker_config" 2>/dev/null || true
-  fi
+  remove_docker_config 2>/dev/null || true
   if [ "$lock_owned" = 1 ]; then
     rmdir "$lock_dir" 2>/dev/null || true
     lock_owned=0
@@ -265,6 +284,7 @@ docker_direct() {
 }
 
 docker_sudo() {
+  : >"$docker_sudo_marker"
   env -i PATH="$tool_path" HOME="${HOME:?HOME is required}" \
     sudo -n env -i PATH="$tool_path" HOME=/root LC_ALL=C LANG=C \
       DOCKER_CONFIG="$docker_config" DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 \
@@ -430,14 +450,14 @@ validate_live_values() {
   [ "$project_containers" = "$exact_containers" ] && [ "$exact_containers" = "$recorded_container_id" ] || die "container ID/inventory substitution detected"
   [ "$project_networks" = "$exact_networks" ] && [ "$exact_networks" = "$recorded_network_id" ] || die "network ID/inventory substitution detected"
   inspect_output=$(mktemp "$runtime_dir/.inspect.XXXXXX")
-  docker_cmd inspect --format '{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Config":{"Image":{{json .Config.Image}},"Labels":{{json .Config.Labels}},"User":{{json .Config.User}}},"HostConfig":{"Binds":{{json .HostConfig.Binds}},"CapDrop":{{json .HostConfig.CapDrop}},"DeviceRequests":{{json .HostConfig.DeviceRequests}},"Devices":{{json .HostConfig.Devices}},"IpcMode":{{json .HostConfig.IpcMode}},"LogConfig":{{json .HostConfig.LogConfig}},"Memory":{{json .HostConfig.Memory}},"MemorySwap":{{json .HostConfig.MemorySwap}},"NanoCpus":{{json .HostConfig.NanoCpus}},"NetworkMode":{{json .HostConfig.NetworkMode}},"PidMode":{{json .HostConfig.PidMode}},"PidsLimit":{{json .HostConfig.PidsLimit}},"PortBindings":{{json .HostConfig.PortBindings}},"Privileged":{{json .HostConfig.Privileged}},"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"RestartPolicy":{{json .HostConfig.RestartPolicy}},"SecurityOpt":{{json .HostConfig.SecurityOpt}},"Tmpfs":{{json .HostConfig.Tmpfs}},"VolumesFrom":{{json .HostConfig.VolumesFrom}}},"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}}},"Mounts":{{json .Mounts}}}' "$recorded_container_id" >"$inspect_output" \
+  docker_cmd inspect --format '{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Config":{"Image":{{json .Config.Image}},"Labels":{{json .Config.Labels}},"User":{{json .Config.User}}},"HostConfig":{"Binds":{{json .HostConfig.Binds}},"CapDrop":{{json .HostConfig.CapDrop}},"DeviceRequests":{{json .HostConfig.DeviceRequests}},"Devices":{{json .HostConfig.Devices}},"IpcMode":{{json .HostConfig.IpcMode}},"LogConfig":{{json .HostConfig.LogConfig}},"Memory":{{json .HostConfig.Memory}},"MemorySwap":{{json .HostConfig.MemorySwap}},"NanoCpus":{{json .HostConfig.NanoCpus}},"NetworkMode":{{json .HostConfig.NetworkMode}},"PidMode":{{json .HostConfig.PidMode}},"PidsLimit":{{json .HostConfig.PidsLimit}},"PortBindings":{{json .HostConfig.PortBindings}},"Privileged":{{json .HostConfig.Privileged}},"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"RestartPolicy":{{json .HostConfig.RestartPolicy}},"SecurityOpt":{{json .HostConfig.SecurityOpt}},"Tmpfs":{{json .HostConfig.Tmpfs}},"VolumesFrom":{{json .HostConfig.VolumesFrom}}},"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}},"Ports":{{json .NetworkSettings.Ports}}},"Mounts":{{json .Mounts}}}' "$recorded_container_id" >"$inspect_output" \
     || die "cannot inspect recorded staging container"
   node_cmd "$policy" validate-container "$project" "$publish_host" "$publish_port" \
     "$(env_value "$env_file" WMUX_IMAGE)" "$(env_value "$env_file" WMUX_BUILD_REVISION)" \
     "$recorded_container_id" "$recorded_network_id" "$recorded_image_id" <"$inspect_output" \
     || die "live staging container policy validation failed"
   rm -f "$inspect_output"; inspect_output=
-  docker_cmd network inspect --format '{"Driver":{{json .Driver}},"Id":{{json .Id}},"Internal":{{json .Internal}},"Labels":{{json .Labels}},"Name":{{json .Name}},"Options":{{json .Options}}}' "$recorded_network_id" \
+  docker_cmd network inspect --format '{"Attachable":{{json .Attachable}},"Driver":{{json .Driver}},"Id":{{json .Id}},"Internal":{{json .Internal}},"Labels":{{json .Labels}},"Name":{{json .Name}},"Options":{{json .Options}}}' "$recorded_network_id" \
     | node_cmd "$policy" validate-network "$project" "$recorded_network_id" \
     || die "live staging network policy validation failed"
   validate_image "$recorded_image_id"
@@ -579,12 +599,15 @@ case "$command_name" in
     if [ ! -f "$env_file" ] || [ ! -f "$live_file" ]; then
       require_unused_project
       if [ -f "$identity_file" ]; then
+        release_docker_client
         node_cmd "$policy" remove-audited-stage "$identity_file" "$runtime_dir" \
           || die "isolated Git cleanup audit failed; evidence retained"
       elif [ -f "$provision_file" ]; then
+        release_docker_client
         node_cmd "$policy" remove-audited-provision "$provision_file" "$runtime_dir" \
           || die "isolated provision cleanup audit failed; evidence retained"
       else
+        release_docker_client
         remove_runtime
       fi
       printf '%s\n' "staging project $project is already down"; exit 0
@@ -603,6 +626,7 @@ case "$command_name" in
     validate_image "$recorded_image_id"
     validate_candidate
     node_cmd "$policy" validate-identity "$identity_file" >/dev/null || die "cleanup identity audit failed; evidence retained"
+    release_docker_client
     node_cmd "$policy" remove-audited-stage "$identity_file" "$runtime_dir" \
       || die "isolated Git cleanup audit failed; evidence retained"
     printf '%s\n' "staging project $project was removed; candidate image retained"

@@ -103,6 +103,63 @@ const validateEmptyDirectory = (target) => {
   if (fs.readdirSync(target).length !== 0) fail("Docker config must start empty");
 };
 
+const validateDockerConfigPath = (lockDirectory, dockerConfig) => {
+  const lockParts = pathParts(lockDirectory);
+  if (!path.basename(lockDirectory).startsWith(".lock-wmux-staging-")) fail("Docker config lock path is not a staging lock");
+  const lockStat = fs.lstatSync(lockDirectory);
+  const owner = lockStat.uid;
+  for (let index = 0; index < lockParts.length; index += 1) {
+    const entryPath = lockParts[index];
+    const stat = fs.lstatSync(entryPath);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) fail(`unsafe Docker config path component: ${entryPath}`);
+    if (stat.uid !== 0 && stat.uid !== owner) fail(`Docker config path component has an unexpected owner: ${entryPath}`);
+    const mode = stat.mode & 0o7777;
+    if ((mode & 0o002) !== 0 && !(stat.uid === 0 && (mode & 0o1000) !== 0)) {
+      fail(`Docker config path component is world-writable: ${entryPath}`);
+    }
+  }
+  if ((lockStat.mode & 0o777) !== 0o700) fail("Docker config lock must have mode 700");
+  if (dockerConfig !== path.join(lockDirectory, "docker-config")) fail("Docker config must be the exact staging lock child");
+  const configStat = fs.lstatSync(dockerConfig);
+  if (!configStat.isDirectory() || configStat.isSymbolicLink() || (configStat.uid !== owner && configStat.uid !== 0)) {
+    fail("Docker config must be a non-symlink directory owned by the staging user or root");
+  }
+  return owner;
+};
+
+const removeDockerConfigTree = (lockDirectory, dockerConfig) => {
+  const owner = validateDockerConfigPath(lockDirectory, dockerConfig);
+  const removeEntry = (entryPath) => {
+    const stat = fs.lstatSync(entryPath);
+    if (stat.uid !== owner && stat.uid !== 0) fail(`refusing Docker config entry with an unexpected owner: ${entryPath}`);
+    if (stat.isDirectory() && !stat.isSymbolicLink()) {
+      fs.chmodSync(entryPath, 0o700);
+      for (const name of fs.readdirSync(entryPath)) removeEntry(path.join(entryPath, name));
+      fs.rmdirSync(entryPath);
+    } else if (stat.isFile() || stat.isSymbolicLink()) {
+      fs.unlinkSync(entryPath);
+    } else {
+      fail(`refusing unsupported Docker config entry: ${entryPath}`);
+    }
+  };
+  removeEntry(dockerConfig);
+};
+
+const dockerConfigCleanupAuthority = (lockDirectory, dockerConfig) => {
+  const owner = validateDockerConfigPath(lockDirectory, dockerConfig);
+  const needsRoot = (entryPath) => {
+    const stat = fs.lstatSync(entryPath);
+    if (stat.uid !== owner && stat.uid !== 0) fail(`Docker config entry has an unexpected owner: ${entryPath}`);
+    if (stat.uid === 0 && owner !== 0) return true;
+    if (stat.isDirectory() && !stat.isSymbolicLink()) {
+      return fs.readdirSync(entryPath).some((name) => needsRoot(path.join(entryPath, name)));
+    }
+    if (!stat.isFile() && !stat.isSymbolicLink()) fail(`unsupported Docker config entry: ${entryPath}`);
+    return false;
+  };
+  return needsRoot(dockerConfig) ? "sudo" : "direct";
+};
+
 const approvedWorktreeRoot = "/mnt/storage/sw_projects/.worktrees/wmux";
 
 const validateWorktreeRoot = (target) => {
@@ -800,10 +857,10 @@ const validateCompose = async ([project, context, host, port, image, revision, v
     if (!entry) fail(`Compose tmpfs missing ${destination}`);
     exactMembers(entry.slice(destination.length + 1).split(","), expected, `Compose tmpfs ${destination}`);
   }
-  exactKeys(config.networks.default, ["driver", "internal", "ipam", "name"], "Compose network");
+  // Compose normalizes explicit false network flags by omitting them; either true value remains an extra rejected key.
+  exactKeys(config.networks.default, ["driver", "ipam", "name"], "Compose network");
   exactKeys(config.networks.default.ipam, [], "Compose network IPAM");
-  if (config.networks.default.name !== `${project}_default` || config.networks.default.driver !== "bridge"
-    || config.networks.default.internal !== true) fail("Compose network drift");
+  if (config.networks.default.name !== `${project}_default` || config.networks.default.driver !== "bridge") fail("Compose network drift");
 };
 
 const liveTmpfs = {
@@ -872,14 +929,20 @@ const validateContainer = async ([project, host, port, image, revision, containe
   exactKeys(h.Tmpfs, Object.keys(liveTmpfs), "live Tmpfs");
   for (const [destination, expected] of Object.entries(liveTmpfs)) validateTmpfsOptions(h.Tmpfs[destination], expected, destination);
   exactMembers(value.Mounts, [], "live Mounts");
+  exactKeys(value.NetworkSettings, ["Networks", "Ports"], "live NetworkSettings");
   exactKeys(value.NetworkSettings.Networks, [`${project}_default`], "live attached networks");
   if (value.NetworkSettings.Networks[`${project}_default`].NetworkID !== networkId) fail("live attached network ID drift");
+  exactKeys(value.NetworkSettings.Ports, ["3478/tcp"], "live realized ports");
+  if (!Array.isArray(value.NetworkSettings.Ports["3478/tcp"]) || value.NetworkSettings.Ports["3478/tcp"].length !== 1
+    || value.NetworkSettings.Ports["3478/tcp"][0].HostIp !== host
+    || value.NetworkSettings.Ports["3478/tcp"][0].HostPort !== port) fail("live realized port drift");
 };
 
 const validateNetwork = async ([project, networkId]) => {
   const value = await parseStdinJson();
-  exactKeys(value, ["Driver", "Id", "Internal", "Labels", "Name", "Options"], "live network inspect");
-  if (value.Id !== networkId || value.Name !== `${project}_default` || value.Driver !== "bridge" || value.Internal !== true) {
+  exactKeys(value, ["Attachable", "Driver", "Id", "Internal", "Labels", "Name", "Options"], "live network inspect");
+  if (value.Id !== networkId || value.Name !== `${project}_default` || value.Driver !== "bridge"
+    || value.Internal !== false || value.Attachable !== false) {
     fail("live network identity drift");
   }
   exactKeys(value.Options, [], "live network options");
@@ -903,6 +966,9 @@ try {
     case "validate-worktree-root": validateWorktreeRoot(args[0]); break;
     case "validate-private-dir": validatePrivateDirectory(args[0]); break;
     case "validate-empty-dir": validateEmptyDirectory(args[0]); break;
+    case "validate-docker-config-path": validateDockerConfigPath(...args); break;
+    case "docker-config-cleanup-authority": process.stdout.write(`${dockerConfigCleanupAuthority(...args)}\n`); break;
+    case "remove-docker-config-tree": removeDockerConfigTree(...args); break;
     case "remove-private-tree": removePrivateTree(args[0]); break;
     case "validate-worktree": validateWorktree(...args); break;
     case "validate-e2e-worktree": validateE2eWorktree(...args); break;

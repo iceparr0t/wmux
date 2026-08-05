@@ -180,8 +180,12 @@ context, Unix endpoint, and engine ID are pinned at `up`; every later Docker
 operation must match them. External object/worktree variables, hooks, fsmonitor,
 `NODE_OPTIONS`, `TAR_OPTIONS`, inherited proxy variables, and
 the caller's Docker configuration are excluded from provenance operations. The
-Docker client uses a new empty owner-only config for every locked operation, and
-all standard upper/lowercase proxy build arguments are explicitly empty.
+Docker client uses a new empty owner-only config for every locked operation. Its
+exact non-symlink location below the validated operation lock is revalidated
+before cleanup; if sudo Docker populated it with root-owned Buildx state, the
+same sudo authority removes only that ephemeral config tree before releasing the
+lock. No broader runtime path is passed to privileged deletion. All standard
+upper/lowercase proxy build arguments are explicitly empty.
 
 The mode-`600` environment containing independently generated shared and
 registration tokens is stored below the durable owner-local
@@ -235,12 +239,16 @@ and durable-shell state inside the container are intentionally lost whenever
 the container is removed or recreated. The protected operator metadata outside
 the container contains only staging lifecycle authority and candidate evidence.
 
-The runtime bridge is a dedicated Compose `internal` network. Published ingress
-on the selected private host address/port remains available, but container
-shells cannot initiate network egress to the Internet, private hosts, agents,
-or media services. Docker image build networking is separate and remains under
-the Docker builder's normal policy. This containment is intentional for the
-candidate UI/API test installation.
+The runtime bridge is one dedicated, non-attachable Compose bridge with Docker's
+default outbound connectivity. Making it non-internal is a deliberate
+compatibility tradeoff: Docker then realizes the exact private-IP published port
+on hosts where an `internal` bridge leaves `NetworkSettings.Ports` null, but the
+staging candidate can initiate outbound network connections. Never place SSH
+keys, host or production configuration, production tokens, or other reusable
+credentials in this container. The wrapper still permits exactly one bridge and
+one private host/port binding, and live policy verifies the bridge driver,
+non-internal/non-attachable flags, attached network, and realized port. Docker
+image build networking remains under the Docker builder's normal policy.
 
 Resource discovery checks project labels and exact container/network names
 independently and also refuses any project-labeled or legacy exact-name volume.
@@ -268,7 +276,7 @@ installation, not production-system parity. Shells and tmux/screen sessions are
 container-local. The method does not validate systemd supervision, native
 POSIX/Windows agents, host SSH inventories, MediaMTX/capture, or host devices.
 Production-untouched evidence consists of the exact staging Compose project
-label, its dedicated internal bridge and ephemeral mounts reported by `smoke`, and the wrapper's
+label, its dedicated non-internal bridge and ephemeral mounts reported by `smoke`, and the wrapper's
 absence of production service/config/state operations; teardown targets those
 same exact labels and resources.
 
