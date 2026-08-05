@@ -250,7 +250,7 @@ if [ "$1" = inspect ]; then
       const early=ctl("runner-prestart-network-realized");
       let networkId=post||early?"${networkId}":"";
       if(!post&&ctl("runner-prestart-network-drift"))networkId="${"f".repeat(64)}";
-      const value={Id:"${runnerContainerId}",Image:"${runnerImageId}",Name:"/"+name,Config:{Cmd:["run"],Entrypoint:["/runner-bootstrap"],Env:env,Image:"${runnerImage}",Labels:labels,OpenStdin:true,StdinOnce:false,Tty:false,User:get("user"),WorkingDir:"/workspace"},HostConfig:h,NetworkSettings:{Networks:{[net]:{NetworkID:networkId}},Ports:{}},Mounts:mounts};
+      const value={Id:"${runnerContainerId}",Image:"${runnerImageId}",Name:"/"+name,Config:{Cmd:["run"],Entrypoint:["/runner-bootstrap"],Env:env,Image:"${runnerImage}",Labels:labels,OpenStdin:true,StdinOnce:true,Tty:false,User:get("user"),WorkingDir:"/workspace"},HostConfig:h,NetworkSettings:{Networks:{[net]:{NetworkID:networkId}},Ports:{}},Mounts:mounts};
       if(post)value.State={Dead:false,Error:"",ExitCode:0,FinishedAt:"0001-01-01T00:00:00Z",OOMKilled:false,Paused:false,Pid:1234,Restarting:false,Running:true,StartedAt:"2026-08-05T12:00:00.000000000Z",Status:"running"};
       if(ctl("runner-inspect-privileged"))h.Privileged=true;
       if(ctl("runner-inspect-host-pid"))h.PidMode="host";
@@ -262,6 +262,7 @@ if [ "$1" = inspect ]; then
       if(ctl("runner-inspect-token-env"))env.push("WMUX_E2E_TOKEN=metadata-secret");
       if(post&&ctl("runner-post-inspect-identity"))value.Name="/substituted";
       if(post&&ctl("runner-post-inspect-config"))value.Config.OpenStdin=false;
+      if(post&&ctl("runner-post-inspect-stdin-once"))value.Config.StdinOnce=false;
       if(post&&ctl("runner-post-inspect-mount"))mounts[0].Source="/substituted";
       if(post&&ctl("runner-post-inspect-resource"))h.Memory=0;
       if(post&&ctl("runner-post-inspect-network"))value.NetworkSettings.Networks[net].NetworkID="";
@@ -660,7 +661,7 @@ test("runner rejects image, package, inspect, output, result, and execution drif
     for (const control of [
       "runner-image-drift", "runner-image-malformed", "runner-image-unexpected", "playwright-version-drift", "e2e-symlink-drift", "runner-inspect-privileged", "runner-inspect-host-pid",
       "runner-inspect-device", "runner-inspect-mount", "runner-inspect-network", "runner-inspect-port",
-      "runner-inspect-limit", "runner-inspect-token-env", "runner-post-inspect-identity", "runner-post-inspect-config",
+      "runner-inspect-limit", "runner-inspect-token-env", "runner-post-inspect-identity", "runner-post-inspect-config", "runner-post-inspect-stdin-once",
       "runner-post-inspect-mount", "runner-post-inspect-resource", "runner-post-inspect-network", "runner-post-inspect-state",
       "runner-prestart-network-drift", "runner-network-before-start-drift", "runner-start-fail", "runner-attach-fail",
       "runner-wait-fail", "runner-token-log", "runner-result-token", "runner-fail",

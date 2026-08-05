@@ -1148,7 +1148,7 @@ const validateRunnerContainer = async ([project, revision, runnerName, container
   const config = value.Config;
   exactKeys(config, ["Cmd", "Entrypoint", "Env", "Image", "Labels", "OpenStdin", "StdinOnce", "Tty", "User", "WorkingDir"], "runner Config");
   if (config.Image !== runnerImage || config.User !== runnerUser || config.WorkingDir !== "/workspace"
-    || config.OpenStdin !== true || config.StdinOnce !== false || config.Tty !== false) {
+    || config.OpenStdin !== true || config.StdinOnce !== true || config.Tty !== false) {
     fail("runner image/user/workdir/stdin policy drift");
   }
   exactMembers(config.Entrypoint, ["/runner-bootstrap"], "runner entrypoint");
