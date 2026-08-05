@@ -475,6 +475,8 @@ export interface WmuxSettings {
   inactiveTabStreaming: InactiveTabStreaming;
   tuiFrameRate: TuiFrameRate;
   terminalScrollMode: TerminalScrollMode;
+  /** Keep sidebar rows partitioned by their presentation host. */
+  groupSidebarSessionsByHost: boolean;
   machineAliases: Record<string, string>;
   collapsedWorkspaceIds: string[];
   favoriteWorkspaceIds: string[];

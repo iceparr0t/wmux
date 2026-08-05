@@ -1572,6 +1572,7 @@ export function AppShell() {
           targetMachineReachable={Boolean(selectedMachine?.reachable)}
           workspaces={openTuiWorkspaces}
           machines={openTuiMachines}
+          groupSidebarSessionsByHost={settings.groupSidebarSessionsByHost}
           onTargetMachineChange={setNewMachineId}
           onCreateWorkspace={() => createWorkspace(targetMachineId)}
           onActivateWorkspace={activateWorkspaceFromChrome}
@@ -1593,6 +1594,7 @@ export function AppShell() {
           targetMachineReachable={Boolean(selectedMachine?.reachable)}
           workspaces={openTuiWorkspaces}
           machines={openTuiMachines}
+          groupSidebarSessionsByHost={settings.groupSidebarSessionsByHost}
           onTargetMachineChange={setNewMachineId}
           onCreateWorkspace={() => createWorkspace(targetMachineId)}
           onActivateWorkspace={activateWorkspaceFromChrome}

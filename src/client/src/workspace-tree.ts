@@ -252,6 +252,21 @@ export const sortFavoriteWorkspaceRows = <
   return sorted;
 };
 
+export const groupSidebarWorkspaceRows = <
+  T extends { id: string; parentId?: string; favorite: boolean; machineId: string },
+>(rows: readonly T[], machineIds: readonly string[], groupByHost: boolean): Array<{ machineId?: string; rows: T[] }> => {
+  if (!groupByHost) return [{ rows: sortFavoriteWorkspaceRows(rows) }];
+  const byMachine = new Map<string, T[]>();
+  for (const row of rows) {
+    const group = byMachine.get(row.machineId) ?? [];
+    group.push(row);
+    byMachine.set(row.machineId, group);
+  }
+  const orderedMachineIds = [...machineIds, ...byMachine.keys()]
+    .filter((machineId, index, ids) => byMachine.has(machineId) && ids.indexOf(machineId) === index);
+  return orderedMachineIds.map((machineId) => ({ machineId, rows: sortFavoriteWorkspaceRows(byMachine.get(machineId) ?? []) }));
+};
+
 export const workspaceMoveIntents = (
   workspaces: readonly Workspace[],
   workspaceId: string,

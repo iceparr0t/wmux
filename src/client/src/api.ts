@@ -69,6 +69,7 @@ export const modalSettingsUpdate = (settings: WmuxSettings): ModalSettingsUpdate
   inactiveTabStreaming: settings.inactiveTabStreaming,
   tuiFrameRate: settings.tuiFrameRate,
   terminalScrollMode: settings.terminalScrollMode,
+  groupSidebarSessionsByHost: settings.groupSidebarSessionsByHost,
   machineAliases: settings.machineAliases,
 });
 
@@ -288,6 +289,7 @@ export const api = {
         inactiveTabStreaming: settings.inactiveTabStreaming,
         tuiFrameRate: settings.tuiFrameRate,
         terminalScrollMode: settings.terminalScrollMode,
+        groupSidebarSessionsByHost: settings.groupSidebarSessionsByHost,
         machineAliases: settings.machineAliases,
       }),
     }),
