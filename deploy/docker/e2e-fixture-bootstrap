@@ -1,0 +1,59 @@
+#!/bin/sh
+set -eu
+
+[ "$#" -eq 1 ] && [ "$1" = run ] || exit 64
+
+credential_error() {
+  printf '%s\n' 'wmux staging fixture credential input rejected' >&2
+  exit 64
+}
+
+IFS= read -r WMUX_TOKEN || credential_error
+IFS= read -r WMUX_REGISTRATION_TOKEN || credential_error
+if IFS= read -r _unexpected; then credential_error; fi
+
+case "$WMUX_TOKEN" in ''|*[!0-9a-f]*) credential_error ;; esac
+case "$WMUX_REGISTRATION_TOKEN" in ''|*[!0-9a-f]*) credential_error ;; esac
+[ "${#WMUX_TOKEN}" -eq 64 ] || credential_error
+[ "${#WMUX_REGISTRATION_TOKEN}" -eq 64 ] || credential_error
+[ "$WMUX_TOKEN" != "$WMUX_REGISTRATION_TOKEN" ] || credential_error
+
+runtime=/run/wmux-e2e
+config=$runtime/wmux.config.json
+mkdir -p "$runtime/attachments"
+chmod 700 "$runtime" "$runtime/attachments"
+cat >"$config" <<'EOF'
+{
+  "keybindings": {
+    "terminal.wordPrevious": ["Alt+ArrowLeft", "Ctrl+Shift+KeyP"]
+  },
+  "shellCommandTracking": true,
+  "machines": [
+    {
+      "id": "local",
+      "name": "Local",
+      "kind": "local",
+      "sessionBackend": "pty",
+      "shell": "/bin/sh",
+      "cwd": "/app"
+    }
+  ]
+}
+EOF
+chmod 600 "$config"
+
+WMUX_HOST=$(node /usr/local/lib/wmux/docker-bind-host.mjs)
+export WMUX_TOKEN WMUX_REGISTRATION_TOKEN WMUX_HOST
+export WMUX_DISABLE_AUTH=0
+export WMUX_PUBLIC_URL=http://wmux-e2e-fixture:3478
+export WMUX_HELPER_URL=http://wmux-e2e-fixture:3478
+export WMUX_CONFIG_PATH=$config
+export WMUX_MANAGED_CONFIG_PATH=$runtime/managed-config.json
+export WMUX_STATE_PATH=$runtime/state.json
+export WMUX_SETTINGS_PATH=$runtime/settings.json
+export WMUX_AGENT_TIMELINE_PATH=$runtime/agent-timelines.json
+export WMUX_ATTACHMENT_DIR=$runtime/attachments
+export WMUX_CERT_FILE= WMUX_KEY_FILE=
+unset _unexpected
+
+exec node dist/server/index.js --host "$WMUX_HOST" --port 3478

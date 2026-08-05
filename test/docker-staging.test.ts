@@ -16,6 +16,8 @@ const networkId = "b".repeat(64);
 const imageId = `sha256:${"c".repeat(64)}`;
 const runnerContainerId = "d".repeat(64);
 const runnerImageId = `sha256:${"7".repeat(64)}`;
+const fixtureContainerId = "8".repeat(64);
+const e2eNetworkId = "9".repeat(64);
 const runnerImage = "mcr.microsoft.com/playwright@sha256:57b65fdc9ceabe0ef613124c7bbe2babcf9362c4d85e382fe3b03604e84b428a";
 
 const executable = (filePath: string, source: string) => fs.writeFileSync(filePath, source, { mode: 0o755 });
@@ -63,7 +65,7 @@ const removeFixture = (fixture: Fixture) => {
   }
 };
 
-function makeFixture(options: { runnerTimeoutSeconds?: number } = {}) {
+function makeFixture(options: { runnerTimeoutSeconds?: number; fixtureHealthTimeoutSeconds?: number } = {}) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-staging-worktree-"));
   fs.chmodSync(directory, 0o700);
   const repository = path.join(directory, "source");
@@ -79,16 +81,21 @@ function makeFixture(options: { runnerTimeoutSeconds?: number } = {}) {
   for (const relative of [
     "scripts/wmux-docker-staging", "deploy/docker/docker-bind-host.mjs", "deploy/docker/docker-staging-policy.mjs",
     "deploy/docker/docker-staging-smoke.mjs", "deploy/docker/docker-compose.staging.yml", "deploy/docker/Dockerfile",
-    "deploy/docker/e2e-runner-bootstrap",
+    "deploy/docker/e2e-runner-bootstrap", "deploy/docker/e2e-fixture-bootstrap",
   ]) {
     const target = path.join(repository, relative);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.copyFileSync(path.join(sourceRoot, relative), target);
   }
   fs.chmodSync(path.join(repository, "scripts/wmux-docker-staging"), 0o755);
+  fs.chmodSync(path.join(repository, "deploy/docker/e2e-fixture-bootstrap"), 0o755);
   if (options.runnerTimeoutSeconds !== undefined) {
     const launcher = path.join(repository, "scripts/wmux-docker-staging");
     fs.writeFileSync(launcher, fs.readFileSync(launcher, "utf8").replace('"$runtime_dir/e2e-run.log" 1800', `"$runtime_dir/e2e-run.log" ${options.runnerTimeoutSeconds}`), { mode: 0o755 });
+  }
+  if (options.fixtureHealthTimeoutSeconds !== undefined) {
+    const launcher = path.join(repository, "scripts/wmux-docker-staging");
+    fs.writeFileSync(launcher, fs.readFileSync(launcher, "utf8").replace('"$e2e_metadata_file" 120', `"$e2e_metadata_file" ${options.fixtureHealthTimeoutSeconds}`), { mode: 0o755 });
   }
   fs.writeFileSync(path.join(repository, "package.json"), '{"name":"candidate","scripts":{"test:e2e:browser:chromium":"true"}}\n');
   fs.writeFileSync(path.join(repository, "package-lock.json"), JSON.stringify({ name: "candidate", lockfileVersion: 3, requires: true, packages: {
@@ -124,7 +131,13 @@ cid='${containerId}'; nid='${networkId}'; iid='${imageId}'
 ctl substitute-container && cid='${"d".repeat(64)}'
 ctl substitute-network && nid='${"e".repeat(64)}'
 if [ "$1" = ps ]; then case " $* " in *label=com.docker.compose.project=*) has container && printf '%s\n' "$cid" || true;; *name=^/*) has container && printf '%s\n' "$cid" || true;; esac; exit 0; fi
-if [ "$1 $2" = 'network ls' ]; then case " $* " in *label=com.docker.compose.project=*) has network && printf '%s\n' "$nid" || true;; *name=^*) has network && printf '%s\n' "$nid" || true;; esac; exit 0; fi
+if [ "$1 $2" = 'network ls' ]; then
+  case " $* " in
+    *label=com.docker.compose.project=*) has network && printf '%s\n' "$nid" || true;;
+    *wmux-e2e-*) has e2e-network && printf '%s\n' '${e2eNetworkId}' || true;;
+    *name=^*) has network && printf '%s\n' "$nid" || true;;
+  esac; exit 0
+fi
 if [ "$1 $2" = 'volume ls' ]; then exit 0; fi
 if [ "$1" = compose ]; then
   env_file=; previous=; for arg in "$@"; do [ "$previous" != --env-file ] || env_file=$arg; previous=$arg; done
@@ -158,31 +171,73 @@ if [ "$1 $2" = 'image inspect' ] && [ "$5" = '${runnerImage}' ]; then
   fi
   exit
 fi
-if [ "$1" = create ]; then
-  ctl runner-create-fail && exit 74
-  interactive=0; previous=; for arg in "$@"; do
-    [ "$arg" != --interactive ] || interactive=1
+if [ "$1 $2" = 'image inspect' ] && [ "$5" = '${imageId}' ]; then
+  case "$4" in
+    *'index .Config "Env"'*) printf '{"Id":"${imageId}","Config":{"Env":["PATH=/usr/bin:/bin","NODE_ENV=production","HOME=/home/node","WMUX_PORT=3478"],"Labels":{"org.opencontainers.image.revision":"%s"}}}\n' "$revision"; exit;;
+  esac
+fi
+if [ "$1 $2" = 'network create' ]; then
+  ctl network-create-fail && exit 74
+  previous=; for arg in "$@"; do
     case "$previous" in
-      --name) printf '%s' "$arg" >"$STATE/runner-name";; --user) printf '%s' "$arg" >"$STATE/runner-user";;
+      --label) case "$arg" in wmux.staging.run=*) printf '%s' "\${arg#*=}" >"$STATE/e2e-run";; esac;;
+    esac
+    previous=$arg
+  done
+  for last do :; done; printf '%s' "$last" >"$STATE/e2e-network-name"
+  touch "$STATE/e2e-network"; ctl network-id-malformed && printf 'not-an-id\n' || printf '${e2eNetworkId}\n'; exit
+fi
+if [ "$1" = create ]; then
+  interactive=0; previous=; role=runner; for arg in "$@"; do
+    [ "$arg" != --interactive ] || interactive=1
+    [ "$previous" != --entrypoint ] || { [ "$arg" != /usr/local/lib/wmux/e2e-fixture-bootstrap ] || role=fixture; }
+    [ "$previous" != --label ] || case "$arg" in wmux.staging.run=*) printf '%s' "\${arg#*=}" >"$STATE/e2e-run";; esac
+    if [ "$role" = fixture ]; then
+      case "$previous" in
+        --name) printf '%s' "$arg" >"$STATE/fixture-name";;
+        --env) case "$arg" in WMUX_BUILD_REVISION=*) printf '%s' "\${arg#*=}" >"$STATE/fixture-revision";; WMUX_E2E_RUN_ID=*) printf '%s' "\${arg#*=}" >"$STATE/fixture-run";; WMUX_E2E_BASE_URL=*) printf '%s' "\${arg#*=}" >"$STATE/fixture-url";; esac;;
+        --network) printf '%s' "$arg" >"$STATE/fixture-network";;
+      esac
+    fi
+    case "$previous" in
+      --name) printf '%s' "$arg" >"$STATE/runner-name"; printf '%s' "$arg" >"$STATE/fixture-name";; --user) printf '%s' "$arg" >"$STATE/runner-user";;
       --mount) source=\${arg#*src=}; source=\${source%%,*}; case "$arg" in *dst=/workspace,*) printf '%s' "$source" >"$STATE/runner-context";; *dst=/runner-bootstrap,*) printf '%s' "$source" >"$STATE/runner-bootstrap";; esac;;
       --env) case "$arg" in WMUX_BUILD_REVISION=*) printf '%s' "\${arg#*=}" >"$STATE/runner-revision";; WMUX_E2E_BASE_URL=*) printf '%s' "\${arg#*=}" >"$STATE/runner-url";; esac;;
     esac
     previous=$arg
   done
   [ "$interactive" = 1 ] || exit 78
-  touch "$STATE/runner"; printf '${runnerContainerId}\n' >"$STATE/runner-id"; printf '${runnerContainerId}\n'; exit
+  if [ "$role" = fixture ]; then
+    ctl fixture-create-fail && exit 74
+    touch "$STATE/fixture"; printf '${fixtureContainerId}\n' >"$STATE/fixture-id"; ctl fixture-id-malformed && printf 'not-an-id\n' || printf '${fixtureContainerId}\n'; exit
+  fi
+  ctl runner-create-fail && exit 74
+  touch "$STATE/runner"; printf '${runnerContainerId}\n' >"$STATE/runner-id"; ctl runner-id-malformed && printf 'not-an-id\n' || printf '${runnerContainerId}\n'; exit
 fi
 if [ "$1" = start ]; then
-  [ "$#" = 2 ] && [ "$2" = '${runnerContainerId}' ] || exit 76
+  [ "$#" = 2 ] || exit 76
+  if [ "$2" = '${fixtureContainerId}' ]; then ctl fixture-start-fail && exit 74; touch "$STATE/fixture-started"; printf '${fixtureContainerId}\n'; exit; fi
+  [ "$2" = '${runnerContainerId}' ] || exit 76
   ctl runner-start-fail && exit 74
-  touch "$STATE/runner-started"
+  touch "$STATE/runner-started" "$STATE/runner-ever-started"
   printf '${runnerContainerId}\n'
   exit 0
 fi
 if [ "$1" = attach ]; then
+  if [ "$4" = '${fixtureContainerId}' ]; then
+    [ "$#" = 4 ] && [ "$2" = --no-stdin=false ] && [ "$3" = --sig-proxy=false ] || exit 76
+    has fixture-started && has fixture-post-inspected || exit 79
+    IFS= read -r token || exit 74; IFS= read -r registration || exit 75
+    printf '%s' "$token" >"$STATE/fixture-token"; printf '%s' "$registration" >"$STATE/fixture-registration"
+    ctl fixture-token-log && printf '%s\n' "$token"
+    ctl fixture-health-fail || touch "$STATE/fixture-healthy"
+    exec sleep 30
+  fi
   [ "$#" = 3 ] && [ "$2" = --no-stdin=false ] && [ "$3" = '${runnerContainerId}' ] || exit 76
   has runner-started && has runner-post-inspected || exit 79
   IFS= read -r token || exit 74; IFS= read -r registration || exit 75
+  printf '%s' "$token" >"$STATE/runner-token"; printf '%s' "$registration" >"$STATE/runner-registration"
+  [ "$token" = "$(/bin/cat "$STATE/fixture-token")" ] && [ "$registration" = "$(/bin/cat "$STATE/fixture-registration")" ] && touch "$STATE/credentials-match"
   if ctl runner-token-log; then printf '%s\n' "$token"; fi
   if ctl runner-result-token; then printf '%s' "$registration" >"$STATE/runner-result-secret"; fi
   context=$(/bin/cat "$STATE/runner-context")
@@ -206,7 +261,18 @@ if [ "$1" = cp ]; then
   if ctl runner-result-token; then /bin/cat "$STATE/runner-result-secret"; else printf 'safe-result-archive'; fi
   exit 0
 fi
+if [ "$1" = logs ]; then
+  [ "$2" = '${fixtureContainerId}' ] || exit 76
+  if ctl fixture-token-log; then /bin/cat "$STATE/fixture-token"; else printf 'fixture safe log\n'; fi
+  exit 0
+fi
 if [ "$1" = rm ] && [ "$2" = -f ]; then
+  if [ "$3" = '${fixtureContainerId}' ]; then
+    ctl fixture-remove-fail && exit 74
+    rm -f "$STATE/fixture-id" "$STATE/fixture-started" "$STATE/fixture-healthy" "$STATE/fixture-token" "$STATE/fixture-registration"
+    ctl fixture-name-substituted || rm -f "$STATE/fixture"
+    exit 0
+  fi
   [ "$3" = '${runnerContainerId}' ] || exit 76
   rm -f "$STATE/runner-id" "$STATE/runner-started" "$STATE/runner-pre-inspected" "$STATE/runner-post-inspected"
   ctl runner-name-substituted || rm -f "$STATE/runner"
@@ -214,14 +280,23 @@ if [ "$1" = rm ] && [ "$2" = -f ]; then
 fi
 if [ "$1" = exec ]; then printf '1000\n'; exit; fi
 if [ "$1" = inspect ]; then
-  if [ "$2" != --format ]; then case "$2" in '${runnerContainerId}') has runner-id;; *-e2e-*) has runner;; *) has container;; esac; exit; fi
+  if [ "$2" != --format ]; then
+    case "$2" in
+      '${runnerContainerId}') has runner-id;; '${fixtureContainerId}') has fixture-id;;
+      *fixture*) has fixture;; *runner*) has runner;; *) has container;;
+    esac; exit
+  fi
   if [ "$3" = '{{.Id}}' ]; then
     case "$4" in
       '${runnerContainerId}')
         [ -f "$STATE/runner-id" ] && /bin/cat "$STATE/runner-id"
         exit 0
         ;;
-      *-e2e-*)
+      '${fixtureContainerId}') [ -f "$STATE/fixture-id" ] && /bin/cat "$STATE/fixture-id"; exit 0;;
+      *fixture*)
+        if ctl fixture-name-substituted; then printf '%s\n' '${"f".repeat(64)}'; elif has fixture-id; then /bin/cat "$STATE/fixture-id"; fi
+        exit 0;;
+      *runner*)
         if ctl runner-name-substituted; then
           printf '%s\n' '${"e".repeat(64)}'
         elif [ -f "$STATE/runner-name" ] && [ -f "$STATE/runner-id" ]; then
@@ -232,6 +307,57 @@ if [ "$1" = inspect ]; then
     esac
     exit 0
   fi
+  case "$3" in
+    *'"StartedAt"'*'"Health"'*)
+      if [ "$4" = '${containerId}' ]; then
+        if ctl visible-drift && has runner-ever-started; then started='2026-08-05T11:59:59Z'; else started='2026-08-05T12:00:00Z'; fi
+        printf '{"Id":"${containerId}","Image":"${imageId}","Name":"/%s-wmux","Running":true,"Status":"running","Restarting":false,"StartedAt":"%s","Health":"healthy"}\n' "$project" "$started"
+        exit
+      fi;;
+  esac
+  case "$3" in
+    *'"Running"'*'"Health"'*)
+      case "$3" in *'"HostConfig"'*) :;; *)
+        [ "$4" = '${fixtureContainerId}' ] || exit 76
+        has fixture-healthy && health=healthy || health=starting
+        printf '{"Id":"${fixtureContainerId}","Running":true,"Status":"running","Health":"%s"}\n' "$health"
+        exit;;
+      esac;;
+  esac
+  case "$3" in
+    *'"State"'*) case "$3" in *'"HostConfig"'*) :;; *)
+      case "$4" in '${fixtureContainerId}'|'${runnerContainerId}') ;; *) exit 76;; esac
+      ctl fixture-prestart-state-drift && [ "$4" = '${fixtureContainerId}' ] && status=running || status=created
+      ctl runner-prestart-state-drift && [ "$4" = '${runnerContainerId}' ] && status=running || true
+      printf '{"Id":"%s","State":{"Dead":false,"Error":"","ExitCode":0,"FinishedAt":"0001-01-01T00:00:00Z","OOMKilled":false,"Paused":false,"Pid":0,"Restarting":false,"Running":false,"StartedAt":"0001-01-01T00:00:00Z","Status":"%s"}}\n' "$4" "$status"
+      exit;; esac;;
+  esac
+  if [ "$4" = '${fixtureContainerId}' ]; then
+    started=0; has fixture-started && started=1
+    healthy=0; case "$3" in *'"Health"'*) healthy=1;; esac
+    post=0; case "$3" in *'"State"'*) post=1;; esac
+    [ "$post" = "$started" ] || exit 79
+    node -e '
+      const fs=require("node:fs"),s=process.argv[1],post=process.argv[2]==="1",healthy=process.argv[3]==="1";
+      const read=n=>fs.readFileSync(s+"/"+n,"utf8"),ctl=n=>fs.existsSync(s+"/control-"+n);
+      const p=read("project"),r=read("fixture-revision"),run=read("fixture-run"),name=read("fixture-name"),net=read("fixture-network"),url=read("fixture-url");
+      const opt=(mode,size)=>"rw,nosuid,nodev,noexec,mode="+mode+",size="+size+",uid=1000,gid=1000";
+      const h={Binds:null,CapDrop:["ALL"],DeviceRequests:null,Devices:[],IpcMode:"private",Init:true,LogConfig:{Type:"local",Config:{compress:"false","max-file":"1","max-size":"4m"}},Memory:1073741824,MemorySwap:1073741824,Mounts:[],NanoCpus:2000000000,NetworkMode:net,PidMode:"",PidsLimit:512,PortBindings:{},Privileged:false,ReadonlyRootfs:true,RestartPolicy:{Name:"no"},SecurityOpt:["no-new-privileges:true"],ShmSize:67108864,Tmpfs:{"/home/node/.wmux":opt("700",268435456),"/tmp":opt("1777",67108864),"/run/wmux-e2e":opt("700",67108864)},UsernsMode:"",VolumesFrom:null};
+      const labels={"org.opencontainers.image.revision":r,"wmux.staging.e2e":"true","wmux.staging.project":p,"wmux.staging.revision":r,"wmux.staging.role":"fixture","wmux.staging.run":run};
+      const env=["PATH=/usr/bin:/bin","NODE_ENV=production","HOME=/home/node","WMUX_PORT=3478","WMUX_BUILD_REVISION="+r,"WMUX_E2E_RUN_ID="+run,"WMUX_E2E_BASE_URL="+url];
+      const networkId=post?"${e2eNetworkId}":"";
+      const value={Id:"${fixtureContainerId}",Image:"${imageId}",Name:"/"+name,Config:{Cmd:["run"],Entrypoint:["/usr/local/lib/wmux/e2e-fixture-bootstrap"],Env:env,Image:"${imageId}",Labels:labels,OpenStdin:true,StdinOnce:true,Tty:false,User:"1000:1000",WorkingDir:"/app"},HostConfig:h,NetworkSettings:{Networks:{[net]:{NetworkID:networkId}},Ports:{}},Mounts:[]};
+      if(post)value.State={Dead:false,Error:"",ExitCode:0,FinishedAt:"0001-01-01T00:00:00Z",OOMKilled:false,Paused:false,Pid:2345,Restarting:false,Running:true,StartedAt:"2026-08-05T12:00:01.000000000Z",Status:"running"};
+      if(healthy)value.Health={Status:ctl("fixture-health-drift")?"unhealthy":"healthy"};
+      if(ctl("fixture-inspect-privileged"))h.Privileged=true;
+      if(ctl("fixture-inspect-mount")){h.Mounts=[{Type:"bind",Source:"/etc",Target:"/host",ReadOnly:true}];value.Mounts=[{Type:"bind",Source:"/etc",Destination:"/host",RW:false,Propagation:"rprivate"}];}
+      if(ctl("fixture-inspect-token-env"))env.push("WMUX_TOKEN=metadata-secret");
+      if(post&&ctl("fixture-post-inspect-state"))value.State.Running=false;
+      process.stdout.write(JSON.stringify(value));
+    ' "$STATE" "$post" "$healthy"
+    if [ "$post" = 1 ]; then touch "$STATE/fixture-post-inspected"; fi
+    exit
+  fi
   if [ "$4" = '${runnerContainerId}' ]; then
     started=0; has runner-started && started=1
     post=0; case "$3" in *'"State"'*) post=1;; esac
@@ -240,15 +366,15 @@ if [ "$1" = inspect ]; then
       const fs=require("node:fs"),s=process.argv[1],post=process.argv[2]==="1";
       const get=n=>fs.readFileSync(s+"/runner-"+n,"utf8"),ctl=n=>fs.existsSync(s+"/control-"+n);
       const [uid,gid]=get("user").split(":").map(Number),p=fs.readFileSync(s+"/project","utf8"),r=get("revision");
-      const name=get("name"),url=get("url"),ctx=get("context"),boot=get("bootstrap"),net=p+"_default";
+      const name=get("name"),url=get("url"),ctx=get("context"),boot=get("bootstrap"),net=fs.readFileSync(s+"/e2e-network-name","utf8"),run=fs.readFileSync(s+"/e2e-run","utf8");
       const hm=[{Type:"bind",Source:ctx,Target:"/workspace",ReadOnly:true},{Type:"bind",Source:boot,Target:"/runner-bootstrap",ReadOnly:true}];
       const mounts=[{Type:"bind",Source:ctx,Destination:"/workspace",Mode:"ro",RW:false,Propagation:"rprivate"},{Type:"bind",Source:boot,Destination:"/runner-bootstrap",Mode:"ro",RW:false,Propagation:"rprivate"}];
       const opt=(mode,size)=>"rw,nosuid,nodev,noexec,mode="+mode+",size="+size+",uid="+uid+",gid="+gid;
       const h={Binds:null,CapDrop:["ALL"],DeviceRequests:null,Devices:[],IpcMode:"private",Init:true,LogConfig:{Type:"local",Config:{compress:"false","max-file":"1","max-size":"4m"}},Memory:2147483648,MemorySwap:2147483648,Mounts:hm,NanoCpus:2000000000,NetworkMode:net,PidMode:"",PidsLimit:512,PortBindings:{},Privileged:false,ReadonlyRootfs:true,RestartPolicy:{Name:"no"},SecurityOpt:["no-new-privileges:true"],ShmSize:536870912,Tmpfs:{"/home/wmux":opt("700",134217728),"/tmp":opt("1777",536870912),"/run":opt("755",8388608)},UsernsMode:"",VolumesFrom:null};
-      const labels={"org.opencontainers.image.revision":r,"wmux.staging.e2e":"true","wmux.staging.project":p};
+      const labels={"org.opencontainers.image.revision":r,"wmux.staging.e2e":"true","wmux.staging.project":p,"wmux.staging.revision":r,"wmux.staging.role":"runner","wmux.staging.run":run};
       const env=["PATH=/usr/bin:/bin","PLAYWRIGHT_BROWSERS_PATH=/ms-playwright","HOME=/home/wmux","TMPDIR=/tmp","XDG_CACHE_HOME=/home/wmux/.cache","WMUX_BUILD_REVISION="+r,"WMUX_E2E_BASE_URL="+url];
       const early=ctl("runner-prestart-network-realized");
-      let networkId=post||early?"${networkId}":"";
+      let networkId=post||early?"${e2eNetworkId}":"";
       if(!post&&ctl("runner-prestart-network-drift"))networkId="${"f".repeat(64)}";
       const value={Id:"${runnerContainerId}",Image:"${runnerImageId}",Name:"/"+name,Config:{Cmd:["run"],Entrypoint:["/runner-bootstrap"],Env:env,Image:"${runnerImage}",Labels:labels,OpenStdin:true,StdinOnce:true,Tty:false,User:get("user"),WorkingDir:"/workspace"},HostConfig:h,NetworkSettings:{Networks:{[net]:{NetworkID:networkId}},Ports:{}},Mounts:mounts};
       if(post)value.State={Dead:false,Error:"",ExitCode:0,FinishedAt:"0001-01-01T00:00:00Z",OOMKilled:false,Paused:false,Pid:1234,Restarting:false,Running:true,StartedAt:"2026-08-05T12:00:00.000000000Z",Status:"running"};
@@ -277,7 +403,23 @@ if [ "$1" = inspect ]; then
   case "$3" in *State.Health.Status*) printf 'healthy\n';; *'{{.Image}}'*) printf '${imageId}\n';; *'"HostConfig"'*)
     node -e 'const [cid,nid,iid,p,r,host,port,portMode]=process.argv.slice(1);const binding=[{HostIp:host,HostPort:port}];const h={Binds:null,CapDrop:["ALL"],DeviceRequests:null,Devices:[],IpcMode:"private",LogConfig:{Type:"local",Config:{"max-file":"3","max-size":"10m"}},Memory:1073741824,MemorySwap:1073741824,NanoCpus:2000000000,NetworkMode:p+"_default",PidMode:"",PidsLimit:512,PortBindings:{"3478/tcp":binding},Privileged:false,ReadonlyRootfs:true,RestartPolicy:{Name:"no"},SecurityOpt:["no-new-privileges:true"],Tmpfs:{"/home/node/.wmux":"rw,nosuid,nodev,mode=700,size=268435456,uid=1000,gid=1000","/tmp":"rw,nosuid,nodev,noexec,mode=1777,size=67108864,uid=1000,gid=1000","/run":"rw,nosuid,nodev,noexec,mode=755,size=8388608,uid=1000,gid=1000"},VolumesFrom:null};process.stdout.write(JSON.stringify({Id:cid,Image:iid,Name:"/"+p+"-wmux",Config:{Image:"wmux-staging:"+r,Labels:{"com.docker.compose.project":p,"com.docker.compose.service":"wmux","org.opencontainers.image.revision":r},User:"node"},HostConfig:h,NetworkSettings:{Networks:{[p+"_default"]:{NetworkID:nid}},Ports:portMode==="null"?null:{"3478/tcp":binding}},Mounts:[]}))' "$cid" "$nid" "$iid" "$project" "$revision" "$host" "$port" "$(ctl null-realized-ports && printf null || printf bound)";; esac; exit
 fi
-if [ "$1 $2" = 'network inspect' ]; then if [ "$3" != --format ]; then has network; exit; fi; if ctl runner-network-before-start-drift && has runner-pre-inspected; then nid='${"f".repeat(64)}'; fi; printf '{"Attachable":false,"Driver":"bridge","Id":"%s","Internal":false,"Labels":{"com.docker.compose.project":"%s","com.docker.compose.network":"default"},"Name":"%s_default","Options":{}}\n' "$nid" "$project" "$project"; exit; fi
+if [ "$1 $2" = 'network inspect' ]; then
+  if [ "$3" != --format ]; then case "$3" in '${e2eNetworkId}'|wmux-e2e-*) has e2e-network;; *) has network;; esac; exit; fi
+  if [ "$5" = '${networkId}' ]; then
+    case "$4" in *'"Driver"'*'"Internal"'*'"Attachable"'*) printf '{"Id":"${networkId}","Name":"%s_default","Driver":"bridge","Internal":false,"Attachable":false}\n' "$project"; exit;; esac
+  fi
+  if [ "$5" = '${e2eNetworkId}' ]; then
+    run=$(/bin/cat "$STATE/e2e-run"); name=$(/bin/cat "$STATE/e2e-network-name")
+    ctl runner-network-before-start-drift && has runner-pre-inspected && eid='${"f".repeat(64)}' || eid='${e2eNetworkId}'
+    ctl e2e-network-internal-drift && internal=false || internal=true
+    printf '{"Attachable":false,"Driver":"bridge","Id":"%s","Internal":%s,"Labels":{"org.opencontainers.image.revision":"%s","wmux.staging.e2e":"true","wmux.staging.project":"%s","wmux.staging.revision":"%s","wmux.staging.role":"network","wmux.staging.run":"%s"},"Name":"%s","Options":{}}\n' "$eid" "$internal" "$revision" "$project" "$revision" "$run" "$name"
+    exit
+  fi
+  printf '{"Attachable":false,"Driver":"bridge","Id":"%s","Internal":false,"Labels":{"com.docker.compose.project":"%s","com.docker.compose.network":"default"},"Name":"%s_default","Options":{}}\n' "$nid" "$project" "$project"; exit
+fi
+if [ "$1 $2" = 'network rm' ]; then
+  [ "$3" = '${e2eNetworkId}' ] || exit 76; ctl network-remove-fail && exit 74; rm -f "$STATE/e2e-network"; exit
+fi
 if [ "$1 $2" = 'image inspect' ]; then printf '{"Id":"${imageId}","Labels":{"org.opencontainers.image.revision":"%s"}}\n' "$revision"; exit; fi
 exit 72
 `);
@@ -626,7 +768,9 @@ test("owner-local E2E context rejects source/dependency drift and runs only in t
     const e2eContext = path.join(fixture.runtime, fixture.project, "e2e-context");
     const escapedContext = e2eContext.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     assert.match(log, new RegExp(`npm-ci cwd=${escapedContext} token=no reg=no`));
-    assert.match(log, /<create> <--interactive>.*<--read-only>.*<--cap-drop> <ALL>.*<--network>.*_default/s);
+    assert.match(log, /<network> <create> <--driver> <bridge> <--internal>.*<wmux-e2e-[0-9a-f]{12}-[0-9a-f]{16}>/);
+    assert.match(log, new RegExp(`<create> <--interactive>.*<--name> <wmux-e2e-fixture-.*<--user> <1000:1000>.*<--read-only>.*<--cap-drop> <ALL>.*<--network> <wmux-e2e-.*<${imageId}> <run>`));
+    assert.match(log, /<create> <--interactive>.*<--name> <wmux-e2e-runner-.*<--network> <wmux-e2e-/);
     assert.match(log, /<create>.*<--log-driver> <local>.*<--log-opt> <max-size=4m>.*<--log-opt> <max-file=1>.*<--log-opt> <compress=false>/s);
     assert.match(log, new RegExp(`<start> <${runnerContainerId}>`));
     assert.match(log, new RegExp(`<attach> <--no-stdin=false> <${runnerContainerId}>`));
@@ -641,8 +785,34 @@ test("owner-local E2E context rejects source/dependency drift and runs only in t
     assert.equal(fs.existsSync(path.join(identity.WMUX_WORKTREE, "node_modules")), false);
     assert.equal(fs.existsSync(e2eContext), false);
     assert.equal(fs.existsSync(path.join(fixture.state, "runner")), false);
+    assert.equal(fs.existsSync(path.join(fixture.state, "fixture")), false);
+    assert.equal(fs.existsSync(path.join(fixture.state, "e2e-network")), false);
+    assert.equal(fs.existsSync(path.join(fixture.state, "credentials-match")), true);
+    assert.notEqual(fs.readFileSync(path.join(fixture.state, "runner-token"), "utf8"), secrets.WMUX_TOKEN);
+    assert.notEqual(fs.readFileSync(path.join(fixture.state, "runner-registration"), "utf8"), secrets.WMUX_REGISTRATION_TOKEN);
+    assert.equal(fs.existsSync(path.join(fixture.runtime, fixture.project, "e2e-run.env")), false);
     assert.doesNotMatch(log, /WMUX_TOKEN=|WMUX_REGISTRATION_TOKEN=/);
+    const e2eCreateLines = log.split("\n").filter((line) => line.includes("<create>") && line.includes("<wmux-e2e-"));
+    assert.ok(e2eCreateLines.length >= 2);
+    assert.ok(e2eCreateLines.every((line) => !/<--publish>|<-p>|<--device>|<--volume>/.test(line)));
     assert.equal(log.includes(secrets.WMUX_TOKEN), false); assert.equal(log.includes(secrets.WMUX_REGISTRATION_TOKEN), false);
+    assert.equal(run(fixture, "down").status, 0);
+  } finally { server?.kill(); removeFixture(fixture); }
+});
+
+test("stale E2E evidence is refused and preserved rather than adopted or cleaned", () => {
+  const fixture = makeFixture();
+  let server: ChildProcess | undefined;
+  try {
+    assert.equal(run(fixture, "up").status, 0);
+    server = startHttpFixture(fixture.directory, "ok", fixture.port);
+    const stale = path.join(fixture.runtime, fixture.project, "e2e-run.env");
+    fs.writeFileSync(stale, "stale evidence\n", { mode: 0o600 });
+    const result = run(fixture, "e2e");
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /stale E2E context exists; evidence retained/);
+    assert.equal(fs.readFileSync(stale, "utf8"), "stale evidence\n");
+    fs.rmSync(stale);
     assert.equal(run(fixture, "down").status, 0);
   } finally { server?.kill(); removeFixture(fixture); }
 });
@@ -666,7 +836,7 @@ test("runner rejects image, package, inspect, output, result, and execution drif
       "runner-inspect-device", "runner-inspect-mount", "runner-inspect-network", "runner-inspect-port",
       "runner-inspect-limit", "runner-inspect-compress-missing", "runner-inspect-compress-changed", "runner-inspect-token-env", "runner-post-inspect-identity", "runner-post-inspect-config", "runner-post-inspect-stdin-once",
       "runner-post-inspect-mount", "runner-post-inspect-resource", "runner-post-inspect-network", "runner-post-inspect-state",
-      "runner-prestart-network-drift", "runner-network-before-start-drift", "runner-start-fail", "runner-attach-fail",
+      "runner-prestart-network-drift", "runner-prestart-state-drift", "runner-network-before-start-drift", "runner-start-fail", "runner-attach-fail",
       "runner-wait-fail", "runner-token-log", "runner-result-token", "runner-fail",
     ]) {
       const controlPath = path.join(fixture.state, `control-${control}`); fs.writeFileSync(controlPath, "");
@@ -680,9 +850,9 @@ test("runner rejects image, package, inspect, output, result, and execution drif
       assert.equal(result.stderr.includes(secrets.WMUX_REGISTRATION_TOKEN), false, `${control} reported registration token`);
       const operationLog = fs.readFileSync(fixture.log, "utf8").slice(priorLogSize);
       if (/^(?:runner-(?:image|inspect|prestart|network-before-start|post-inspect|start-fail)|playwright-version|e2e-symlink)/.test(control)) {
-        assert.doesNotMatch(operationLog, /<attach>/, `${control} delivered credentials before policy validation completed`);
+        assert.doesNotMatch(operationLog, new RegExp(`<attach> <--no-stdin=false> <${runnerContainerId}>`), `${control} delivered runner credentials before policy validation completed`);
       }
-      if (control === "runner-network-before-start-drift") assert.doesNotMatch(operationLog, /<start>/);
+      if (control === "runner-network-before-start-drift") assert.doesNotMatch(operationLog, new RegExp(`<start> <${runnerContainerId}>`));
       fs.rmSync(controlPath);
     }
     const commandLog = fs.readFileSync(fixture.log, "utf8");
@@ -693,13 +863,82 @@ test("runner rejects image, package, inspect, output, result, and execution drif
   } finally { server?.kill(); removeFixture(fixture); }
 });
 
+test("fixture and internal-network policy rejects identity, resource, mount, metadata, start, and health drift before runner credentials", () => {
+  const fixture = makeFixture({ fixtureHealthTimeoutSeconds: 1 });
+  let server: ChildProcess | undefined;
+  try {
+    assert.equal(run(fixture, "up").status, 0);
+    server = startHttpFixture(fixture.directory, "ok", fixture.port);
+    for (const control of [
+      "e2e-network-internal-drift", "fixture-create-fail", "fixture-inspect-privileged", "fixture-inspect-mount",
+      "fixture-inspect-token-env", "fixture-prestart-state-drift", "fixture-start-fail", "fixture-post-inspect-state", "fixture-health-drift", "fixture-health-fail",
+    ]) {
+      const controlPath = path.join(fixture.state, `control-${control}`); fs.writeFileSync(controlPath, "");
+      const before = fs.statSync(fixture.log).size;
+      const result = run(fixture, "e2e");
+      assert.notEqual(result.status, 0, `${control} unexpectedly passed`);
+      assert.equal(fs.existsSync(path.join(fixture.state, "fixture")), false, `${control} left fixture state`);
+      assert.equal(fs.existsSync(path.join(fixture.state, "e2e-network")), false, `${control} left network state`);
+      assert.equal(fs.existsSync(path.join(fixture.runtime, fixture.project, "e2e-context")), false, `${control} left local context`);
+      const operationLog = fs.readFileSync(fixture.log, "utf8").slice(before);
+      assert.doesNotMatch(operationLog, new RegExp(`<attach> <--no-stdin=false> <${runnerContainerId}>`));
+      assert.doesNotMatch(operationLog, new RegExp(`<start> <${runnerContainerId}>`));
+      if (/^(?:e2e-network|fixture-(?:create|inspect|start|post))/.test(control)) {
+        assert.doesNotMatch(operationLog, new RegExp(`<attach> <--no-stdin=false> <--sig-proxy=false> <${fixtureContainerId}>`), `${control} delivered fixture credentials before policy validation completed`);
+      }
+      fs.rmSync(controlPath);
+    }
+    assert.equal(run(fixture, "down").status, 0);
+  } finally { server?.kill(); removeFixture(fixture); }
+});
+
+test("fixture credential-output detection is generic and exact cleanup removes secret metadata", () => {
+  const fixture = makeFixture();
+  let server: ChildProcess | undefined;
+  try {
+    assert.equal(run(fixture, "up").status, 0);
+    server = startHttpFixture(fixture.directory, "ok", fixture.port);
+    const visible = metadata(path.join(fixture.runtime, fixture.project, "staging.env"));
+    fs.writeFileSync(path.join(fixture.state, "control-fixture-token-log"), "");
+    const result = runRaw(fixture, "e2e");
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /credential material detected|credential-output scan failed/);
+    assert.equal(result.stderr.includes(visible.WMUX_TOKEN) || result.stderr.includes(visible.WMUX_REGISTRATION_TOKEN), false);
+    assert.equal(fs.existsSync(path.join(fixture.state, "fixture")), false);
+    assert.equal(fs.existsSync(path.join(fixture.state, "e2e-network")), false);
+    assert.equal(fs.existsSync(path.join(fixture.runtime, `.lock-${fixture.project}`)), false);
+    assert.equal(fs.existsSync(path.join(fixture.runtime, fixture.project, "e2e-run.env")), false);
+  } finally { server?.kill(); removeFixture(fixture); }
+});
+
+test("fixture, network, and visible-state cleanup failures retain the operation lock and evidence", () => {
+  for (const control of [
+    "network-id-malformed", "fixture-id-malformed", "runner-id-malformed",
+    "fixture-remove-fail", "fixture-name-substituted", "network-remove-fail", "visible-drift",
+  ]) {
+    const fixture = makeFixture();
+    let server: ChildProcess | undefined;
+    try {
+      assert.equal(run(fixture, "up").status, 0);
+      server = startHttpFixture(fixture.directory, "ok", fixture.port);
+      fs.writeFileSync(path.join(fixture.state, `control-${control}`), "");
+      const result = runRaw(fixture, "e2e");
+      assert.notEqual(result.status, 0, `${control} unexpectedly passed`);
+      assert.equal(fs.existsSync(path.join(fixture.runtime, `.lock-${fixture.project}`)), true, `${control} released lock`);
+      assert.equal(fs.existsSync(path.join(fixture.runtime, fixture.project, "e2e-run.env")), true, `${control} removed evidence`);
+      const log = fs.readFileSync(fixture.log, "utf8");
+      assert.doesNotMatch(log, /\bprune\b|--volumes|compose.*down/);
+    } finally { server?.kill(); removeFixture(fixture); }
+  }
+});
+
 test("bounded runner attach and wait time out without putting credentials in arguments or logs", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-runner-timeout-")); fs.chmodSync(directory, 0o700);
   const lock = path.join(directory, ".lock-wmux-staging-timeout"); const config = path.join(lock, "docker-config");
   const bin = path.join(directory, "bin"); const envFile = path.join(directory, "staging.env"); const logFile = path.join(directory, "e2e-run.log");
   fs.mkdirSync(config, { recursive: true, mode: 0o700 }); fs.chmodSync(config, 0o500); fs.mkdirSync(bin, { mode: 0o700 });
   const token = "a".repeat(64); const registration = "b".repeat(64);
-  fs.writeFileSync(envFile, `WMUX_TOKEN=${token}\nWMUX_REGISTRATION_TOKEN=${registration}\n`, { mode: 0o600 });
+  fs.writeFileSync(envFile, `WMUX_E2E_PROJECT=wmux-staging-timeout\nWMUX_E2E_REVISION=${"c".repeat(40)}\nWMUX_E2E_RUN_ID=${"d".repeat(16)}\nWMUX_TOKEN=${token}\nWMUX_REGISTRATION_TOKEN=${registration}\n`, { mode: 0o600 });
   try {
     for (const phase of ["attach", "wait"]) {
       executable(path.join(bin, "docker"), `#!/bin/sh
@@ -752,7 +991,8 @@ test("create failure does not retain runner_created and does not perform by-name
     assert.equal(fs.existsSync(path.join(fixture.runtime, ".lock-" + fixture.project)), false);
     assert.equal(fs.existsSync(path.join(fixture.state, "runner")), false);
     const log = fs.readFileSync(fixture.log, "utf8");
-    assert.doesNotMatch(log, /<rm> <-f>/);
+    assert.doesNotMatch(log, new RegExp(`<rm> <-f> <${runnerContainerId}>`));
+    assert.match(log, new RegExp(`<rm> <-f> <${fixtureContainerId}>`));
   } finally {
     server?.kill();
     removeFixture(fixture);
@@ -913,6 +1153,7 @@ test("dedicated staging artifacts preserve exact private publish and omit produc
   const script = fs.readFileSync(path.join(sourceRoot, "scripts/wmux-docker-staging"), "utf8");
   const policy = fs.readFileSync(sourcePolicy, "utf8");
   const bootstrap = fs.readFileSync(path.join(sourceRoot, "deploy/docker/e2e-runner-bootstrap"), "utf8");
+  const fixtureBootstrap = fs.readFileSync(path.join(sourceRoot, "deploy/docker/e2e-fixture-bootstrap"), "utf8");
   assert.match(compose, /WMUX_PUBLISH_HOST.*WMUX_PUBLISH_PORT/); assert.match(compose, /internal: false/); assert.match(compose, /attachable: false/);
   assert.doesNotMatch(compose, /^volumes:/m); assert.doesNotMatch(script, /docker-compose\.yml|--volumes|\bprune\b|git archive|candidate\.tar/);
   assert.match(script, /runtime_root=\$\{XDG_STATE_HOME:-\$\{HOME:\?HOME is required\}\/\.local\/state\}\/wmux\/docker-staging/);
@@ -932,4 +1173,13 @@ test("dedicated staging artifacts preserve exact private publish and omit produc
   assert.match(bootstrap, /exec \/workspace\/node_modules\/\.bin\/playwright test/);
   assert.match(bootstrap, /--workers=1 --output=\/tmp\/e2e-results/);
   assert.doesNotMatch(bootstrap, /set -x|docker|WMUX_E2E_BASE_URL=/);
+  assert.match(script, /network create --driver bridge --internal/);
+  assert.match(script, /"\$recorded_image_id" run/);
+  assert.match(script, /WMUX_E2E_BASE_URL=\$fixture_base_url/);
+  assert.doesNotMatch(script, /--network "\$network_name"/);
+  assert.match(fixtureBootstrap, /"name": "Local"/);
+  assert.match(fixtureBootstrap, /"sessionBackend": "pty"/);
+  assert.match(fixtureBootstrap, /"cwd": "\/app"/);
+  assert.match(fixtureBootstrap, /read -r WMUX_TOKEN/);
+  assert.doesNotMatch(fixtureBootstrap, /set -x|\/mnt\/|\bdocker\s/);
 });

@@ -67,7 +67,7 @@ case "$full_revision:$short_revision" in *[!0-9a-f:]*) die "Git returned a non-c
 launcher_blob=$(git_cmd rev-parse "$full_revision:scripts/wmux-docker-staging" 2>/dev/null) || die "staging launcher is not committed at HEAD"
 actual_launcher_blob=$(git_cmd hash-object --no-filters "$script_dir/wmux-docker-staging" 2>/dev/null) || die "cannot hash staging launcher"
 [ "$launcher_blob" = "$actual_launcher_blob" ] || die "staging launcher bytes differ from committed HEAD"
-for trusted_path in deploy/docker/docker-staging-policy.mjs deploy/docker/docker-bind-host.mjs deploy/docker/docker-staging-smoke.mjs deploy/docker/e2e-runner-bootstrap; do
+for trusted_path in deploy/docker/docker-staging-policy.mjs deploy/docker/docker-bind-host.mjs deploy/docker/docker-staging-smoke.mjs deploy/docker/e2e-runner-bootstrap deploy/docker/e2e-fixture-bootstrap; do
   trusted_blob=$(git_cmd rev-parse "$full_revision:$trusted_path" 2>/dev/null) || die "$trusted_path is not committed at HEAD"
   actual_trusted_blob=$(git_cmd hash-object --no-filters "$repo_root/$trusted_path" 2>/dev/null) || die "cannot hash $trusted_path"
   [ "$trusted_blob" = "$actual_trusted_blob" ] || die "$trusted_path bytes differ from committed HEAD"
@@ -220,11 +220,23 @@ runner_created=0
 runner_container_id=
 runner_name=
 runner_image_inspect=
+candidate_image_inspect=
+e2e_metadata_file=
+visible_snapshot_file=
+e2e_run_id=
+e2e_network_created=0
+e2e_network_id=
+e2e_network_name=
+fixture_created=0
+fixture_container_id=
+fixture_name=
 e2e_context=
 e2e_context_file=
 e2e_dependency_file=
 npm_home=
 npm_cache=
+e2e_local_owned=0
+cleanup_blocked=0
 
 remove_runner() {
   [ "$runner_created" = 1 ] || return 0
@@ -237,16 +249,57 @@ remove_runner() {
   runner_created=0
 }
 
+remove_fixture() {
+  [ "$fixture_created" = 1 ] || return 0
+  [ -n "$fixture_container_id" ] || return 1
+  docker_cmd rm -f "$fixture_container_id" >/dev/null 2>&1 || return 1
+  if docker_cmd inspect "$fixture_container_id" >/dev/null 2>&1; then return 1; fi
+  if [ -n "$fixture_name" ] && docker_cmd inspect "$fixture_name" >/dev/null 2>&1; then
+    if [ -n "$(docker_cmd inspect --format '{{.Id}}' "$fixture_name" 2>/dev/null)" ]; then return 1; fi
+  fi
+  fixture_created=0
+}
+
+remove_e2e_network() {
+  [ "$e2e_network_created" = 1 ] || return 0
+  [ -n "$e2e_network_id" ] || return 1
+  docker_cmd network rm "$e2e_network_id" >/dev/null 2>&1 || return 1
+  if docker_cmd network inspect "$e2e_network_id" >/dev/null 2>&1; then return 1; fi
+  if [ -n "$e2e_network_name" ]; then
+    remaining_network=$(docker_cmd network ls -q --no-trunc --filter "name=^${e2e_network_name}$" 2>/dev/null) || return 1
+    [ -z "$remaining_network" ] || return 1
+  fi
+  e2e_network_created=0
+}
+
+verify_visible_unchanged() {
+  [ -n "$visible_snapshot_file" ] && [ -f "$visible_snapshot_file" ] || return 0
+  visible_container_id=$(env_value "$live_file" WMUX_CONTAINER_ID) || return 1
+  visible_network_id=$(env_value "$live_file" WMUX_NETWORK_ID) || return 1
+  docker_target=$(if [ "$docker_selector" = host ]; then printf '%s' "$docker_endpoint"; else printf '%s' "$docker_context"; fi)
+  node_cmd "$policy" verify-visible-snapshot "$visible_snapshot_file" "$docker_mode" "$docker_config" \
+    "$docker_selector" "$docker_target" "$visible_container_id" "$visible_network_id" >/dev/null
+}
+
+scan_fixture_output() {
+  [ "$fixture_created" = 1 ] && [ -n "$fixture_container_id" ] && [ -f "$e2e_metadata_file" ] || return 0
+  docker_target=$(if [ "$docker_selector" = host ]; then printf '%s' "$docker_endpoint"; else printf '%s' "$docker_context"; fi)
+  node_cmd "$policy" scan-fixture-output "$e2e_metadata_file" "$docker_mode" "$docker_config" \
+    "$docker_selector" "$docker_target" "$fixture_container_id" >/dev/null
+}
+
 remove_e2e_local() {
+  [ "$e2e_local_owned" = 1 ] || return 0
   for private_tree in "$e2e_context" "$npm_home" "$npm_cache"; do
     [ -n "$private_tree" ] && [ -e "$private_tree" ] || continue
     node_cmd "$policy" remove-private-tree "$private_tree" || return 1
   done
-  for private_file in "$e2e_context_file" "$e2e_dependency_file" "$runner_image_inspect"; do
+  for private_file in "$e2e_context_file" "$e2e_dependency_file" "$runner_image_inspect" "$candidate_image_inspect" "$e2e_metadata_file" "$visible_snapshot_file"; do
     [ -n "$private_file" ] && [ -e "$private_file" ] || continue
     node_cmd "$policy" validate-metadata "$private_file" || return 1
     rm -f "$private_file" || return 1
   done
+  e2e_local_owned=0
 }
 
 remove_docker_config() {
@@ -272,11 +325,15 @@ release_docker_client() {
 }
 
 cleanup() {
-  cleanup_failed=0
+  cleanup_failed=$cleanup_blocked
   remove_runner 2>/dev/null || cleanup_failed=1
-  remove_e2e_local 2>/dev/null || cleanup_failed=1
+  scan_fixture_output 2>/dev/null || true
+  remove_fixture 2>/dev/null || cleanup_failed=1
+  remove_e2e_network 2>/dev/null || cleanup_failed=1
+  verify_visible_unchanged 2>/dev/null || cleanup_failed=1
+  if [ "$cleanup_failed" = 0 ]; then remove_e2e_local 2>/dev/null || cleanup_failed=1; fi
   [ -z "$inspect_output" ] || rm -f "$inspect_output"
-  remove_docker_config 2>/dev/null || cleanup_failed=1
+  if [ "$cleanup_failed" = 0 ]; then remove_docker_config 2>/dev/null || cleanup_failed=1; fi
   if [ "$lock_owned" = 1 ] && [ "$cleanup_failed" = 0 ]; then
     rmdir "$lock_dir" 2>/dev/null || true
     lock_owned=0
@@ -590,14 +647,32 @@ case "$command_name" in
     clean_candidate
     run_smoke
     [ "${WMUX_STAGING_LAUNCH_HEAD-}" = "$full_revision" ] || die "E2E launcher HEAD does not equal WMUX_BUILD_REVISION"
+    recorded_container_id=$(env_value "$live_file" WMUX_CONTAINER_ID)
+    recorded_network_id=$(env_value "$live_file" WMUX_NETWORK_ID)
+    recorded_image_id=$(env_value "$live_file" WMUX_IMAGE_ID)
+    docker_target=$(if [ "$docker_selector" = host ]; then printf '%s' "$docker_endpoint"; else printf '%s' "$docker_context"; fi)
+    visible_snapshot_file=$runtime_dir/e2e-visible-snapshot.json
+    e2e_metadata_file=$runtime_dir/e2e-run.env
     e2e_context=$runtime_dir/e2e-context
     e2e_context_file=$runtime_dir/e2e-context.env
     e2e_dependency_file=$runtime_dir/e2e-dependencies.env
+    runner_image_inspect=$runtime_dir/e2e-runner-image.json
+    candidate_image_inspect=$runtime_dir/e2e-candidate-image.json
     npm_home=$runtime_dir/npm-home
     npm_cache=$runtime_dir/npm-cache
     case "$runtime_dir" in /mnt|/mnt/*) die "E2E runtime must be owner-local and outside /mnt" ;; esac
     [ ! -e "$e2e_context" ] && [ ! -e "$e2e_context_file" ] && [ ! -e "$e2e_dependency_file" ] \
+      && [ ! -e "$runner_image_inspect" ] && [ ! -e "$candidate_image_inspect" ] \
+      && [ ! -e "$visible_snapshot_file" ] && [ ! -e "$e2e_metadata_file" ] \
+      && [ ! -e "$npm_home" ] && [ ! -e "$npm_cache" ] \
       || die "stale E2E context exists; evidence retained"
+    e2e_local_owned=1
+    node_cmd "$policy" create-visible-snapshot "$visible_snapshot_file" "$docker_mode" "$docker_config" \
+      "$docker_selector" "$docker_target" "$recorded_container_id" "$recorded_network_id" \
+      || die "cannot record visible staging identity/state before E2E"
+    e2e_run_id=$(node_cmd "$policy" new-run-id) || die "cannot generate E2E run identity"
+    node_cmd "$policy" create-e2e-metadata "$e2e_metadata_file" "$env_file" "$project" "$full_revision" "$e2e_run_id" \
+      || die "cannot create fresh E2E credentials"
     node_cmd "$policy" create-e2e-context "$build_context_file" "$isolated_repo" "$e2e_context" "$e2e_context_file" \
       || die "cannot create verified owner-local E2E context"
     node_cmd "$policy" prepare-private-dir "$npm_home" || die "cannot create private E2E npm home"
@@ -619,25 +694,100 @@ case "$command_name" in
 
     runner_image=$(node_cmd "$policy" runner-image) || die "cannot resolve pinned E2E runner image"
     docker_cmd pull "$runner_image" >/dev/null || die "cannot pull digest-pinned E2E runner image"
-    runner_image_inspect=$runtime_dir/e2e-runner-image.json
     ( umask 077; docker_cmd image inspect --format '{"Id":{{json .Id}},"RepoDigests":{{json .RepoDigests}},"Config":{"Cmd":{{json (index .Config "Cmd")}},"Entrypoint":{{json (index .Config "Entrypoint")}},"Env":{{json (index .Config "Env")}},"Labels":{{json (index .Config "Labels")}}}}' "$runner_image" >"$runner_image_inspect" ) \
       || die "cannot inspect digest-pinned E2E runner image"
     node_cmd "$policy" validate-metadata "$runner_image_inspect" || die "runner image evidence is unsafe"
     node_cmd "$policy" validate-runner-image <"$runner_image_inspect" || die "E2E runner image digest policy failed"
     runner_image_id=$(node -e 'const fs=require("node:fs");process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).Id)' "$runner_image_inspect") \
       || die "cannot read validated runner image ID"
-    runner_run_id=$(node_cmd "$policy" new-run-id) || die "cannot generate E2E runner identity"
-    runner_name=$project-e2e-$short_revision-$runner_run_id
+    ( umask 077; docker_cmd image inspect --format '{"Id":{{json .Id}},"Config":{"Env":{{json (index .Config "Env")}},"Labels":{{json (index .Config "Labels")}}}}' "$recorded_image_id" >"$candidate_image_inspect" ) \
+      || die "cannot inspect exact E2E candidate image"
+    node_cmd "$policy" validate-metadata "$candidate_image_inspect" || die "candidate image evidence is unsafe"
+    node_cmd "$policy" validate-e2e-candidate-image "$recorded_image_id" "$full_revision" <"$candidate_image_inspect" \
+      || die "exact E2E candidate image policy failed"
+
+    e2e_network_name=wmux-e2e-$short_revision-$e2e_run_id
+    fixture_name=wmux-e2e-fixture-$short_revision-$e2e_run_id
+    runner_name=wmux-e2e-runner-$short_revision-$e2e_run_id
+    if docker_cmd network inspect "$e2e_network_name" >/dev/null 2>&1; then die "generated E2E network name already exists"; fi
+    if docker_cmd inspect "$fixture_name" >/dev/null 2>&1; then die "generated E2E fixture name already exists"; fi
+    if docker_cmd inspect "$runner_name" >/dev/null 2>&1; then die "generated E2E runner name already exists"; fi
+    e2e_network_id=$(docker_cmd network create --driver bridge --internal \
+      --label "org.opencontainers.image.revision=$full_revision" \
+      --label "wmux.staging.e2e=true" --label "wmux.staging.project=$project" \
+      --label "wmux.staging.revision=$full_revision" --label "wmux.staging.role=network" \
+      --label "wmux.staging.run=$e2e_run_id" "$e2e_network_name") || die "cannot create unique internal E2E network"
+    case "$e2e_network_id" in *[!0-9a-f]*|'') cleanup_blocked=1; die "Docker returned an invalid E2E network ID; operation lock retained" ;; esac
+    [ "${#e2e_network_id}" -eq 64 ] || { cleanup_blocked=1; die "Docker returned a non-canonical E2E network ID; operation lock retained"; }
+    e2e_network_created=1
+    docker_cmd network inspect --format '{"Attachable":{{json .Attachable}},"Driver":{{json .Driver}},"Id":{{json .Id}},"Internal":{{json .Internal}},"Labels":{{json .Labels}},"Name":{{json .Name}},"Options":{{json .Options}}}' "$e2e_network_id" \
+      | node_cmd "$policy" validate-e2e-network "$project" "$full_revision" "$e2e_run_id" "$e2e_network_name" "$e2e_network_id" \
+      || die "unique E2E network policy validation failed"
+
+    fixture_base_url=http://wmux-e2e-fixture:3478
+    fixture_container_id=$(docker_cmd create --interactive \
+      --name "$fixture_name" \
+      --label "org.opencontainers.image.revision=$full_revision" \
+      --label "wmux.staging.e2e=true" --label "wmux.staging.project=$project" \
+      --label "wmux.staging.revision=$full_revision" --label "wmux.staging.role=fixture" \
+      --label "wmux.staging.run=$e2e_run_id" \
+      --user 1000:1000 --workdir /app --entrypoint /usr/local/lib/wmux/e2e-fixture-bootstrap \
+      --read-only --cap-drop ALL --security-opt no-new-privileges:true --ipc private --init \
+      --network "$e2e_network_name" --network-alias wmux-e2e-fixture \
+      --memory 1g --memory-swap 1g --cpus 2 --pids-limit 512 --shm-size 64m \
+      --tmpfs "/home/node/.wmux:rw,nosuid,nodev,noexec,mode=0700,size=256m,uid=1000,gid=1000" \
+      --tmpfs "/tmp:rw,nosuid,nodev,noexec,mode=1777,size=64m,uid=1000,gid=1000" \
+      --tmpfs "/run/wmux-e2e:rw,nosuid,nodev,noexec,mode=0700,size=64m,uid=1000,gid=1000" \
+      --log-driver local --log-opt max-size=4m --log-opt max-file=1 --log-opt compress=false --restart no \
+      --env HOME=/home/node --env "WMUX_BUILD_REVISION=$full_revision" --env "WMUX_E2E_RUN_ID=$e2e_run_id" \
+      --env "WMUX_E2E_BASE_URL=$fixture_base_url" \
+      "$recorded_image_id" run) || die "cannot create isolated candidate fixture"
+    case "$fixture_container_id" in *[!0-9a-f]*|'') cleanup_blocked=1; die "Docker returned an invalid E2E fixture container ID; operation lock retained" ;; esac
+    [ "${#fixture_container_id}" -eq 64 ] || { cleanup_blocked=1; die "Docker returned a non-canonical E2E fixture container ID; operation lock retained"; }
+    fixture_created=1
+    inspect_output=$(mktemp "$runtime_dir/.e2e-fixture-inspect.XXXXXX")
+    docker_cmd inspect --format '{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Config":{"Cmd":{{json .Config.Cmd}},"Entrypoint":{{json .Config.Entrypoint}},"Env":{{json .Config.Env}},"Image":{{json .Config.Image}},"Labels":{{json .Config.Labels}},"OpenStdin":{{json .Config.OpenStdin}},"StdinOnce":{{json .Config.StdinOnce}},"Tty":{{json .Config.Tty}},"User":{{json .Config.User}},"WorkingDir":{{json .Config.WorkingDir}}},"HostConfig":{"Binds":{{json .HostConfig.Binds}},"CapDrop":{{json .HostConfig.CapDrop}},"DeviceRequests":{{json .HostConfig.DeviceRequests}},"Devices":{{json .HostConfig.Devices}},"IpcMode":{{json .HostConfig.IpcMode}},"Init":{{json .HostConfig.Init}},"LogConfig":{{json .HostConfig.LogConfig}},"Memory":{{json .HostConfig.Memory}},"MemorySwap":{{json .HostConfig.MemorySwap}},"Mounts":{{json .HostConfig.Mounts}},"NanoCpus":{{json .HostConfig.NanoCpus}},"NetworkMode":{{json .HostConfig.NetworkMode}},"PidMode":{{json .HostConfig.PidMode}},"PidsLimit":{{json .HostConfig.PidsLimit}},"PortBindings":{{json .HostConfig.PortBindings}},"Privileged":{{json .HostConfig.Privileged}},"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"RestartPolicy":{{json .HostConfig.RestartPolicy}},"SecurityOpt":{{json .HostConfig.SecurityOpt}},"ShmSize":{{json .HostConfig.ShmSize}},"Tmpfs":{{json .HostConfig.Tmpfs}},"UsernsMode":{{json .HostConfig.UsernsMode}},"VolumesFrom":{{json .HostConfig.VolumesFrom}}},"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}},"Ports":{{json .NetworkSettings.Ports}}},"Mounts":{{json .Mounts}}}' "$fixture_container_id" >"$inspect_output" \
+      || die "cannot inspect isolated candidate fixture"
+    node_cmd "$policy" validate-fixture-container-prestart "$project" "$full_revision" "$e2e_run_id" "$fixture_name" "$fixture_container_id" \
+      "$e2e_network_name" "$e2e_network_id" "$recorded_image_id" "$candidate_image_inspect" "$fixture_base_url" <"$inspect_output" \
+      || die "candidate fixture inspect policy failed before start"
+    rm -f "$inspect_output"; inspect_output=
+    docker_cmd inspect --format '{"Id":{{json .Id}},"State":{"Dead":{{json .State.Dead}},"Error":{{json .State.Error}},"ExitCode":{{json .State.ExitCode}},"FinishedAt":{{json .State.FinishedAt}},"OOMKilled":{{json .State.OOMKilled}},"Paused":{{json .State.Paused}},"Pid":{{json .State.Pid}},"Restarting":{{json .State.Restarting}},"Running":{{json .State.Running}},"StartedAt":{{json .State.StartedAt}},"Status":{{json .State.Status}}}}' "$fixture_container_id" \
+      | node_cmd "$policy" validate-created-container-state "$fixture_container_id" fixture \
+      || die "candidate fixture created-state policy failed before start"
+    docker_cmd start "$fixture_container_id" >/dev/null || die "cannot start isolated candidate fixture"
+    inspect_output=$(mktemp "$runtime_dir/.e2e-fixture-inspect.XXXXXX")
+    docker_cmd inspect --format '{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Config":{"Cmd":{{json .Config.Cmd}},"Entrypoint":{{json .Config.Entrypoint}},"Env":{{json .Config.Env}},"Image":{{json .Config.Image}},"Labels":{{json .Config.Labels}},"OpenStdin":{{json .Config.OpenStdin}},"StdinOnce":{{json .Config.StdinOnce}},"Tty":{{json .Config.Tty}},"User":{{json .Config.User}},"WorkingDir":{{json .Config.WorkingDir}}},"HostConfig":{"Binds":{{json .HostConfig.Binds}},"CapDrop":{{json .HostConfig.CapDrop}},"DeviceRequests":{{json .HostConfig.DeviceRequests}},"Devices":{{json .HostConfig.Devices}},"IpcMode":{{json .HostConfig.IpcMode}},"Init":{{json .HostConfig.Init}},"LogConfig":{{json .HostConfig.LogConfig}},"Memory":{{json .HostConfig.Memory}},"MemorySwap":{{json .HostConfig.MemorySwap}},"Mounts":{{json .HostConfig.Mounts}},"NanoCpus":{{json .HostConfig.NanoCpus}},"NetworkMode":{{json .HostConfig.NetworkMode}},"PidMode":{{json .HostConfig.PidMode}},"PidsLimit":{{json .HostConfig.PidsLimit}},"PortBindings":{{json .HostConfig.PortBindings}},"Privileged":{{json .HostConfig.Privileged}},"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"RestartPolicy":{{json .HostConfig.RestartPolicy}},"SecurityOpt":{{json .HostConfig.SecurityOpt}},"ShmSize":{{json .HostConfig.ShmSize}},"Tmpfs":{{json .HostConfig.Tmpfs}},"UsernsMode":{{json .HostConfig.UsernsMode}},"VolumesFrom":{{json .HostConfig.VolumesFrom}}},"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}},"Ports":{{json .NetworkSettings.Ports}}},"Mounts":{{json .Mounts}},"State":{"Dead":{{json .State.Dead}},"Error":{{json .State.Error}},"ExitCode":{{json .State.ExitCode}},"FinishedAt":{{json .State.FinishedAt}},"OOMKilled":{{json .State.OOMKilled}},"Paused":{{json .State.Paused}},"Pid":{{json .State.Pid}},"Restarting":{{json .State.Restarting}},"Running":{{json .State.Running}},"StartedAt":{{json .State.StartedAt}},"Status":{{json .State.Status}}}}' "$fixture_container_id" >"$inspect_output" \
+      || die "cannot inspect running candidate fixture"
+    node_cmd "$policy" validate-fixture-container-running "$project" "$full_revision" "$e2e_run_id" "$fixture_name" "$fixture_container_id" \
+      "$e2e_network_name" "$e2e_network_id" "$recorded_image_id" "$candidate_image_inspect" "$fixture_base_url" <"$inspect_output" \
+      || die "running candidate fixture inspect policy failed before credential delivery"
+    rm -f "$inspect_output"; inspect_output=
+    docker_cmd network inspect --format '{"Attachable":{{json .Attachable}},"Driver":{{json .Driver}},"Id":{{json .Id}},"Internal":{{json .Internal}},"Labels":{{json .Labels}},"Name":{{json .Name}},"Options":{{json .Options}}}' "$e2e_network_id" \
+      | node_cmd "$policy" validate-e2e-network "$project" "$full_revision" "$e2e_run_id" "$e2e_network_name" "$e2e_network_id" \
+      || die "E2E network identity changed before fixture credential delivery"
+    node_cmd "$policy" deliver-fixture-credentials "$e2e_metadata_file" 120 "$docker_mode" "$docker_config" \
+      "$docker_selector" "$docker_target" "$fixture_container_id" \
+      || die "candidate fixture startup/health gate failed"
+    inspect_output=$(mktemp "$runtime_dir/.e2e-fixture-inspect.XXXXXX")
+    docker_cmd inspect --format '{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Config":{"Cmd":{{json .Config.Cmd}},"Entrypoint":{{json .Config.Entrypoint}},"Env":{{json .Config.Env}},"Image":{{json .Config.Image}},"Labels":{{json .Config.Labels}},"OpenStdin":{{json .Config.OpenStdin}},"StdinOnce":{{json .Config.StdinOnce}},"Tty":{{json .Config.Tty}},"User":{{json .Config.User}},"WorkingDir":{{json .Config.WorkingDir}}},"HostConfig":{"Binds":{{json .HostConfig.Binds}},"CapDrop":{{json .HostConfig.CapDrop}},"DeviceRequests":{{json .HostConfig.DeviceRequests}},"Devices":{{json .HostConfig.Devices}},"IpcMode":{{json .HostConfig.IpcMode}},"Init":{{json .HostConfig.Init}},"LogConfig":{{json .HostConfig.LogConfig}},"Memory":{{json .HostConfig.Memory}},"MemorySwap":{{json .HostConfig.MemorySwap}},"Mounts":{{json .HostConfig.Mounts}},"NanoCpus":{{json .HostConfig.NanoCpus}},"NetworkMode":{{json .HostConfig.NetworkMode}},"PidMode":{{json .HostConfig.PidMode}},"PidsLimit":{{json .HostConfig.PidsLimit}},"PortBindings":{{json .HostConfig.PortBindings}},"Privileged":{{json .HostConfig.Privileged}},"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"RestartPolicy":{{json .HostConfig.RestartPolicy}},"SecurityOpt":{{json .HostConfig.SecurityOpt}},"ShmSize":{{json .HostConfig.ShmSize}},"Tmpfs":{{json .HostConfig.Tmpfs}},"UsernsMode":{{json .HostConfig.UsernsMode}},"VolumesFrom":{{json .HostConfig.VolumesFrom}}},"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}},"Ports":{{json .NetworkSettings.Ports}}},"Mounts":{{json .Mounts}},"State":{"Dead":{{json .State.Dead}},"Error":{{json .State.Error}},"ExitCode":{{json .State.ExitCode}},"FinishedAt":{{json .State.FinishedAt}},"OOMKilled":{{json .State.OOMKilled}},"Paused":{{json .State.Paused}},"Pid":{{json .State.Pid}},"Restarting":{{json .State.Restarting}},"Running":{{json .State.Running}},"StartedAt":{{json .State.StartedAt}},"Status":{{json .State.Status}}},"Health":{"Status":{{json .State.Health.Status}}}' "$fixture_container_id" >"$inspect_output" \
+      || die "cannot inspect healthy candidate fixture"
+    node_cmd "$policy" validate-fixture-container-healthy "$project" "$full_revision" "$e2e_run_id" "$fixture_name" "$fixture_container_id" \
+      "$e2e_network_name" "$e2e_network_id" "$recorded_image_id" "$candidate_image_inspect" "$fixture_base_url" <"$inspect_output" \
+      || die "candidate fixture failed post-credential health policy"
+    rm -f "$inspect_output"; inspect_output=
+
     runner_user=$(id -u):$(id -g)
     runner_bootstrap=$e2e_context/deploy/docker/e2e-runner-bootstrap
-    if docker_cmd inspect "$runner_name" >/dev/null 2>&1; then die "generated E2E runner name already exists"; fi
     runner_container_id=$(docker_cmd create --interactive \
       --name "$runner_name" \
       --label "org.opencontainers.image.revision=$full_revision" \
       --label "wmux.staging.e2e=true" --label "wmux.staging.project=$project" \
+      --label "wmux.staging.revision=$full_revision" --label "wmux.staging.role=runner" \
+      --label "wmux.staging.run=$e2e_run_id" \
       --user "$runner_user" --workdir /workspace --entrypoint /runner-bootstrap \
       --read-only --cap-drop ALL --security-opt no-new-privileges:true --ipc private --init \
-      --network "$network_name" --memory 2g --memory-swap 2g --cpus 2 --pids-limit 512 --shm-size 512m \
+      --network "$e2e_network_name" --memory 2g --memory-swap 2g --cpus 2 --pids-limit 512 --shm-size 512m \
       --tmpfs "/home/wmux:rw,nosuid,nodev,noexec,mode=0700,size=128m,uid=$(id -u),gid=$(id -g)" \
       --tmpfs "/tmp:rw,nosuid,nodev,noexec,mode=1777,size=512m,uid=$(id -u),gid=$(id -g)" \
       --tmpfs "/run:rw,nosuid,nodev,noexec,mode=0755,size=8m,uid=$(id -u),gid=$(id -g)" \
@@ -645,51 +795,63 @@ case "$command_name" in
       --mount "type=bind,src=$e2e_context,dst=/workspace,readonly,bind-propagation=rprivate" \
       --mount "type=bind,src=$runner_bootstrap,dst=/runner-bootstrap,readonly,bind-propagation=rprivate" \
       --env HOME=/home/wmux --env TMPDIR=/tmp --env XDG_CACHE_HOME=/home/wmux/.cache \
-      --env "WMUX_BUILD_REVISION=$full_revision" --env "WMUX_E2E_BASE_URL=$base_url" \
+      --env "WMUX_BUILD_REVISION=$full_revision" --env "WMUX_E2E_BASE_URL=$fixture_base_url" \
       "$runner_image" run) || die "cannot create isolated E2E runner"
-    case "$runner_container_id" in *[!0-9a-f]*|'') die "Docker returned an invalid E2E runner container ID" ;; esac
-    [ "${#runner_container_id}" -eq 64 ] || die "Docker returned a non-canonical E2E runner container ID"
+    case "$runner_container_id" in *[!0-9a-f]*|'') cleanup_blocked=1; die "Docker returned an invalid E2E runner container ID; operation lock retained" ;; esac
+    [ "${#runner_container_id}" -eq 64 ] || { cleanup_blocked=1; die "Docker returned a non-canonical E2E runner container ID; operation lock retained"; }
     runner_created=1
     inspect_output=$(mktemp "$runtime_dir/.e2e-inspect.XXXXXX")
     docker_cmd inspect --format '{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Config":{"Cmd":{{json .Config.Cmd}},"Entrypoint":{{json .Config.Entrypoint}},"Env":{{json .Config.Env}},"Image":{{json .Config.Image}},"Labels":{{json .Config.Labels}},"OpenStdin":{{json .Config.OpenStdin}},"StdinOnce":{{json .Config.StdinOnce}},"Tty":{{json .Config.Tty}},"User":{{json .Config.User}},"WorkingDir":{{json .Config.WorkingDir}}},"HostConfig":{"Binds":{{json .HostConfig.Binds}},"CapDrop":{{json .HostConfig.CapDrop}},"DeviceRequests":{{json .HostConfig.DeviceRequests}},"Devices":{{json .HostConfig.Devices}},"IpcMode":{{json .HostConfig.IpcMode}},"Init":{{json .HostConfig.Init}},"LogConfig":{{json .HostConfig.LogConfig}},"Memory":{{json .HostConfig.Memory}},"MemorySwap":{{json .HostConfig.MemorySwap}},"Mounts":{{json .HostConfig.Mounts}},"NanoCpus":{{json .HostConfig.NanoCpus}},"NetworkMode":{{json .HostConfig.NetworkMode}},"PidMode":{{json .HostConfig.PidMode}},"PidsLimit":{{json .HostConfig.PidsLimit}},"PortBindings":{{json .HostConfig.PortBindings}},"Privileged":{{json .HostConfig.Privileged}},"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"RestartPolicy":{{json .HostConfig.RestartPolicy}},"SecurityOpt":{{json .HostConfig.SecurityOpt}},"ShmSize":{{json .HostConfig.ShmSize}},"Tmpfs":{{json .HostConfig.Tmpfs}},"UsernsMode":{{json .HostConfig.UsernsMode}},"VolumesFrom":{{json .HostConfig.VolumesFrom}}},"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}},"Ports":{{json .NetworkSettings.Ports}}},"Mounts":{{json .Mounts}}}' "$runner_container_id" >"$inspect_output" \
       || die "cannot inspect isolated E2E runner"
-    node_cmd "$policy" validate-runner-container-prestart "$project" "$full_revision" "$runner_name" "$runner_container_id" \
-      "$network_name" "$(env_value "$live_file" WMUX_NETWORK_ID)" "$runner_image_id" "$e2e_context" "$runner_bootstrap" \
-      "$base_url" "$runner_user" "$runner_image_inspect" <"$inspect_output" \
+    node_cmd "$policy" validate-runner-container-prestart "$project" "$full_revision" "$e2e_run_id" "$runner_name" "$runner_container_id" \
+      "$e2e_network_name" "$e2e_network_id" "$runner_image_id" "$e2e_context" "$runner_bootstrap" \
+      "$fixture_base_url" "$runner_user" "$runner_image_inspect" <"$inspect_output" \
       || die "isolated E2E runner inspect policy failed before credential delivery"
     rm -f "$inspect_output"; inspect_output=
+    docker_cmd inspect --format '{"Id":{{json .Id}},"State":{"Dead":{{json .State.Dead}},"Error":{{json .State.Error}},"ExitCode":{{json .State.ExitCode}},"FinishedAt":{{json .State.FinishedAt}},"OOMKilled":{{json .State.OOMKilled}},"Paused":{{json .State.Paused}},"Pid":{{json .State.Pid}},"Restarting":{{json .State.Restarting}},"Running":{{json .State.Running}},"StartedAt":{{json .State.StartedAt}},"Status":{{json .State.Status}}}}' "$runner_container_id" \
+      | node_cmd "$policy" validate-created-container-state "$runner_container_id" runner \
+      || die "E2E runner created-state policy failed before start"
 
-    recorded_network_id=$(env_value "$live_file" WMUX_NETWORK_ID)
-    docker_cmd network inspect --format '{"Attachable":{{json .Attachable}},"Driver":{{json .Driver}},"Id":{{json .Id}},"Internal":{{json .Internal}},"Labels":{{json .Labels}},"Name":{{json .Name}},"Options":{{json .Options}}}' "$recorded_network_id" \
-      | node_cmd "$policy" validate-network "$project" "$recorded_network_id" \
-      || die "staging network identity changed before E2E runner start"
+    docker_cmd network inspect --format '{"Attachable":{{json .Attachable}},"Driver":{{json .Driver}},"Id":{{json .Id}},"Internal":{{json .Internal}},"Labels":{{json .Labels}},"Name":{{json .Name}},"Options":{{json .Options}}}' "$e2e_network_id" \
+      | node_cmd "$policy" validate-e2e-network "$project" "$full_revision" "$e2e_run_id" "$e2e_network_name" "$e2e_network_id" \
+      || die "E2E network identity changed before runner start"
     docker_cmd start "$runner_container_id" >/dev/null || die "cannot start isolated E2E runner"
     inspect_output=$(mktemp "$runtime_dir/.e2e-inspect.XXXXXX")
     docker_cmd inspect --format '{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Config":{"Cmd":{{json .Config.Cmd}},"Entrypoint":{{json .Config.Entrypoint}},"Env":{{json .Config.Env}},"Image":{{json .Config.Image}},"Labels":{{json .Config.Labels}},"OpenStdin":{{json .Config.OpenStdin}},"StdinOnce":{{json .Config.StdinOnce}},"Tty":{{json .Config.Tty}},"User":{{json .Config.User}},"WorkingDir":{{json .Config.WorkingDir}}},"HostConfig":{"Binds":{{json .HostConfig.Binds}},"CapDrop":{{json .HostConfig.CapDrop}},"DeviceRequests":{{json .HostConfig.DeviceRequests}},"Devices":{{json .HostConfig.Devices}},"IpcMode":{{json .HostConfig.IpcMode}},"Init":{{json .HostConfig.Init}},"LogConfig":{{json .HostConfig.LogConfig}},"Memory":{{json .HostConfig.Memory}},"MemorySwap":{{json .HostConfig.MemorySwap}},"Mounts":{{json .HostConfig.Mounts}},"NanoCpus":{{json .HostConfig.NanoCpus}},"NetworkMode":{{json .HostConfig.NetworkMode}},"PidMode":{{json .HostConfig.PidMode}},"PidsLimit":{{json .HostConfig.PidsLimit}},"PortBindings":{{json .HostConfig.PortBindings}},"Privileged":{{json .HostConfig.Privileged}},"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"RestartPolicy":{{json .HostConfig.RestartPolicy}},"SecurityOpt":{{json .HostConfig.SecurityOpt}},"ShmSize":{{json .HostConfig.ShmSize}},"Tmpfs":{{json .HostConfig.Tmpfs}},"UsernsMode":{{json .HostConfig.UsernsMode}},"VolumesFrom":{{json .HostConfig.VolumesFrom}}},"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}},"Ports":{{json .NetworkSettings.Ports}}},"Mounts":{{json .Mounts}},"State":{"Dead":{{json .State.Dead}},"Error":{{json .State.Error}},"ExitCode":{{json .State.ExitCode}},"FinishedAt":{{json .State.FinishedAt}},"OOMKilled":{{json .State.OOMKilled}},"Paused":{{json .State.Paused}},"Pid":{{json .State.Pid}},"Restarting":{{json .State.Restarting}},"Running":{{json .State.Running}},"StartedAt":{{json .State.StartedAt}},"Status":{{json .State.Status}}}}' "$runner_container_id" >"$inspect_output" \
       || die "cannot inspect running isolated E2E runner"
-    node_cmd "$policy" validate-runner-container-running "$project" "$full_revision" "$runner_name" "$runner_container_id" \
-      "$network_name" "$recorded_network_id" "$runner_image_id" "$e2e_context" "$runner_bootstrap" \
-      "$base_url" "$runner_user" "$runner_image_inspect" <"$inspect_output" \
+    node_cmd "$policy" validate-runner-container-running "$project" "$full_revision" "$e2e_run_id" "$runner_name" "$runner_container_id" \
+      "$e2e_network_name" "$e2e_network_id" "$runner_image_id" "$e2e_context" "$runner_bootstrap" \
+      "$fixture_base_url" "$runner_user" "$runner_image_inspect" <"$inspect_output" \
       || die "running E2E runner inspect policy failed before credential delivery"
     rm -f "$inspect_output"; inspect_output=
 
+    docker_cmd network inspect --format '{"Attachable":{{json .Attachable}},"Driver":{{json .Driver}},"Id":{{json .Id}},"Internal":{{json .Internal}},"Labels":{{json .Labels}},"Name":{{json .Name}},"Options":{{json .Options}}}' "$e2e_network_id" \
+      | node_cmd "$policy" validate-e2e-network "$project" "$full_revision" "$e2e_run_id" "$e2e_network_name" "$e2e_network_id" \
+      || die "E2E network identity changed before runner credential delivery"
+
     runner_status=0
-    node_cmd "$policy" run-runner "$env_file" "$runtime_dir/e2e-run.log" 1800 "$docker_mode" "$docker_config" \
+    node_cmd "$policy" run-runner "$e2e_metadata_file" "$runtime_dir/e2e-run.log" 1800 "$docker_mode" "$docker_config" \
       "$docker_selector" "$( [ "$docker_selector" = host ] && printf '%s' "$docker_endpoint" || printf '%s' "$docker_context" )" "$runner_container_id" \
       || runner_status=$?
     result_scan_status=0
-    node_cmd "$policy" scan-runner-results "$env_file" "$docker_mode" "$docker_config" "$docker_selector" \
+    node_cmd "$policy" scan-runner-results "$e2e_metadata_file" "$docker_mode" "$docker_config" "$docker_selector" \
       "$( [ "$docker_selector" = host ] && printf '%s' "$docker_endpoint" || printf '%s' "$docker_context" )" "$runner_container_id" \
       || result_scan_status=$?
+    fixture_scan_status=0
+    scan_fixture_output || fixture_scan_status=$?
     context_status=0
     node_cmd "$policy" validate-e2e-context "$e2e_dependency_file" "$e2e_context_file" "$isolated_repo" >/dev/null || context_status=$?
     remove_runner || die "failed to remove exact E2E runner; operation lock retained"
+    remove_fixture || die "failed to remove exact E2E fixture; operation lock retained"
+    remove_e2e_network || die "failed to remove exact E2E network; operation lock retained"
+    verify_visible_unchanged || die "visible staging changed during E2E; operation lock and evidence retained"
     remove_e2e_local || die "failed to clean exact E2E context; operation lock retained"
     clean_candidate
     [ "$runner_status" -eq 0 ] || die "browser E2E runner failed"
     [ "$result_scan_status" -eq 0 ] || die "browser E2E result credential scan failed"
+    [ "$fixture_scan_status" -eq 0 ] || die "candidate fixture credential-output scan failed"
     [ "$context_status" -eq 0 ] || die "candidate E2E source or dependency tree changed while credentials were present"
-    printf '%s\n' "staging browser E2E passed for $project at $base_url"
+    printf '%s\n' "staging browser E2E passed for $project using a disposable internal candidate fixture"
     ;;
   down)
     select_docker

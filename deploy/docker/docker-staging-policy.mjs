@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import crypto from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -12,6 +12,7 @@ if (!Number.isInteger(uid)) fail("staging policy requires a POSIX uid");
 const runnerImage = "mcr.microsoft.com/playwright@sha256:57b65fdc9ceabe0ef613124c7bbe2babcf9362c4d85e382fe3b03604e84b428a";
 const runnerPlaywrightVersion = "1.61.0";
 const runnerLogLimit = 4 * 1024 * 1024;
+const fixtureLogLimit = 4 * 1024 * 1024;
 
 const exactKeys = (value, expected, name) => {
   if (!value || typeof value !== "object" || Array.isArray(value)) fail(`${name} must be an object`);
@@ -892,6 +893,37 @@ const createLiveMetadata = (filePath, values) => {
   writeExclusive(filePath, `${lines.join("\n")}\n`);
 };
 
+const e2eMetadataKeys = [
+  "WMUX_E2E_PROJECT", "WMUX_E2E_REVISION", "WMUX_E2E_RUN_ID", "WMUX_TOKEN", "WMUX_REGISTRATION_TOKEN",
+];
+
+const createE2eMetadata = (filePath, visibleMetadataFile, [project, revision, runId]) => {
+  const visible = readMetadata(visibleMetadataFile);
+  if (!/^wmux-staging-[a-z0-9-]+$/.test(project ?? "") || !/^[0-9a-f]{40,64}$/.test(revision ?? "")
+    || !/^[0-9a-f]{16}$/.test(runId ?? "")) fail("invalid E2E metadata identity");
+  const forbidden = new Set([visible.WMUX_TOKEN, visible.WMUX_REGISTRATION_TOKEN]);
+  let token;
+  do token = crypto.randomBytes(32).toString("hex"); while (forbidden.has(token));
+  forbidden.add(token);
+  let registrationToken;
+  do registrationToken = crypto.randomBytes(32).toString("hex"); while (forbidden.has(registrationToken));
+  const values = { WMUX_E2E_PROJECT: project, WMUX_E2E_REVISION: revision, WMUX_E2E_RUN_ID: runId,
+    WMUX_TOKEN: token, WMUX_REGISTRATION_TOKEN: registrationToken };
+  writeExclusive(filePath, `${e2eMetadataKeys.map((key) => `${key}=${values[key]}`).join("\n")}\n`);
+};
+
+const readE2eMetadata = (filePath) => {
+  const values = readMetadata(filePath);
+  exactKeys(values, e2eMetadataKeys, "E2E metadata");
+  if (!/^wmux-staging-[a-z0-9-]+$/.test(values.WMUX_E2E_PROJECT ?? "")
+    || !/^[0-9a-f]{40,64}$/.test(values.WMUX_E2E_REVISION ?? "")
+    || !/^[0-9a-f]{16}$/.test(values.WMUX_E2E_RUN_ID ?? "")
+    || !/^[0-9a-f]{64}$/.test(values.WMUX_TOKEN ?? "")
+    || !/^[0-9a-f]{64}$/.test(values.WMUX_REGISTRATION_TOKEN ?? "")
+    || values.WMUX_TOKEN === values.WMUX_REGISTRATION_TOKEN) fail("E2E credential metadata is invalid");
+  return values;
+};
+
 const createProvisionMetadata = (filePath, [repository, worktree, revision]) => {
   if (!/^[0-9a-f]{40,64}$/.test(revision ?? "")) fail("invalid provision revision");
   writeExclusive(filePath, `WMUX_ISOLATED_REPOSITORY=${safeValue(repository, "repository")}\nWMUX_WORKTREE=${safeValue(worktree, "worktree")}\nWMUX_BUILD_REVISION=${revision}\n`);
@@ -1109,6 +1141,123 @@ const validateImage = async ([imageId, revision]) => {
   }
 };
 
+const validateE2eCandidateImage = async ([imageId, revision]) => {
+  const value = await parseStdinJson();
+  exactKeys(value, ["Id", "Config"], "E2E candidate image inspect");
+  if (value.Id !== imageId) fail("E2E candidate image ID drift");
+  exactKeys(value.Config, ["Env", "Labels"], "E2E candidate image Config");
+  requireOptionalStringMap(value.Config.Labels, "E2E candidate image labels");
+  if (value.Config.Labels?.["org.opencontainers.image.revision"] !== revision) fail("E2E candidate image revision drift");
+  if (!Array.isArray(value.Config.Env) || value.Config.Env.some((entry) => typeof entry !== "string"
+    || /(?:^|_)(?:TOKEN|SECRET|PASSWORD|CREDENTIAL)=/i.test(entry))) fail("E2E candidate image environment is unsafe");
+};
+
+const e2eLabels = (project, revision, runId, role) => ({
+  "org.opencontainers.image.revision": revision,
+  "wmux.staging.e2e": "true",
+  "wmux.staging.project": project,
+  "wmux.staging.revision": revision,
+  "wmux.staging.role": role,
+  "wmux.staging.run": runId,
+});
+
+const validateE2eNetwork = async ([project, revision, runId, networkName, networkId]) => {
+  const value = await parseStdinJson();
+  exactKeys(value, ["Attachable", "Driver", "Id", "Internal", "Labels", "Name", "Options"], "E2E network inspect");
+  if (value.Id !== networkId || value.Name !== networkName || value.Driver !== "bridge"
+    || value.Internal !== true || value.Attachable !== false) fail("E2E network identity/policy drift");
+  exactKeys(value.Options, [], "E2E network options");
+  exactMap(value.Labels, e2eLabels(project, revision, runId, "network"), "E2E network labels");
+};
+
+const fixtureTmpfs = {
+  "/home/node/.wmux": { flags: ["rw", "nosuid", "nodev", "noexec"], mode: 0o700, size: 268_435_456, uid: 1000, gid: 1000 },
+  "/tmp": { flags: ["rw", "nosuid", "nodev", "noexec"], mode: 0o1777, size: 67_108_864, uid: 1000, gid: 1000 },
+  "/run/wmux-e2e": { flags: ["rw", "nosuid", "nodev", "noexec"], mode: 0o700, size: 67_108_864, uid: 1000, gid: 1000 },
+};
+
+const validateRunningState = (state, name) => {
+  exactKeys(state, ["Dead", "Error", "ExitCode", "FinishedAt", "OOMKilled", "Paused", "Pid", "Restarting", "Running", "StartedAt", "Status"], `${name} State`);
+  if (state.Status !== "running" || state.Running !== true || state.Paused !== false || state.Restarting !== false
+    || state.OOMKilled !== false || state.Dead !== false || !Number.isSafeInteger(state.Pid) || state.Pid < 1
+    || state.ExitCode !== 0 || state.Error !== "") fail(`${name} is not in the required running state`);
+  if (typeof state.StartedAt !== "string" || state.StartedAt.length > 64
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(state.StartedAt)
+    || state.StartedAt.startsWith("0001-01-01T") || state.FinishedAt !== "0001-01-01T00:00:00Z") {
+    fail(`${name} state timestamps are invalid`);
+  }
+};
+
+const validateCreatedContainerState = async ([containerId, name]) => {
+  const value = await parseStdinJson();
+  exactKeys(value, ["Id", "State"], `${name} prestart inspect`);
+  if (value.Id !== containerId) fail(`${name} prestart container ID drift`);
+  exactKeys(value.State, ["Dead", "Error", "ExitCode", "FinishedAt", "OOMKilled", "Paused", "Pid", "Restarting", "Running", "StartedAt", "Status"], `${name} prestart State`);
+  const state = value.State;
+  if (state.Status !== "created" || state.Running !== false || state.Paused !== false || state.Restarting !== false
+    || state.OOMKilled !== false || state.Dead !== false || state.Pid !== 0 || state.ExitCode !== 0 || state.Error !== ""
+    || state.StartedAt !== "0001-01-01T00:00:00Z" || state.FinishedAt !== "0001-01-01T00:00:00Z") {
+    fail(`${name} is not in the required created state`);
+  }
+};
+
+const validateFixtureContainer = async ([project, revision, runId, fixtureName, containerId, networkName, networkId,
+  imageId, imageInspectFile, baseUrl], phase) => {
+  const imageInspect = readJsonFile(imageInspectFile, "E2E candidate image identity");
+  const value = await parseStdinJson();
+  const expectedKeys = ["Id", "Image", "Name", "Config", "HostConfig", "NetworkSettings", "Mounts"];
+  if (phase !== "prestart") expectedKeys.push("State");
+  if (phase === "healthy") expectedKeys.push("Health");
+  exactKeys(value, expectedKeys, "fixture inspect");
+  if (value.Id !== containerId || value.Image !== imageId || value.Name !== `/${fixtureName}`) fail("fixture container identity drift");
+  const config = value.Config;
+  exactKeys(config, ["Cmd", "Entrypoint", "Env", "Image", "Labels", "OpenStdin", "StdinOnce", "Tty", "User", "WorkingDir"], "fixture Config");
+  if (config.Image !== imageId || config.User !== "1000:1000" || config.WorkingDir !== "/app"
+    || config.OpenStdin !== true || config.StdinOnce !== true || config.Tty !== false) fail("fixture image/user/workdir/stdin policy drift");
+  exactMembers(config.Entrypoint, ["/usr/local/lib/wmux/e2e-fixture-bootstrap"], "fixture entrypoint");
+  exactMembers(config.Cmd, ["run"], "fixture command");
+  exactMap(config.Labels, { ...(imageInspect.Config.Labels ?? {}), ...e2eLabels(project, revision, runId, "fixture") }, "fixture labels");
+  const requiredEnvironment = [
+    "HOME=/home/node", `WMUX_BUILD_REVISION=${revision}`, `WMUX_E2E_RUN_ID=${runId}`, `WMUX_E2E_BASE_URL=${baseUrl}`,
+  ];
+  const expectedEnvironment = new Map((imageInspect.Config.Env ?? []).map((entry) => [String(entry).split("=", 1)[0], entry]));
+  for (const entry of requiredEnvironment) expectedEnvironment.set(entry.split("=", 1)[0], entry);
+  exactMembers(config.Env, [...expectedEnvironment.values()], "fixture environment");
+  if (config.Env.some((entry) => /(?:^|_)(?:TOKEN|SECRET|PASSWORD|CREDENTIAL)=/i.test(entry))) fail("credential found in fixture environment");
+
+  const h = value.HostConfig;
+  exactKeys(h, ["Binds", "CapDrop", "DeviceRequests", "Devices", "IpcMode", "Init", "LogConfig", "Memory", "MemorySwap",
+    "Mounts", "NanoCpus", "NetworkMode", "PidMode", "PidsLimit", "PortBindings", "Privileged", "ReadonlyRootfs",
+    "RestartPolicy", "SecurityOpt", "ShmSize", "Tmpfs", "UsernsMode", "VolumesFrom"], "fixture HostConfig");
+  if (h.Privileged !== false || h.ReadonlyRootfs !== true || h.PidMode !== "" || h.IpcMode !== "private"
+    || h.NetworkMode !== networkName || h.PidsLimit !== 512 || h.NanoCpus !== 2_000_000_000
+    || h.Memory !== 1_073_741_824 || h.MemorySwap !== 1_073_741_824 || h.ShmSize !== 67_108_864
+    || h.RestartPolicy?.Name !== "no" || h.UsernsMode !== "" || h.Init !== true) fail("fixture namespace/resource policy drift");
+  exactMembers(h.CapDrop, ["ALL"], "fixture CapDrop"); exactMembers(h.SecurityOpt, ["no-new-privileges:true"], "fixture SecurityOpt");
+  requireEmptyList(h.Binds, "fixture Binds"); requireEmptyList(h.Devices, "fixture Devices");
+  requireEmptyList(h.DeviceRequests, "fixture DeviceRequests"); requireEmptyList(h.VolumesFrom, "fixture VolumesFrom");
+  requireEmptyList(h.Mounts, "fixture Mounts");
+  if (h.PortBindings !== null && Object.keys(h.PortBindings).length !== 0) fail("fixture ports must be empty");
+  exactKeys(h.LogConfig, ["Config", "Type"], "fixture LogConfig");
+  exactMap(h.LogConfig.Config, { compress: "false", "max-file": "1", "max-size": "4m" }, "fixture LogConfig options");
+  if (h.LogConfig.Type !== "local") fail("fixture log driver drift");
+  exactKeys(h.Tmpfs, Object.keys(fixtureTmpfs), "fixture Tmpfs");
+  for (const [destination, expected] of Object.entries(fixtureTmpfs)) validateTmpfsOptions(h.Tmpfs[destination], expected, destination);
+  exactMembers(value.Mounts, [], "fixture realized mounts");
+  exactKeys(value.NetworkSettings, ["Networks", "Ports"], "fixture NetworkSettings");
+  exactKeys(value.NetworkSettings.Networks, [networkName], "fixture attached networks");
+  const attachedNetworkId = value.NetworkSettings.Networks[networkName].NetworkID;
+  if (phase === "prestart") {
+    if (attachedNetworkId !== "" && attachedNetworkId !== networkId) fail("fixture pre-start network ID drift");
+  } else if (attachedNetworkId !== networkId) fail("fixture running network ID drift");
+  if (value.NetworkSettings.Ports !== null && Object.keys(value.NetworkSettings.Ports).length !== 0) fail("fixture realized ports must be empty");
+  if (phase !== "prestart") validateRunningState(value.State, "fixture");
+  if (phase === "healthy") {
+    exactKeys(value.Health, ["Status"], "fixture Health");
+    if (value.Health.Status !== "healthy") fail("fixture is not healthy");
+  }
+};
+
 const readJsonFile = (filePath, name) => {
   validateMetadata(filePath);
   try { return JSON.parse(fs.readFileSync(filePath, "utf8")); } catch { fail(`${name} is not valid JSON`); }
@@ -1135,7 +1284,7 @@ const runnerTmpfs = (runnerUid, runnerGid) => ({
   "/run": { flags: ["rw", "nosuid", "nodev", "noexec"], mode: 0o755, size: 8_388_608, uid: runnerUid, gid: runnerGid },
 });
 
-const validateRunnerContainer = async ([project, revision, runnerName, containerId, networkName, networkId, imageId,
+const validateRunnerContainer = async ([project, revision, runId, runnerName, containerId, networkName, networkId, imageId,
   context, bootstrap, baseUrl, runnerUser, imageInspectFile], phase) => {
   if (!/^\d+:\d+$/.test(runnerUser ?? "")) fail("runner user must be numeric uid:gid");
   const [runnerUid, runnerGid] = runnerUser.split(":").map(Number);
@@ -1155,9 +1304,7 @@ const validateRunnerContainer = async ([project, revision, runnerName, container
   exactMembers(config.Cmd, ["run"], "runner command");
   exactMap(config.Labels, {
     ...(imageInspect.Config.Labels ?? {}),
-    "org.opencontainers.image.revision": revision,
-    "wmux.staging.e2e": "true",
-    "wmux.staging.project": project,
+    ...e2eLabels(project, revision, runId, "runner"),
   }, "runner labels");
   const requiredEnvironment = [
     `HOME=/home/wmux`, `TMPDIR=/tmp`, `XDG_CACHE_HOME=/home/wmux/.cache`,
@@ -1206,17 +1353,7 @@ const validateRunnerContainer = async ([project, revision, runnerName, container
   } else if (attachedNetworkId !== networkId) fail("runner running network ID drift");
   if (value.NetworkSettings.Ports !== null && Object.keys(value.NetworkSettings.Ports).length !== 0) fail("runner realized ports must be empty");
   if (phase === "running") {
-    exactKeys(value.State, ["Dead", "Error", "ExitCode", "FinishedAt", "OOMKilled", "Paused", "Pid", "Restarting", "Running", "StartedAt", "Status"], "runner State");
-    if (value.State.Status !== "running" || value.State.Running !== true || value.State.Paused !== false
-      || value.State.Restarting !== false || value.State.OOMKilled !== false || value.State.Dead !== false
-      || !Number.isSafeInteger(value.State.Pid) || value.State.Pid < 1 || value.State.ExitCode !== 0 || value.State.Error !== "") {
-      fail("runner is not in the required running state");
-    }
-    if (typeof value.State.StartedAt !== "string" || value.State.StartedAt.length > 64
-      || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value.State.StartedAt)
-      || value.State.StartedAt.startsWith("0001-01-01T") || value.State.FinishedAt !== "0001-01-01T00:00:00Z") {
-      fail("runner state timestamps are invalid");
-    }
+    validateRunningState(value.State, "runner");
   }
 };
 
@@ -1239,8 +1376,114 @@ const dockerInvocation = (mode, dockerConfig, selector, endpoint, dockerArgs) =>
 
 const containsCredential = (bytes, token, registrationToken) => bytes.includes(Buffer.from(token)) || bytes.includes(Buffer.from(registrationToken));
 
+const runDockerCapture = (invocation, timeout = 30_000, maxBuffer = 4 * 1024 * 1024) => {
+  const result = spawnSync(invocation.command, invocation.args, { env: invocation.env, timeout, maxBuffer });
+  if (result.error || result.status !== 0) fail("bounded Docker evidence command failed");
+  return Buffer.isBuffer(result.stdout) ? result.stdout : Buffer.from(result.stdout ?? "");
+};
+
+const visibleContainerFormat = '{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Running":{{json .State.Running}},"Status":{{json .State.Status}},"Restarting":{{json .State.Restarting}},"StartedAt":{{json .State.StartedAt}},"Health":{{json .State.Health.Status}}}';
+const visibleNetworkFormat = '{"Id":{{json .Id}},"Name":{{json .Name}},"Driver":{{json .Driver}},"Internal":{{json .Internal}},"Attachable":{{json .Attachable}}}';
+
+const captureVisibleSnapshot = (mode, dockerConfig, selector, endpoint, containerId, networkId) => {
+  const parse = (bytes, name) => { try { return JSON.parse(bytes.toString("utf8")); } catch { fail(`${name} evidence is malformed`); } };
+  const container = parse(runDockerCapture(dockerInvocation(mode, dockerConfig, selector, endpoint,
+    ["inspect", "--format", visibleContainerFormat, containerId])), "visible container");
+  const network = parse(runDockerCapture(dockerInvocation(mode, dockerConfig, selector, endpoint,
+    ["network", "inspect", "--format", visibleNetworkFormat, networkId])), "visible network");
+  exactKeys(container, ["Id", "Image", "Name", "Running", "Status", "Restarting", "StartedAt", "Health"], "visible container snapshot");
+  exactKeys(network, ["Id", "Name", "Driver", "Internal", "Attachable"], "visible network snapshot");
+  if (container.Id !== containerId || network.Id !== networkId || container.Running !== true || container.Status !== "running"
+    || container.Restarting !== false || container.Health !== "healthy") fail("visible staging service is not healthy and stable");
+  return { container, network };
+};
+
+const createVisibleSnapshot = (filePath, mode, dockerConfig, selector, endpoint, containerId, networkId) => {
+  if (!/^[0-9a-f]{64}$/.test(containerId ?? "") || !/^[0-9a-f]{64}$/.test(networkId ?? "")) fail("visible resource ID is invalid");
+  writeExclusive(filePath, `${JSON.stringify(captureVisibleSnapshot(mode, dockerConfig, selector, endpoint, containerId, networkId))}\n`);
+};
+
+const verifyVisibleSnapshot = (filePath, mode, dockerConfig, selector, endpoint, containerId, networkId) => {
+  const expected = readJsonFile(filePath, "visible staging snapshot");
+  const actual = captureVisibleSnapshot(mode, dockerConfig, selector, endpoint, containerId, networkId);
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) fail("visible staging container/network/start/state changed during E2E");
+};
+
+const deliverFixtureCredentials = async (metadataFile, timeoutText, mode, dockerConfig, selector, endpoint, containerId) => {
+  const metadata = readE2eMetadata(metadataFile);
+  if (!/^[0-9a-f]{64}$/.test(containerId ?? "")) fail("fixture container ID is invalid");
+  const timeout = Number(timeoutText);
+  if (!Number.isInteger(timeout) || timeout < 1 || timeout > 300) fail("fixture health timeout is invalid");
+  const invocation = dockerInvocation(mode, dockerConfig, selector, endpoint,
+    ["attach", "--no-stdin=false", "--sig-proxy=false", containerId]);
+  const child = spawn(invocation.command, invocation.args, { env: invocation.env, stdio: ["pipe", "pipe", "pipe"] });
+  const output = [];
+  let outputBytes = 0;
+  let outputOverflow = false;
+  const collect = (chunk) => {
+    const bytes = Buffer.from(chunk); outputBytes += bytes.length;
+    if (outputBytes > fixtureLogLimit) { outputOverflow = true; child.kill("SIGTERM"); return; }
+    output.push(bytes);
+  };
+  child.stdout.on("data", collect); child.stderr.on("data", collect);
+  let exited = false; let exitError; let resolveClose;
+  const closePromise = new Promise((resolve) => { resolveClose = resolve; });
+  child.once("error", (error) => { exitError = error; exited = true; resolveClose(); });
+  child.once("close", () => { exited = true; resolveClose(); });
+  child.stdin.end(`${metadata.WMUX_TOKEN}\n${metadata.WMUX_REGISTRATION_TOKEN}\n`);
+  const deadline = Date.now() + timeout * 1000;
+  let healthy = false;
+  while (Date.now() < deadline && !healthy && !outputOverflow && !exitError) {
+    const healthInvocation = dockerInvocation(mode, dockerConfig, selector, endpoint, ["inspect", "--format",
+      '{"Id":{{json .Id}},"Running":{{json .State.Running}},"Status":{{json .State.Status}},"Health":{{json .State.Health.Status}}}', containerId]);
+    const result = spawnSync(healthInvocation.command, healthInvocation.args, { env: healthInvocation.env, timeout: 5_000, maxBuffer: 64 * 1024 });
+    if (!result.error && result.status === 0) {
+      try {
+        const value = JSON.parse(Buffer.from(result.stdout ?? "").toString("utf8"));
+        healthy = value.Id === containerId && value.Running === true && value.Status === "running" && value.Health === "healthy";
+        if (value.Id !== containerId || value.Running !== true || value.Status !== "running") fail("fixture identity/state drifted during health gate");
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("drifted")) throw error;
+      }
+    }
+    if (!healthy) await new Promise((resolve) => setTimeout(resolve, 200));
+    if (exited && !healthy) break;
+  }
+  if (containsCredential(Buffer.concat(output), metadata.WMUX_TOKEN, metadata.WMUX_REGISTRATION_TOKEN)) {
+    child.kill("SIGTERM"); fail("credential material detected in fixture output; output quarantined");
+  }
+  if (outputOverflow) fail("fixture startup output exceeded its bounded capture");
+  if (exitError) fail("Docker fixture attach failed");
+  if (!healthy) { child.kill("SIGTERM"); fail("fixture did not become healthy within its bounded timeout"); }
+  if (!exited) child.kill("SIGTERM");
+  await Promise.race([
+    closePromise,
+    new Promise((resolve) => setTimeout(resolve, 2_000)),
+  ]);
+  if (!exited) {
+    child.kill("SIGKILL");
+    await Promise.race([closePromise, new Promise((resolve) => setTimeout(resolve, 2_000))]);
+  }
+  if (!exited) fail("Docker fixture attach did not terminate after health gate");
+  if (outputOverflow) fail("fixture startup output exceeded its bounded capture");
+  if (containsCredential(Buffer.concat(output), metadata.WMUX_TOKEN, metadata.WMUX_REGISTRATION_TOKEN)) {
+    fail("credential material detected in fixture output; output quarantined");
+  }
+};
+
+const scanFixtureOutput = (metadataFile, mode, dockerConfig, selector, endpoint, containerId) => {
+  const metadata = readE2eMetadata(metadataFile);
+  const invocation = dockerInvocation(mode, dockerConfig, selector, endpoint, ["logs", containerId]);
+  const result = spawnSync(invocation.command, invocation.args, { env: invocation.env, timeout: 30_000, maxBuffer: fixtureLogLimit });
+  if (result.error || result.status !== 0) fail("fixture logs could not be scanned");
+  if (containsCredential(result.stdout ?? Buffer.alloc(0), metadata.WMUX_TOKEN, metadata.WMUX_REGISTRATION_TOKEN)
+    || containsCredential(result.stderr ?? Buffer.alloc(0), metadata.WMUX_TOKEN, metadata.WMUX_REGISTRATION_TOKEN)) {
+    fail("credential material detected in fixture logs; logs quarantined");
+  }
+};
+
 const runRunner = (metadataFile, logFile, timeoutText, mode, dockerConfig, selector, endpoint, containerId) => {
-  const metadata = readMetadata(metadataFile);
+  const metadata = readE2eMetadata(metadataFile);
   const token = metadata.WMUX_TOKEN; const registrationToken = metadata.WMUX_REGISTRATION_TOKEN;
   if (!/^[0-9a-f]{64}$/.test(token ?? "") || !/^[0-9a-f]{64}$/.test(registrationToken ?? "") || token === registrationToken) fail("runner credential metadata is invalid");
   const timeout = Number(timeoutText);
@@ -1289,7 +1532,7 @@ const runRunner = (metadataFile, logFile, timeoutText, mode, dockerConfig, selec
 };
 
 const scanRunnerResults = (metadataFile, mode, dockerConfig, selector, endpoint, containerId) => {
-  const metadata = readMetadata(metadataFile);
+  const metadata = readE2eMetadata(metadataFile);
   if (!/^[0-9a-f]{64}$/.test(containerId ?? "")) fail("runner container ID is invalid");
   const invocation = dockerInvocation(mode, dockerConfig, selector, endpoint, ["cp", `${containerId}:/tmp/e2e-results/.`, "-"]);
   const result = spawnSync(invocation.command, invocation.args, { env: invocation.env, timeout: 60_000, maxBuffer: 128 * 1024 * 1024 });
@@ -1331,6 +1574,7 @@ try {
     case "validate-identity": emitIdentity(args[0]); break;
     case "remove-audited-stage": removeAuditedStage(...args); break;
     case "create-live-metadata": createLiveMetadata(args[0], args.slice(1)); break;
+    case "create-e2e-metadata": createE2eMetadata(args[0], args[1], args.slice(2)); break;
     case "create-provision-metadata": createProvisionMetadata(args[0], args.slice(1)); break;
     case "validate-provision": emitProvision(args[0]); break;
     case "remove-audited-provision": removeAuditedProvision(...args); break;
@@ -1339,11 +1583,21 @@ try {
     case "validate-container": await validateContainer(args); break;
     case "validate-network": await validateNetwork(args); break;
     case "validate-image": await validateImage(args); break;
+    case "validate-e2e-candidate-image": await validateE2eCandidateImage(args); break;
+    case "validate-e2e-network": await validateE2eNetwork(args); break;
+    case "validate-fixture-container-prestart": await validateFixtureContainer(args, "prestart"); break;
+    case "validate-fixture-container-running": await validateFixtureContainer(args, "running"); break;
+    case "validate-fixture-container-healthy": await validateFixtureContainer(args, "healthy"); break;
+    case "validate-created-container-state": await validateCreatedContainerState(args); break;
     case "validate-runner-image": await validateRunnerImage(args); break;
     case "validate-runner-container-prestart": await validateRunnerContainer(args, "prestart"); break;
     case "validate-runner-container-running": await validateRunnerContainer(args, "running"); break;
     case "run-runner": runRunner(...args); break;
     case "scan-runner-results": scanRunnerResults(...args); break;
+    case "deliver-fixture-credentials": await deliverFixtureCredentials(...args); break;
+    case "scan-fixture-output": scanFixtureOutput(...args); break;
+    case "create-visible-snapshot": createVisibleSnapshot(...args); break;
+    case "verify-visible-snapshot": verifyVisibleSnapshot(...args); break;
     default: fail(`unknown staging policy command: ${command ?? ""}`);
   }
 } catch (error) {
