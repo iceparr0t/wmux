@@ -1,0 +1,565 @@
+#!/bin/sh
+set -eu
+umask 077
+
+die() { printf '%s\n' "wmux-docker-staging: $*" >&2; exit 1; }
+
+usage() {
+  cat >&2 <<'EOF'
+usage: wmux-docker-staging up|status|smoke|e2e|down|url|config-path
+
+Required environment:
+  WMUX_STAGING_PUBLISH_HOST  explicit private IPv4 publish address
+  WMUX_STAGING_PUBLISH_PORT  explicit high port (1024-65535, except 3478)
+
+Optional environment:
+  WMUX_STAGING_PROJECT       safe name beginning with wmux-staging-
+  WMUX_STAGING_RUNTIME_ROOT  absolute durable owner-controlled state directory
+  WMUX_STAGING_WORKTREE_ROOT must equal /mnt/storage/sw_projects/.worktrees/wmux
+EOF
+  exit 2
+}
+
+tool_path=${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}
+script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd -P)
+repo_root=$(CDPATH= cd "$script_dir/.." && pwd -P)
+bind_validator=$repo_root/deploy/docker/docker-bind-host.mjs
+policy=$repo_root/deploy/docker/docker-staging-policy.mjs
+smoke_helper=$repo_root/deploy/docker/docker-staging-smoke.mjs
+
+node_cmd() {
+  env -i PATH="$tool_path" HOME="${HOME:?HOME is required}" LC_ALL=C LANG=C \
+    node "$@"
+}
+
+env_value() {
+  metadata_file=$1
+  key=$2
+  awk -F= -v wanted="$key" '$1 == wanted { sub(/^[^=]*=/, ""); print; found=1; exit } END { if (!found) exit 1 }' "$metadata_file"
+}
+
+git_cmd() {
+  env -i PATH="$tool_path" HOME="${HOME:?HOME is required}" LC_ALL=C LANG=C \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 \
+    git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c protocol.file.allow=never \
+      -C "$repo_root" "$@"
+}
+
+isolated_git() {
+  env -i PATH="$tool_path" HOME="${HOME:?HOME is required}" LC_ALL=C LANG=C \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 \
+    git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c protocol.file.allow=never \
+      --git-dir "$isolated_repo" "$@"
+}
+
+[ "$#" -eq 1 ] || usage
+command_name=$1
+case "$command_name" in up|status|smoke|e2e|down|url|config-path) ;; *) usage ;; esac
+
+verified_repo=$(git_cmd rev-parse --show-toplevel 2>/dev/null) || die "cannot verify the candidate repository"
+[ "$verified_repo" = "$repo_root" ] || die "Git top-level differs from the staging repository"
+full_revision=$(git_cmd rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || die "cannot resolve candidate commit"
+short_revision=$(git_cmd rev-parse --short=12 "$full_revision" 2>/dev/null) || die "cannot resolve candidate short revision"
+case "$full_revision:$short_revision" in *[!0-9a-f:]*) die "Git returned a non-canonical revision" ;; esac
+[ "${#full_revision}" -ge 40 ] && [ "${#short_revision}" -eq 12 ] || die "Git returned an unexpected revision length"
+launcher_blob=$(git_cmd rev-parse "$full_revision:scripts/wmux-docker-staging" 2>/dev/null) || die "staging launcher is not committed at HEAD"
+actual_launcher_blob=$(git_cmd hash-object --no-filters "$script_dir/wmux-docker-staging" 2>/dev/null) || die "cannot hash staging launcher"
+[ "$launcher_blob" = "$actual_launcher_blob" ] || die "staging launcher bytes differ from committed HEAD"
+for trusted_path in deploy/docker/docker-staging-policy.mjs deploy/docker/docker-bind-host.mjs deploy/docker/docker-staging-smoke.mjs; do
+  trusted_blob=$(git_cmd rev-parse "$full_revision:$trusted_path" 2>/dev/null) || die "$trusted_path is not committed at HEAD"
+  actual_trusted_blob=$(git_cmd hash-object --no-filters "$repo_root/$trusted_path" 2>/dev/null) || die "cannot hash $trusted_path"
+  [ "$trusted_blob" = "$actual_trusted_blob" ] || die "$trusted_path bytes differ from committed HEAD"
+done
+node_cmd "$policy" validate-source-checkout "$repo_root" "$full_revision" || die "tracked or staged checkout changes detected"
+
+publish_host=${WMUX_STAGING_PUBLISH_HOST-}
+publish_port=${WMUX_STAGING_PUBLISH_PORT-}
+[ -n "$publish_host" ] || die "WMUX_STAGING_PUBLISH_HOST is required"
+[ -n "$publish_port" ] || die "WMUX_STAGING_PUBLISH_PORT is required"
+case "$publish_host" in *[!0-9.]*) die "WMUX_STAGING_PUBLISH_HOST must use canonical IPv4 notation" ;; esac
+env -i PATH="$tool_path" WMUX_PUBLISH_HOST="$publish_host" \
+  node "$bind_validator" --validate-publish >/dev/null
+case "$publish_port" in *[!0-9]*|'') die "WMUX_STAGING_PUBLISH_PORT must be a decimal port number" ;; 0*) die "WMUX_STAGING_PUBLISH_PORT must use canonical decimal notation" ;; esac
+[ "${#publish_port}" -le 5 ] || die "WMUX_STAGING_PUBLISH_PORT must be between 1024 and 65535"
+[ "$publish_port" -ge 1024 ] && [ "$publish_port" -le 65535 ] || die "WMUX_STAGING_PUBLISH_PORT must be between 1024 and 65535"
+[ "$publish_port" -ne 3478 ] || die "refusing the production/default wmux port 3478"
+case "${DOCKER_HOST-}" in ''|unix:///*) ;; *) die "refusing non-local DOCKER_HOST" ;; esac
+
+if [ -n "${WMUX_STAGING_PROJECT-}" ]; then
+  project=$WMUX_STAGING_PROJECT
+else
+  project=wmux-staging-$short_revision
+fi
+case "$project" in wmux-staging-[a-z0-9]*) ;; *) die "WMUX_STAGING_PROJECT must begin with wmux-staging- and use lowercase letters, digits, or hyphens" ;; esac
+case "$project" in *[!a-z0-9-]*|*-|*--*|*production*|*prod*) die "WMUX_STAGING_PROJECT is unsafe or production-like" ;; esac
+[ "${#project}" -le 63 ] || die "WMUX_STAGING_PROJECT must be at most 63 characters"
+
+if [ -n "${WMUX_STAGING_RUNTIME_ROOT-}" ]; then
+  runtime_root=$WMUX_STAGING_RUNTIME_ROOT
+elif [ -d /mnt/storage/sw_projects/.workspace ]; then
+  runtime_root=/mnt/storage/sw_projects/.workspace/deployments/wmux-staging
+else
+  runtime_root=${XDG_STATE_HOME:-${HOME:?HOME is required}/.local/state}/wmux/docker-staging
+fi
+case "$runtime_root" in /*) ;; *) die "WMUX_STAGING_RUNTIME_ROOT must be absolute" ;; esac
+case "$runtime_root" in *[!A-Za-z0-9._/-]*) die "WMUX_STAGING_RUNTIME_ROOT contains unsafe characters" ;; esac
+node_cmd "$policy" prepare-private-dir "$runtime_root" || die "staging runtime root is not owner-controlled"
+worktree_root=${WMUX_STAGING_WORKTREE_ROOT:-/mnt/storage/sw_projects/.worktrees/wmux}
+node_cmd "$policy" validate-worktree-root "$worktree_root" || die "staging worktree root is not approved"
+
+runtime_dir=$runtime_root/$project
+identity_file=$runtime_dir/identity.env
+provision_file=$runtime_dir/provision.env
+
+exec_committed_launcher() {
+  node_cmd "$policy" validate-identity "$identity_file" >/dev/null || die "isolated repository/worktree identity validation failed; evidence retained"
+  isolated_repo=$(env_value "$identity_file" WMUX_ISOLATED_REPOSITORY)
+  candidate_context=$(env_value "$identity_file" WMUX_WORKTREE)
+  recorded_revision=$(env_value "$identity_file" WMUX_BUILD_REVISION)
+  [ "$candidate_context/scripts/wmux-docker-staging" != "$script_dir/wmux-docker-staging" ] || die "refusing recursive staging bootstrap"
+  exec env -i PATH="$tool_path" HOME="${HOME:?HOME is required}" LC_ALL=C LANG=C \
+    WMUX_STAGING_INTERNAL_IDENTITY="$identity_file" WMUX_STAGING_LAUNCH_HEAD="$full_revision" \
+    WMUX_STAGING_PUBLISH_HOST="$publish_host" WMUX_STAGING_PUBLISH_PORT="$publish_port" \
+    WMUX_STAGING_PROJECT="$project" WMUX_STAGING_RUNTIME_ROOT="$runtime_root" \
+    WMUX_STAGING_WORKTREE_ROOT="$worktree_root" \
+    "$candidate_context/scripts/wmux-docker-staging" "$command_name"
+}
+
+exec_provisioned_launcher() {
+  node_cmd "$policy" validate-provision "$provision_file" >/dev/null || die "isolated provision validation failed; evidence retained"
+  isolated_repo=$(env_value "$provision_file" WMUX_ISOLATED_REPOSITORY)
+  candidate_context=$(env_value "$provision_file" WMUX_WORKTREE)
+  exec env -i PATH="$tool_path" HOME="${HOME:?HOME is required}" LC_ALL=C LANG=C \
+    WMUX_STAGING_INTERNAL_PROVISION="$provision_file" WMUX_STAGING_LAUNCH_HEAD="$full_revision" \
+    WMUX_STAGING_PUBLISH_HOST="$publish_host" WMUX_STAGING_PUBLISH_PORT="$publish_port" \
+    WMUX_STAGING_PROJECT="$project" WMUX_STAGING_RUNTIME_ROOT="$runtime_root" \
+    WMUX_STAGING_WORKTREE_ROOT="$worktree_root" \
+    "$candidate_context/scripts/wmux-docker-staging" "$command_name"
+}
+
+if [ -z "${WMUX_STAGING_INTERNAL_IDENTITY-}" ] && [ -z "${WMUX_STAGING_INTERNAL_PROVISION-}" ]; then
+  if [ -f "$identity_file" ]; then exec_committed_launcher; fi
+  if [ -f "$provision_file" ]; then
+    [ "$command_name" = down ] || die "incomplete staging provenance requires audited down; evidence retained"
+    exec_provisioned_launcher
+  fi
+  if [ -e "$runtime_dir" ]; then die "incomplete staging provenance exists without a valid identity; evidence retained"; fi
+  if [ "$command_name" = up ]; then
+    node_cmd "$policy" prepare-private-dir "$runtime_dir" || die "cannot create private staging runtime"
+    isolated_repo=$runtime_dir/repository.git
+    run_id=$(node_cmd "$policy" new-run-id) || die "cannot generate staging run identity"
+    candidate_context=$worktree_root/stage-$short_revision-$run_id
+    node_cmd "$policy" create-provision-metadata "$provision_file" "$isolated_repo" "$candidate_context" "$full_revision" \
+      || die "cannot record staging provision identity"
+    env -i PATH="$tool_path" HOME="${HOME:?HOME is required}" LC_ALL=C LANG=C \
+      GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_ATTR_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 \
+      GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 git -c core.hooksPath=/dev/null init -q --bare --template= "$isolated_repo" \
+      || die "cannot initialize isolated repository; evidence retained"
+    chmod -R go-rwx "$isolated_repo"
+    pack_base=$isolated_repo/objects/pack/pack
+    printf '%s\n' "$full_revision" | git_cmd pack-objects "$pack_base" --revs >/dev/null \
+      || die "cannot copy committed objects into isolated repository; evidence retained"
+    isolated_git cat-file -e "$full_revision^{commit}" || die "isolated repository lacks the pinned commit; evidence retained"
+    isolated_git update-ref refs/wmux/candidate "$full_revision" || die "cannot pin isolated candidate ref; evidence retained"
+    [ ! -e "$candidate_context" ] || die "generated staging worktree path already exists; evidence retained"
+    isolated_git worktree add --detach "$candidate_context" "$full_revision" >/dev/null \
+      || die "cannot create detached staging worktree; evidence retained"
+    node_cmd "$policy" secure-worktree "$candidate_context" || die "cannot secure staging worktree; evidence retained"
+    node_cmd "$policy" validate-worktree "$isolated_repo" "$candidate_context" "$full_revision" \
+      || die "detached worktree differs from pinned commit; evidence retained"
+    node_cmd "$policy" create-identity "$identity_file" "$isolated_repo" "$candidate_context" "$full_revision" "$launcher_blob" \
+      || die "cannot record isolated repository/worktree identity; evidence retained"
+    exec_committed_launcher
+  fi
+fi
+
+if [ -n "${WMUX_STAGING_INTERNAL_IDENTITY-}" ]; then
+  [ "$WMUX_STAGING_INTERNAL_IDENTITY" = "$identity_file" ] || die "internal identity path mismatch"
+  node_cmd "$policy" validate-identity "$identity_file" >/dev/null || die "isolated repository/worktree identity validation failed; evidence retained"
+  isolated_repo=$(env_value "$identity_file" WMUX_ISOLATED_REPOSITORY)
+  candidate_context=$(env_value "$identity_file" WMUX_WORKTREE)
+  full_revision=$(env_value "$identity_file" WMUX_BUILD_REVISION)
+  short_revision=$(printf '%s' "$full_revision" | cut -c1-12)
+  [ "$repo_root" = "$candidate_context" ] || die "committed launcher is not running from the recorded detached worktree"
+  [ "$(git_cmd rev-parse --verify HEAD)" = "$full_revision" ] || die "detached worktree HEAD drift"
+  [ "$(git_cmd symbolic-ref -q HEAD 2>/dev/null || true)" = "" ] || die "staging worktree is not detached"
+  [ "$(git_cmd hash-object --no-filters "$script_dir/wmux-docker-staging")" = "$(env_value "$identity_file" WMUX_SCRIPT_BLOB)" ] \
+    || die "re-executed staging launcher bytes drifted"
+elif [ -n "${WMUX_STAGING_INTERNAL_PROVISION-}" ]; then
+  [ "$WMUX_STAGING_INTERNAL_PROVISION" = "$provision_file" ] || die "internal provision path mismatch"
+  node_cmd "$policy" validate-provision "$provision_file" >/dev/null || die "isolated provision validation failed; evidence retained"
+  isolated_repo=$(env_value "$provision_file" WMUX_ISOLATED_REPOSITORY)
+  candidate_context=$(env_value "$provision_file" WMUX_WORKTREE)
+  full_revision=$(env_value "$provision_file" WMUX_BUILD_REVISION)
+  short_revision=$(printf '%s' "$full_revision" | cut -c1-12)
+  [ "$repo_root" = "$candidate_context" ] || die "provisioned launcher is not running from the detached worktree"
+fi
+
+lock_dir=$runtime_root/.lock-$project
+lock_owned=0
+inspect_output=
+docker_config=
+
+cleanup() {
+  [ -z "$inspect_output" ] || rm -f "$inspect_output"
+  if [ -n "$docker_config" ] && [ -d "$docker_config" ]; then
+    chmod 700 "$docker_config" 2>/dev/null || true
+    rmdir "$docker_config" 2>/dev/null || true
+  fi
+  if [ "$lock_owned" = 1 ]; then
+    rmdir "$lock_dir" 2>/dev/null || true
+    lock_owned=0
+  fi
+}
+
+mkdir "$lock_dir" 2>/dev/null || die "staging project $project is locked by another operation"
+lock_owned=1
+trap cleanup EXIT
+trap 'cleanup; trap - EXIT; exit 129' HUP
+trap 'cleanup; trap - EXIT; exit 130' INT
+trap 'cleanup; trap - EXIT; exit 143' TERM
+chmod 700 "$lock_dir"
+node_cmd "$policy" validate-private-dir "$lock_dir" || die "staging lock is unsafe"
+docker_config=$lock_dir/docker-config
+node_cmd "$policy" prepare-private-dir "$docker_config" || die "cannot create private Docker config"
+node_cmd "$policy" validate-empty-dir "$docker_config" || die "staging Docker config is not empty"
+chmod 500 "$docker_config"
+
+runtime_dir=$runtime_root/$project
+env_file=$runtime_dir/staging.env
+live_file=$runtime_dir/live.env
+[ -n "${candidate_context-}" ] || candidate_context=$runtime_dir/candidate
+base_url=http://$publish_host:$publish_port
+container_name=$project-wmux
+network_name=${project}_default
+legacy_volume_name=${project}_wmux-data
+
+docker_mode=
+docker_context=
+docker_endpoint=
+docker_engine_id=
+docker_selector=
+
+docker_direct() {
+  env -i PATH="$tool_path" HOME="${HOME:?HOME is required}" LC_ALL=C LANG=C \
+    DOCKER_CONFIG="$docker_config" DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 \
+    docker "$@"
+}
+
+docker_sudo() {
+  env -i PATH="$tool_path" HOME="${HOME:?HOME is required}" \
+    sudo -n env -i PATH="$tool_path" HOME=/root LC_ALL=C LANG=C \
+      DOCKER_CONFIG="$docker_config" DOCKER_BUILDKIT=1 COMPOSE_DOCKER_CLI_BUILD=1 \
+      docker "$@"
+}
+
+raw_docker() { if [ "$1" = sudo ]; then shift; docker_sudo "$@"; else shift; docker_direct "$@"; fi; }
+
+docker_cmd() {
+  if [ "$docker_mode" = sudo ]; then
+    if [ "$docker_selector" = host ]; then docker_sudo --host "$docker_endpoint" "$@"; else docker_sudo --context "$docker_context" "$@"; fi
+  elif [ "$docker_selector" = host ]; then
+    docker_direct --host "$docker_endpoint" "$@"
+  else
+    docker_direct --context "$docker_context" "$@"
+  fi
+}
+
+select_docker() {
+  docker_mode=
+  for probe_mode in direct sudo; do
+    probe_context=$(raw_docker "$probe_mode" context show 2>/dev/null) || continue
+    if [ -n "${DOCKER_HOST-}" ]; then
+      probe_selector=host
+      probe_endpoint=$DOCKER_HOST
+    else
+      probe_selector=context
+      probe_endpoint=$(raw_docker "$probe_mode" context inspect --format '{{(index .Endpoints "docker").Host}}' "$probe_context" 2>/dev/null) || continue
+    fi
+    case "$probe_endpoint" in unix:///*) ;; *) die "refusing non-local Docker endpoint for context $probe_context" ;; esac
+    docker_mode=$probe_mode
+    docker_context=$probe_context
+    docker_selector=$probe_selector
+    docker_endpoint=$probe_endpoint
+    docker_engine_id=$(docker_cmd info --format '{{.ID}}' 2>/dev/null) || docker_engine_id=
+    if [ -n "$docker_engine_id" ]; then
+      confirmed_engine=$(docker_cmd info --format '{{.ID}}' 2>/dev/null) || die "cannot confirm selected Docker engine"
+      [ "$confirmed_engine" = "$docker_engine_id" ] || die "Docker engine identity changed during selection"
+      return
+    fi
+    docker_mode=
+  done
+  die "Docker is unavailable directly and through sudo -n"
+}
+
+require_base_metadata() {
+  [ -f "$env_file" ] || die "staging project $project has no trusted base metadata"
+  node_cmd "$policy" validate-private-dir "$runtime_dir" || die "staging runtime directory is unsafe"
+  node_cmd "$policy" validate-metadata "$env_file" || die "staging base metadata is unsafe"
+  [ "$(env_value "$env_file" COMPOSE_PROJECT_NAME)" = "$project" ] || die "staging metadata project mismatch"
+  [ "$(env_value "$env_file" WMUX_PUBLISH_HOST)" = "$publish_host" ] || die "staging publish host mismatch"
+  [ "$(env_value "$env_file" WMUX_PUBLISH_PORT)" = "$publish_port" ] || die "staging publish port mismatch"
+}
+
+require_live_metadata() {
+  [ -f "$live_file" ] || die "staging project $project has no trusted live metadata"
+  node_cmd "$policy" validate-metadata "$live_file" || die "staging live metadata is unsafe"
+  [ "$(env_value "$live_file" WMUX_CONTAINER_NAME)" = "$container_name" ] || die "recorded container name mismatch"
+  [ "$(env_value "$live_file" WMUX_NETWORK_NAME)" = "$network_name" ] || die "recorded network name mismatch"
+}
+
+require_daemon_identity() {
+  select_docker
+  [ "$(env_value "$env_file" WMUX_DOCKER_MODE)" = "$docker_mode" ] || die "Docker access mode differs from metadata"
+  [ "$(env_value "$env_file" WMUX_DOCKER_CONTEXT)" = "$docker_context" ] || die "Docker context differs from metadata"
+  [ "$(env_value "$env_file" WMUX_DOCKER_ENDPOINT)" = "$docker_endpoint" ] || die "Docker endpoint differs from metadata"
+  [ "$(env_value "$env_file" WMUX_DOCKER_ENGINE_ID)" = "$docker_engine_id" ] || die "Docker engine ID differs from metadata"
+  if [ -f "$live_file" ]; then
+    [ "$(env_value "$live_file" WMUX_LIVE_DOCKER_MODE)" = "$docker_mode" ] || die "post-up Docker access mode differs"
+    [ "$(env_value "$live_file" WMUX_LIVE_DOCKER_CONTEXT)" = "$docker_context" ] || die "post-up Docker context differs"
+    [ "$(env_value "$live_file" WMUX_LIVE_DOCKER_ENDPOINT)" = "$docker_endpoint" ] || die "post-up Docker endpoint differs"
+    [ "$(env_value "$live_file" WMUX_LIVE_DOCKER_ENGINE_ID)" = "$docker_engine_id" ] || die "post-up Docker engine ID differs"
+  fi
+}
+
+compose() {
+  docker_cmd compose --project-name "$project" --env-file "$env_file" \
+    -f "$candidate_context/deploy/docker/docker-compose.staging.yml" "$@"
+}
+
+query_resources() {
+  project_containers=$(docker_cmd ps -aq --no-trunc --filter "label=com.docker.compose.project=$project") || die "failed to query project containers"
+  exact_containers=$(docker_cmd ps -aq --no-trunc --filter "name=^/${container_name}$") || die "failed to query exact container name"
+  project_networks=$(docker_cmd network ls -q --no-trunc --filter "label=com.docker.compose.project=$project") || die "failed to query project networks"
+  exact_networks=$(docker_cmd network ls -q --no-trunc --filter "name=^${network_name}$") || die "failed to query exact network name"
+  project_volumes=$(docker_cmd volume ls -q --filter "label=com.docker.compose.project=$project") || die "failed to query project volumes"
+  exact_volumes=$(docker_cmd volume ls -q --filter "name=^${legacy_volume_name}$") || die "failed to query forbidden exact volume name"
+}
+
+resources_exist() { [ -n "$project_containers$exact_containers$project_networks$exact_networks$project_volumes$exact_volumes" ]; }
+
+require_unused_project() {
+  query_resources
+  resources_exist && die "Docker resources already exist for $project without complete trusted metadata"
+  return 0
+}
+
+validate_candidate() {
+  [ "$(env_value "$env_file" WMUX_BUILD_CONTEXT)" = "$candidate_context" ] || die "candidate context path mismatch"
+  [ "$(env_value "$env_file" WMUX_IDENTITY_PATH)" = "$identity_file" ] || die "candidate identity path mismatch"
+  [ "$(env_value "$env_file" WMUX_BUILD_REVISION)" = "$full_revision" ] || die "candidate revision mismatch"
+  node_cmd "$policy" validate-identity "$identity_file" >/dev/null || die "candidate identity validation failed; evidence retained"
+  node_cmd "$policy" validate-worktree "$isolated_repo" "$candidate_context" "$full_revision" \
+    || die "candidate worktree validation failed"
+  node_cmd "$policy" validate-dockerfile "$candidate_context/deploy/docker/Dockerfile" \
+    || die "candidate Dockerfile validation failed"
+}
+
+clean_candidate() {
+  git_cmd clean -ffdx >/dev/null || die "failed to clean detached candidate worktree"
+  validate_candidate
+}
+
+clean_materialized_candidate() {
+  git_cmd clean -ffdx >/dev/null || die "failed to clean detached candidate worktree"
+  node_cmd "$policy" validate-worktree "$isolated_repo" "$candidate_context" "$full_revision" \
+    || die "candidate worktree validation failed"
+  node_cmd "$policy" validate-dockerfile "$candidate_context/deploy/docker/Dockerfile" \
+    || die "candidate Dockerfile validation failed"
+}
+
+validate_compose() {
+  compose config --format json | node_cmd "$policy" validate-compose \
+    "$project" "$candidate_context" "$publish_host" "$publish_port" \
+    "$(env_value "$env_file" WMUX_IMAGE)" "$(env_value "$env_file" WMUX_BUILD_REVISION)" \
+    "$(env_value "$env_file" WMUX_BUILD_VERSION)" "$base_url" "$env_file" \
+    || die "dedicated staging Compose policy validation failed"
+}
+
+validate_image() {
+  image_id=$1
+  docker_cmd image inspect --format '{"Id":{{json .Id}},"Labels":{{json .Config.Labels}}}' "$image_id" \
+    | node_cmd "$policy" validate-image "$image_id" "$(env_value "$env_file" WMUX_BUILD_REVISION)" \
+    || die "staging image identity validation failed"
+}
+
+validate_live_values() {
+  recorded_container_id=$1
+  recorded_network_id=$2
+  recorded_image_id=$3
+  query_resources
+  [ -z "$project_volumes$exact_volumes" ] || die "staging project has a forbidden Docker volume"
+  [ "$project_containers" = "$exact_containers" ] && [ "$exact_containers" = "$recorded_container_id" ] || die "container ID/inventory substitution detected"
+  [ "$project_networks" = "$exact_networks" ] && [ "$exact_networks" = "$recorded_network_id" ] || die "network ID/inventory substitution detected"
+  inspect_output=$(mktemp "$runtime_dir/.inspect.XXXXXX")
+  docker_cmd inspect --format '{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Config":{"Image":{{json .Config.Image}},"Labels":{{json .Config.Labels}},"User":{{json .Config.User}}},"HostConfig":{"Binds":{{json .HostConfig.Binds}},"CapDrop":{{json .HostConfig.CapDrop}},"DeviceRequests":{{json .HostConfig.DeviceRequests}},"Devices":{{json .HostConfig.Devices}},"IpcMode":{{json .HostConfig.IpcMode}},"LogConfig":{{json .HostConfig.LogConfig}},"Memory":{{json .HostConfig.Memory}},"MemorySwap":{{json .HostConfig.MemorySwap}},"NanoCpus":{{json .HostConfig.NanoCpus}},"NetworkMode":{{json .HostConfig.NetworkMode}},"PidMode":{{json .HostConfig.PidMode}},"PidsLimit":{{json .HostConfig.PidsLimit}},"PortBindings":{{json .HostConfig.PortBindings}},"Privileged":{{json .HostConfig.Privileged}},"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"RestartPolicy":{{json .HostConfig.RestartPolicy}},"SecurityOpt":{{json .HostConfig.SecurityOpt}},"Tmpfs":{{json .HostConfig.Tmpfs}},"VolumesFrom":{{json .HostConfig.VolumesFrom}}},"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}}},"Mounts":{{json .Mounts}}}' "$recorded_container_id" >"$inspect_output" \
+    || die "cannot inspect recorded staging container"
+  node_cmd "$policy" validate-container "$project" "$publish_host" "$publish_port" \
+    "$(env_value "$env_file" WMUX_IMAGE)" "$(env_value "$env_file" WMUX_BUILD_REVISION)" \
+    "$recorded_container_id" "$recorded_network_id" "$recorded_image_id" <"$inspect_output" \
+    || die "live staging container policy validation failed"
+  rm -f "$inspect_output"; inspect_output=
+  docker_cmd network inspect --format '{"Driver":{{json .Driver}},"Id":{{json .Id}},"Internal":{{json .Internal}},"Labels":{{json .Labels}},"Name":{{json .Name}},"Options":{{json .Options}}}' "$recorded_network_id" \
+    | node_cmd "$policy" validate-network "$project" "$recorded_network_id" \
+    || die "live staging network policy validation failed"
+  validate_image "$recorded_image_id"
+  runtime_uid=$(docker_cmd exec "$recorded_container_id" node -p 'process.getuid?.()') || die "cannot verify staging uid"
+  [ "$runtime_uid" = 1000 ] || die "staging process is not uid 1000"
+}
+
+validate_live_policy() {
+  require_live_metadata
+  validate_live_values \
+    "$(env_value "$live_file" WMUX_CONTAINER_ID)" \
+    "$(env_value "$live_file" WMUX_NETWORK_ID)" \
+    "$(env_value "$live_file" WMUX_IMAGE_ID)"
+}
+
+create_candidate() {
+  [ -f "$identity_file" ] && [ -f "$provision_file" ] && [ ! -e "$env_file" ] && [ ! -e "$live_file" ] \
+    || die "incomplete staging runtime already exists"
+  clean_materialized_candidate
+  node_cmd "$policy" create-metadata "$env_file" \
+    "$project" "wmux-staging:$full_revision" "staging-$short_revision" "$full_revision" \
+    "$candidate_context" "$identity_file" "$publish_host" "$publish_port" "$base_url" \
+    "$docker_mode" "$docker_context" "$docker_endpoint" "$docker_engine_id" \
+    || die "failed to create exclusive staging metadata"
+}
+
+record_live_metadata() {
+  query_resources
+  [ -z "$project_volumes$exact_volumes" ] || die "staging up created a forbidden Docker volume"
+  [ -n "$exact_containers" ] && [ "$project_containers" = "$exact_containers" ] || die "staging container inventory mismatch after up"
+  [ -n "$exact_networks" ] && [ "$project_networks" = "$exact_networks" ] || die "staging network inventory mismatch after up"
+  image_id=$(docker_cmd inspect --format '{{.Image}}' "$exact_containers") || die "cannot resolve candidate image ID"
+  validate_live_values "$exact_containers" "$exact_networks" "$image_id"
+  node_cmd "$policy" create-live-metadata "$live_file" \
+    "$exact_containers" "$exact_networks" "$image_id" "$container_name" "$network_name" \
+    "$docker_mode" "$docker_context" "$docker_endpoint" "$docker_engine_id" \
+    || die "failed to create exclusive live metadata"
+}
+
+remove_runtime() { [ ! -d "$runtime_dir" ] || node_cmd "$policy" remove-private-tree "$runtime_dir" || die "refusing to remove unsafe staging runtime"; }
+
+run_smoke() {
+  require_base_metadata
+  require_live_metadata
+  validate_candidate
+  require_daemon_identity
+  validate_live_policy
+  recorded_container_id=$(env_value "$live_file" WMUX_CONTAINER_ID)
+  health_status=$(docker_cmd inspect --format '{{.State.Health.Status}}' "$recorded_container_id")
+  [ "$health_status" = healthy ] || die "staging container is not healthy"
+  node_cmd "$smoke_helper" "$base_url" "$env_file" "$full_revision" || die "bounded staging HTTP smoke failed"
+  printf '%s\n' "staging smoke passed for $project at $base_url"
+}
+
+case "$command_name" in
+  up)
+    select_docker
+    if [ -f "$env_file" ]; then
+      require_base_metadata
+      [ "$(env_value "$env_file" WMUX_BUILD_REVISION)" = "$full_revision" ] || die "staging project belongs to another revision"
+      validate_candidate
+      require_daemon_identity
+      if [ -f "$live_file" ]; then validate_live_policy; printf '%s\n' "staging project $project is already up at $base_url"; exit 0; fi
+      require_unused_project
+    else
+      require_unused_project
+      create_candidate
+      require_base_metadata
+    fi
+    validate_compose
+    clean_candidate
+    compose up -d --build --wait --wait-timeout 180
+    record_live_metadata
+    printf '%s\n' "staging project $project is up at $base_url"
+    ;;
+  status)
+    select_docker
+    if [ ! -f "$env_file" ] || [ ! -f "$live_file" ]; then require_unused_project; printf '%s\n' "staging project $project is not initialized"; exit 0; fi
+    require_base_metadata; require_live_metadata; require_daemon_identity; validate_live_policy; compose ps
+    ;;
+  smoke) run_smoke ;;
+  e2e)
+    clean_candidate
+    run_smoke
+    [ "${WMUX_STAGING_LAUNCH_HEAD-}" = "$full_revision" ] || die "E2E launcher HEAD does not equal WMUX_BUILD_REVISION"
+    npm_home=$runtime_dir/npm-home
+    npm_cache=$runtime_dir/npm-cache
+    node_cmd "$policy" prepare-private-dir "$npm_home" || die "cannot create private E2E npm home"
+    node_cmd "$policy" prepare-private-dir "$npm_cache" || die "cannot create private E2E npm cache"
+    install_status=0
+    (
+      cd "$candidate_context"
+      exec env -i PATH="$tool_path" HOME="$npm_home" npm_config_cache="$npm_cache" LC_ALL=C LANG=C \
+        npm ci --ignore-scripts --no-audit --no-fund
+    ) || install_status=$?
+    if [ "$install_status" -ne 0 ]; then
+      if [ -d "$candidate_context/node_modules" ]; then
+        node_cmd "$policy" validate-dependency-worktree "$isolated_repo" "$candidate_context" "$full_revision" \
+          || die "failed dependency install left unsafe worktree drift; evidence retained"
+      fi
+      clean_candidate
+      die "candidate dependency install failed with status $install_status"
+    fi
+    node_cmd "$policy" validate-e2e-worktree "$isolated_repo" "$candidate_context" "$full_revision" \
+      || die "candidate E2E dependency validation failed; evidence retained"
+    dependency_digest=$(node_cmd "$policy" dependency-digest "$isolated_repo" "$candidate_context" "$full_revision") \
+      || die "cannot bind candidate E2E dependency identity"
+    token=$(env_value "$env_file" WMUX_TOKEN); registration_token=$(env_value "$env_file" WMUX_REGISTRATION_TOKEN)
+    e2e_status=0
+    (
+      cd "$candidate_context"
+      exec env -i PATH="$candidate_context/node_modules/.bin:$tool_path" HOME="$npm_home" LC_ALL=C LANG=C \
+        PLAYWRIGHT_BROWSERS_PATH="${HOME:?HOME is required}/.cache/ms-playwright" \
+        NO_PROXY='*' no_proxy='*' WMUX_BUILD_REVISION="$full_revision" WMUX_E2E_BASE_URL="$base_url" \
+        WMUX_E2E_TOKEN="$token" WMUX_E2E_REGISTRATION_TOKEN="$registration_token" \
+        "$candidate_context/node_modules/.bin/playwright" test --config=playwright.browser.config.ts \
+          --project=chromium --project=mobile-chromium --output="$runtime_dir/e2e-results"
+    ) || e2e_status=$?
+    node_cmd "$policy" validate-e2e-worktree "$isolated_repo" "$candidate_context" "$full_revision" \
+      || die "candidate E2E changed source or dependency boundaries; evidence retained"
+    [ "$(node_cmd "$policy" dependency-digest "$isolated_repo" "$candidate_context" "$full_revision")" = "$dependency_digest" ] \
+      || die "candidate E2E dependency tree changed while credentials were present; evidence retained"
+    clean_candidate
+    [ "$e2e_status" -eq 0 ] || die "browser E2E failed with status $e2e_status"
+    ;;
+  down)
+    select_docker
+    if [ ! -f "$env_file" ] || [ ! -f "$live_file" ]; then
+      require_unused_project
+      if [ -f "$identity_file" ]; then
+        node_cmd "$policy" remove-audited-stage "$identity_file" "$runtime_dir" \
+          || die "isolated Git cleanup audit failed; evidence retained"
+      elif [ -f "$provision_file" ]; then
+        node_cmd "$policy" remove-audited-provision "$provision_file" "$runtime_dir" \
+          || die "isolated provision cleanup audit failed; evidence retained"
+      else
+        remove_runtime
+      fi
+      printf '%s\n' "staging project $project is already down"; exit 0
+    fi
+    require_base_metadata; require_live_metadata; require_daemon_identity
+    validate_live_policy
+    recorded_container_id=$(env_value "$live_file" WMUX_CONTAINER_ID)
+    recorded_network_id=$(env_value "$live_file" WMUX_NETWORK_ID)
+    recorded_image_id=$(env_value "$live_file" WMUX_IMAGE_ID)
+    validate_live_policy
+    compose down --remove-orphans
+    query_resources
+    resources_exist && die "staging resources remain after exact teardown; metadata retained"
+    if docker_cmd inspect "$recorded_container_id" >/dev/null 2>&1; then die "recorded container ID remains after teardown"; fi
+    if docker_cmd network inspect "$recorded_network_id" >/dev/null 2>&1; then die "recorded network ID remains after teardown"; fi
+    validate_image "$recorded_image_id"
+    validate_candidate
+    node_cmd "$policy" validate-identity "$identity_file" >/dev/null || die "cleanup identity audit failed; evidence retained"
+    node_cmd "$policy" remove-audited-stage "$identity_file" "$runtime_dir" \
+      || die "isolated Git cleanup audit failed; evidence retained"
+    printf '%s\n' "staging project $project was removed; candidate image retained"
+    ;;
+  url) require_base_metadata; printf '%s\n' "$base_url" ;;
+  config-path) require_base_metadata; printf '%s\n' "$env_file" ;;
+esac

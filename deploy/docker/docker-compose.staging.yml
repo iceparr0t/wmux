@@ -1,0 +1,62 @@
+services:
+  wmux:
+    container_name: "${COMPOSE_PROJECT_NAME:?COMPOSE_PROJECT_NAME is required}-wmux"
+    image: "${WMUX_IMAGE:?WMUX_IMAGE is required}"
+    build:
+      context: "${WMUX_BUILD_CONTEXT:?WMUX_BUILD_CONTEXT is required}"
+      dockerfile: deploy/docker/Dockerfile
+      args:
+        WMUX_VERSION: "${WMUX_BUILD_VERSION:?WMUX_BUILD_VERSION is required}"
+        WMUX_REVISION: "${WMUX_BUILD_REVISION:?WMUX_BUILD_REVISION is required}"
+        HTTP_PROXY: ""
+        HTTPS_PROXY: ""
+        NO_PROXY: ""
+        ALL_PROXY: ""
+        FTP_PROXY: ""
+        http_proxy: ""
+        https_proxy: ""
+        no_proxy: ""
+        all_proxy: ""
+        ftp_proxy: ""
+    init: true
+    user: node
+    privileged: false
+    read_only: true
+    restart: "no"
+    pid: private
+    ipc: private
+    pids_limit: 512
+    cpus: 2.0
+    mem_limit: 1g
+    memswap_limit: 1g
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      WMUX_PUBLISH_HOST: "${WMUX_PUBLISH_HOST:?WMUX_PUBLISH_HOST is required}"
+      WMUX_HOST: ""
+      WMUX_PORT: "3478"
+      WMUX_PUBLIC_URL: "${WMUX_PUBLIC_URL:?WMUX_PUBLIC_URL is required}"
+      WMUX_TOKEN: "${WMUX_TOKEN:?WMUX_TOKEN is required}"
+      WMUX_REGISTRATION_TOKEN: "${WMUX_REGISTRATION_TOKEN:?WMUX_REGISTRATION_TOKEN is required}"
+      WMUX_BROWSER_AUTH_MODE: shared-or-login
+    ports:
+      - "${WMUX_PUBLISH_HOST:?WMUX_PUBLISH_HOST is required}:${WMUX_PUBLISH_PORT:?WMUX_PUBLISH_PORT is required}:3478"
+    tmpfs:
+      - /home/node/.wmux:rw,nosuid,nodev,mode=0700,size=256m,uid=1000,gid=1000
+      - /tmp:rw,nosuid,nodev,noexec,mode=1777,size=64m,uid=1000,gid=1000
+      - /run:rw,nosuid,nodev,noexec,mode=0755,size=8m,uid=1000,gid=1000
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
+    networks:
+      - default
+
+networks:
+  default:
+    name: "${COMPOSE_PROJECT_NAME:?COMPOSE_PROJECT_NAME is required}_default"
+    driver: bridge
+    internal: true

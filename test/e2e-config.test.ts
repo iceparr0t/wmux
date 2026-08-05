@@ -3,6 +3,7 @@ import http from "node:http";
 import { test } from "node:test";
 import {
   deriveExternalE2eRegistrationToken,
+  resolveExternalE2eRegistrationToken,
   resolveExternalE2eToken,
 } from "../e2e/config-auth.js";
 import { defaultE2ePort, resolveE2ePort } from "../e2e/config-port.js";
@@ -36,6 +37,10 @@ test("external E2E requires a bounded per-run authentication secret", () => {
   const registrationToken = deriveExternalE2eRegistrationToken(token);
   assert.match(registrationToken, /^[\x21-\x7e]+$/);
   assert.notEqual(registrationToken, token);
+  const independentRegistrationToken = "r".repeat(64);
+  assert.equal(resolveExternalE2eRegistrationToken(token, independentRegistrationToken), independentRegistrationToken);
+  assert.throws(() => resolveExternalE2eRegistrationToken(token, token), /distinct/);
+  assert.throws(() => resolveExternalE2eRegistrationToken(token, "short"), /WMUX_E2E_REGISTRATION_TOKEN/);
 });
 
 test("external E2E API auth stays in a same-origin redirect-refusing native adapter", async () => {

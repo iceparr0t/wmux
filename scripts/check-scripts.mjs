@@ -56,6 +56,8 @@ run(python.command, [
 });
 
 for (const script of [
+  "deploy/docker/docker-staging-policy.mjs",
+  "deploy/docker/docker-staging-smoke.mjs",
   "scripts/wmux-hooks",
   "scripts/wmux-agent-input-broker",
   "scripts/wmux-moonlight-gateway",
@@ -78,3 +80,5 @@ run("bash", [
   "scripts/wmux-title",
   "scripts/wmuxctl",
 ]);
+
+run("sh", ["-n", "scripts/wmux-docker-staging"]);
