@@ -160,7 +160,8 @@ if [ "$1 $2" = 'image inspect' ] && [ "$5" = '${runnerImage}' ]; then
 fi
 if [ "$1" = create ]; then
   ctl runner-create-fail && exit 74
-  previous=; for arg in "$@"; do
+  interactive=0; previous=; for arg in "$@"; do
+    [ "$arg" != --interactive ] || interactive=1
     case "$previous" in
       --name) printf '%s' "$arg" >"$STATE/runner-name";; --user) printf '%s' "$arg" >"$STATE/runner-user";;
       --mount) source=\${arg#*src=}; source=\${source%%,*}; case "$arg" in *dst=/workspace,*) printf '%s' "$source" >"$STATE/runner-context";; *dst=/runner-bootstrap,*) printf '%s' "$source" >"$STATE/runner-bootstrap";; esac;;
@@ -168,9 +169,19 @@ if [ "$1" = create ]; then
     esac
     previous=$arg
   done
+  [ "$interactive" = 1 ] || exit 78
   touch "$STATE/runner"; printf '${runnerContainerId}\n' >"$STATE/runner-id"; printf '${runnerContainerId}\n'; exit
 fi
 if [ "$1" = start ]; then
+  [ "$#" = 2 ] && [ "$2" = '${runnerContainerId}' ] || exit 76
+  ctl runner-start-fail && exit 74
+  touch "$STATE/runner-started"
+  printf '${runnerContainerId}\n'
+  exit 0
+fi
+if [ "$1" = attach ]; then
+  [ "$#" = 3 ] && [ "$2" = --no-stdin=false ] && [ "$3" = '${runnerContainerId}' ] || exit 76
+  has runner-started && has runner-post-inspected || exit 79
   IFS= read -r token || exit 74; IFS= read -r registration || exit 75
   if ctl runner-token-log; then printf '%s\n' "$token"; fi
   if ctl runner-result-token; then printf '%s' "$registration" >"$STATE/runner-result-secret"; fi
@@ -179,16 +190,25 @@ if [ "$1" = start ]; then
   ctl e2e-config-drift && chmod 700 "$context/playwright.browser.config.ts"
   ctl e2e-dependency-drift && printf 'drift\n' >"$context/node_modules/fake/drift"
   ctl runner-timeout && sleep 5
-  ctl runner-fail && exit 42
+  ctl runner-attach-fail && exit 73
   printf 'browser suite passed\n'; exit 0
 fi
+if [ "$1" = wait ]; then
+  [ "$#" = 2 ] && [ "$2" = '${runnerContainerId}' ] || exit 76
+  has runner-started || exit 79
+  ctl runner-wait-fail && exit 73
+  ctl runner-wait-timeout && sleep 5
+  ctl runner-fail && printf '42\n' || printf '0\n'
+  exit 0
+fi
 if [ "$1" = cp ]; then
+  [ "$2" = '${runnerContainerId}:/tmp/e2e-results/.' ] || exit 76
   if ctl runner-result-token; then /bin/cat "$STATE/runner-result-secret"; else printf 'safe-result-archive'; fi
   exit 0
 fi
 if [ "$1" = rm ] && [ "$2" = -f ]; then
   [ "$3" = '${runnerContainerId}' ] || exit 76
-  rm -f "$STATE/runner-id"
+  rm -f "$STATE/runner-id" "$STATE/runner-started" "$STATE/runner-pre-inspected" "$STATE/runner-post-inspected"
   ctl runner-name-substituted || rm -f "$STATE/runner"
   exit 0
 fi
@@ -213,12 +233,48 @@ if [ "$1" = inspect ]; then
     exit 0
   fi
   if [ "$4" = '${runnerContainerId}' ]; then
-    node -e 'const fs=require("node:fs"),s=process.argv[1],control=process.argv[2];const get=n=>fs.readFileSync(s+"/runner-"+n,"utf8");const [uid,gid]=get("user").split(":").map(Number);const p=fs.readFileSync(s+"/project","utf8"),r=get("revision"),name=get("name"),url=get("url"),ctx=get("context"),boot=get("bootstrap"),net=p+"_default";const hm=[{Type:"bind",Source:ctx,Target:"/workspace",ReadOnly:true},{Type:"bind",Source:boot,Target:"/runner-bootstrap",ReadOnly:true}];const mounts=[{Type:"bind",Source:ctx,Destination:"/workspace",Mode:"ro",RW:false,Propagation:"rprivate"},{Type:"bind",Source:boot,Destination:"/runner-bootstrap",Mode:"ro",RW:false,Propagation:"rprivate"}];const opt=(mode,size)=>"rw,nosuid,nodev,noexec,mode="+mode+",size="+size+",uid="+uid+",gid="+gid;const h={Binds:null,CapDrop:["ALL"],DeviceRequests:null,Devices:[],IpcMode:"private",Init:true,LogConfig:{Type:"local",Config:{"max-file":"1","max-size":"4m"}},Memory:2147483648,MemorySwap:2147483648,Mounts:hm,NanoCpus:2000000000,NetworkMode:net,PidMode:"",PidsLimit:512,PortBindings:{},Privileged:false,ReadonlyRootfs:true,RestartPolicy:{Name:"no"},SecurityOpt:["no-new-privileges:true"],ShmSize:536870912,Tmpfs:{"/home/wmux":opt("700",134217728),"/tmp":opt("1777",536870912),"/run":opt("755",8388608)},UsernsMode:"",VolumesFrom:null};const labels={"org.opencontainers.image.revision":r,"wmux.staging.e2e":"true","wmux.staging.project":p};const env=["PATH=/usr/bin:/bin","PLAYWRIGHT_BROWSERS_PATH=/ms-playwright","HOME=/home/wmux","TMPDIR=/tmp","XDG_CACHE_HOME=/home/wmux/.cache","WMUX_BUILD_REVISION="+r,"WMUX_E2E_BASE_URL="+url];const value={Id:"${runnerContainerId}",Image:"${runnerImageId}",Name:"/"+name,Config:{Cmd:["run"],Entrypoint:["/runner-bootstrap"],Env:env,Image:"${runnerImage}",Labels:labels,User:get("user"),WorkingDir:"/workspace"},HostConfig:h,NetworkSettings:{Networks:{[net]:{NetworkID:"${networkId}"}},Ports:{}},Mounts:mounts};if(control==="privileged")h.Privileged=true;if(control==="host-pid")h.PidMode="host";if(control==="device")h.Devices=[{PathOnHost:"/dev/null"}];if(control==="mount")hm[0].Source="/etc";if(control==="network")h.NetworkMode="host";if(control==="port")h.PortBindings={"80/tcp":[{HostPort:"80"}]};if(control==="limit")h.Memory=0;if(control==="token-env")value.Config.Env.push("WMUX_E2E_TOKEN=forbidden");process.stdout.write(JSON.stringify(value))' "$STATE" "$(for control in privileged host-pid device mount network port limit token-env; do ctl runner-inspect-$control && { printf '%s' "$control"; break; }; done)"; exit
+    started=0; has runner-started && started=1
+    post=0; case "$3" in *'"State"'*) post=1;; esac
+    [ "$post" = "$started" ] || exit 79
+    node -e '
+      const fs=require("node:fs"),s=process.argv[1],post=process.argv[2]==="1";
+      const get=n=>fs.readFileSync(s+"/runner-"+n,"utf8"),ctl=n=>fs.existsSync(s+"/control-"+n);
+      const [uid,gid]=get("user").split(":").map(Number),p=fs.readFileSync(s+"/project","utf8"),r=get("revision");
+      const name=get("name"),url=get("url"),ctx=get("context"),boot=get("bootstrap"),net=p+"_default";
+      const hm=[{Type:"bind",Source:ctx,Target:"/workspace",ReadOnly:true},{Type:"bind",Source:boot,Target:"/runner-bootstrap",ReadOnly:true}];
+      const mounts=[{Type:"bind",Source:ctx,Destination:"/workspace",Mode:"ro",RW:false,Propagation:"rprivate"},{Type:"bind",Source:boot,Destination:"/runner-bootstrap",Mode:"ro",RW:false,Propagation:"rprivate"}];
+      const opt=(mode,size)=>"rw,nosuid,nodev,noexec,mode="+mode+",size="+size+",uid="+uid+",gid="+gid;
+      const h={Binds:null,CapDrop:["ALL"],DeviceRequests:null,Devices:[],IpcMode:"private",Init:true,LogConfig:{Type:"local",Config:{"max-file":"1","max-size":"4m"}},Memory:2147483648,MemorySwap:2147483648,Mounts:hm,NanoCpus:2000000000,NetworkMode:net,PidMode:"",PidsLimit:512,PortBindings:{},Privileged:false,ReadonlyRootfs:true,RestartPolicy:{Name:"no"},SecurityOpt:["no-new-privileges:true"],ShmSize:536870912,Tmpfs:{"/home/wmux":opt("700",134217728),"/tmp":opt("1777",536870912),"/run":opt("755",8388608)},UsernsMode:"",VolumesFrom:null};
+      const labels={"org.opencontainers.image.revision":r,"wmux.staging.e2e":"true","wmux.staging.project":p};
+      const env=["PATH=/usr/bin:/bin","PLAYWRIGHT_BROWSERS_PATH=/ms-playwright","HOME=/home/wmux","TMPDIR=/tmp","XDG_CACHE_HOME=/home/wmux/.cache","WMUX_BUILD_REVISION="+r,"WMUX_E2E_BASE_URL="+url];
+      const early=ctl("runner-prestart-network-realized");
+      let networkId=post||early?"${networkId}":"";
+      if(!post&&ctl("runner-prestart-network-drift"))networkId="${"f".repeat(64)}";
+      const value={Id:"${runnerContainerId}",Image:"${runnerImageId}",Name:"/"+name,Config:{Cmd:["run"],Entrypoint:["/runner-bootstrap"],Env:env,Image:"${runnerImage}",Labels:labels,OpenStdin:true,StdinOnce:false,Tty:false,User:get("user"),WorkingDir:"/workspace"},HostConfig:h,NetworkSettings:{Networks:{[net]:{NetworkID:networkId}},Ports:{}},Mounts:mounts};
+      if(post)value.State={Dead:false,Error:"",ExitCode:0,FinishedAt:"0001-01-01T00:00:00Z",OOMKilled:false,Paused:false,Pid:1234,Restarting:false,Running:true,StartedAt:"2026-08-05T12:00:00.000000000Z",Status:"running"};
+      if(ctl("runner-inspect-privileged"))h.Privileged=true;
+      if(ctl("runner-inspect-host-pid"))h.PidMode="host";
+      if(ctl("runner-inspect-device"))h.Devices=[{PathOnHost:"/dev/null"}];
+      if(ctl("runner-inspect-mount")){h.Mounts.push({Type:"bind",Source:"/etc",Target:"/host",ReadOnly:true});mounts.push({Type:"bind",Source:"/etc",Destination:"/host",Mode:"ro",RW:false,Propagation:"rprivate"});}
+      if(ctl("runner-inspect-network"))value.NetworkSettings.Networks.extra={NetworkID:"${networkId}"};
+      if(ctl("runner-inspect-port")){h.PortBindings={"8080/tcp":[{HostIp:"0.0.0.0",HostPort:"8080"}]};value.NetworkSettings.Ports={"8080/tcp":[{HostIp:"0.0.0.0",HostPort:"8080"}]};}
+      if(ctl("runner-inspect-limit"))h.PidsLimit=1024;
+      if(ctl("runner-inspect-token-env"))env.push("WMUX_E2E_TOKEN=metadata-secret");
+      if(post&&ctl("runner-post-inspect-identity"))value.Name="/substituted";
+      if(post&&ctl("runner-post-inspect-config"))value.Config.OpenStdin=false;
+      if(post&&ctl("runner-post-inspect-mount"))mounts[0].Source="/substituted";
+      if(post&&ctl("runner-post-inspect-resource"))h.Memory=0;
+      if(post&&ctl("runner-post-inspect-network"))value.NetworkSettings.Networks[net].NetworkID="";
+      if(post&&ctl("runner-post-inspect-state"))value.State.Running=false;
+      process.stdout.write(JSON.stringify(value));
+    ' "$STATE" "$post"
+    if [ "$post" = 0 ]; then touch "$STATE/runner-pre-inspected"; else touch "$STATE/runner-post-inspected"; fi
+    exit
   fi
   case "$3" in *State.Health.Status*) printf 'healthy\n';; *'{{.Image}}'*) printf '${imageId}\n';; *'"HostConfig"'*)
     node -e 'const [cid,nid,iid,p,r,host,port,portMode]=process.argv.slice(1);const binding=[{HostIp:host,HostPort:port}];const h={Binds:null,CapDrop:["ALL"],DeviceRequests:null,Devices:[],IpcMode:"private",LogConfig:{Type:"local",Config:{"max-file":"3","max-size":"10m"}},Memory:1073741824,MemorySwap:1073741824,NanoCpus:2000000000,NetworkMode:p+"_default",PidMode:"",PidsLimit:512,PortBindings:{"3478/tcp":binding},Privileged:false,ReadonlyRootfs:true,RestartPolicy:{Name:"no"},SecurityOpt:["no-new-privileges:true"],Tmpfs:{"/home/node/.wmux":"rw,nosuid,nodev,mode=700,size=268435456,uid=1000,gid=1000","/tmp":"rw,nosuid,nodev,noexec,mode=1777,size=67108864,uid=1000,gid=1000","/run":"rw,nosuid,nodev,noexec,mode=755,size=8388608,uid=1000,gid=1000"},VolumesFrom:null};process.stdout.write(JSON.stringify({Id:cid,Image:iid,Name:"/"+p+"-wmux",Config:{Image:"wmux-staging:"+r,Labels:{"com.docker.compose.project":p,"com.docker.compose.service":"wmux","org.opencontainers.image.revision":r},User:"node"},HostConfig:h,NetworkSettings:{Networks:{[p+"_default"]:{NetworkID:nid}},Ports:portMode==="null"?null:{"3478/tcp":binding}},Mounts:[]}))' "$cid" "$nid" "$iid" "$project" "$revision" "$host" "$port" "$(ctl null-realized-ports && printf null || printf bound)";; esac; exit
 fi
-if [ "$1 $2" = 'network inspect' ]; then if [ "$3" != --format ]; then has network; exit; fi; printf '{"Attachable":false,"Driver":"bridge","Id":"%s","Internal":false,"Labels":{"com.docker.compose.project":"%s","com.docker.compose.network":"default"},"Name":"%s_default","Options":{}}\n' "$nid" "$project" "$project"; exit; fi
+if [ "$1 $2" = 'network inspect' ]; then if [ "$3" != --format ]; then has network; exit; fi; if ctl runner-network-before-start-drift && has runner-pre-inspected; then nid='${"f".repeat(64)}'; fi; printf '{"Attachable":false,"Driver":"bridge","Id":"%s","Internal":false,"Labels":{"com.docker.compose.project":"%s","com.docker.compose.network":"default"},"Name":"%s_default","Options":{}}\n' "$nid" "$project" "$project"; exit; fi
 if [ "$1 $2" = 'image inspect' ]; then printf '{"Id":"${imageId}","Labels":{"org.opencontainers.image.revision":"%s"}}\n' "$revision"; exit; fi
 exit 72
 `);
@@ -567,8 +623,15 @@ test("owner-local E2E context rejects source/dependency drift and runs only in t
     const e2eContext = path.join(fixture.runtime, fixture.project, "e2e-context");
     const escapedContext = e2eContext.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     assert.match(log, new RegExp(`npm-ci cwd=${escapedContext} token=no reg=no`));
-    assert.match(log, /<create>.*<--read-only>.*<--cap-drop> <ALL>.*<--network>.*_default/s);
-    assert.match(log, /<start> <-a> <-i>/);
+    assert.match(log, /<create> <--interactive>.*<--read-only>.*<--cap-drop> <ALL>.*<--network>.*_default/s);
+    assert.match(log, new RegExp(`<start> <${runnerContainerId}>`));
+    assert.match(log, new RegExp(`<attach> <--no-stdin=false> <${runnerContainerId}>`));
+    assert.match(log, new RegExp(`<wait> <${runnerContainerId}>`));
+    const startAt = log.indexOf(`<start> <${runnerContainerId}>`);
+    const postInspectAt = log.indexOf(`<inspect> <--format>`, startAt + 1);
+    const attachAt = log.indexOf(`<attach> <--no-stdin=false> <${runnerContainerId}>`);
+    const waitAt = log.indexOf(`<wait> <${runnerContainerId}>`);
+    assert.ok(startAt >= 0 && postInspectAt > startAt && attachAt > postInspectAt && waitAt > attachAt, log);
     assert.match(fs.readFileSync(path.join(fixture.runtime, fixture.project, "e2e-run.log"), "utf8"), /browser suite passed/);
     assert.equal(fs.existsSync(path.join(fixture.state, "canonical-playwright-executed")), false);
     assert.equal(fs.existsSync(path.join(identity.WMUX_WORKTREE, "node_modules")), false);
@@ -589,15 +652,21 @@ test("runner rejects image, package, inspect, output, result, and execution drif
     const runtimeDirectory = path.join(fixture.runtime, fixture.project);
     const secrets = metadata(path.join(runtimeDirectory, "staging.env"));
     fs.writeFileSync(path.join(fixture.state, "control-runner-image-optional-absent"), "");
+    fs.writeFileSync(path.join(fixture.state, "control-runner-prestart-network-realized"), "");
     const absentOptional = run(fixture, "e2e");
     assert.equal(absentOptional.status, 0, absentOptional.stderr);
     fs.rmSync(path.join(fixture.state, "control-runner-image-optional-absent"));
+    fs.rmSync(path.join(fixture.state, "control-runner-prestart-network-realized"));
     for (const control of [
       "runner-image-drift", "runner-image-malformed", "runner-image-unexpected", "playwright-version-drift", "e2e-symlink-drift", "runner-inspect-privileged", "runner-inspect-host-pid",
       "runner-inspect-device", "runner-inspect-mount", "runner-inspect-network", "runner-inspect-port",
-      "runner-inspect-limit", "runner-inspect-token-env", "runner-token-log", "runner-result-token", "runner-fail",
+      "runner-inspect-limit", "runner-inspect-token-env", "runner-post-inspect-identity", "runner-post-inspect-config",
+      "runner-post-inspect-mount", "runner-post-inspect-resource", "runner-post-inspect-network", "runner-post-inspect-state",
+      "runner-prestart-network-drift", "runner-network-before-start-drift", "runner-start-fail", "runner-attach-fail",
+      "runner-wait-fail", "runner-token-log", "runner-result-token", "runner-fail",
     ]) {
       const controlPath = path.join(fixture.state, `control-${control}`); fs.writeFileSync(controlPath, "");
+      const priorLogSize = fs.statSync(fixture.log).size;
       const result = run(fixture, "e2e");
       assert.notEqual(result.status, 0, `${control} unexpectedly passed`);
       assert.equal(fs.existsSync(path.join(fixture.state, "runner")), false, `${control} left runner container state`);
@@ -605,6 +674,11 @@ test("runner rejects image, package, inspect, output, result, and execution drif
       assert.equal(fs.existsSync(path.join(fixture.runtime, `.lock-${fixture.project}`)), false, `${control} left operation lock`);
       assert.equal(result.stderr.includes(secrets.WMUX_TOKEN), false, `${control} reported shared token`);
       assert.equal(result.stderr.includes(secrets.WMUX_REGISTRATION_TOKEN), false, `${control} reported registration token`);
+      const operationLog = fs.readFileSync(fixture.log, "utf8").slice(priorLogSize);
+      if (/^(?:runner-(?:image|inspect|prestart|network-before-start|post-inspect|start-fail)|playwright-version|e2e-symlink)/.test(control)) {
+        assert.doesNotMatch(operationLog, /<attach>/, `${control} delivered credentials before policy validation completed`);
+      }
+      if (control === "runner-network-before-start-drift") assert.doesNotMatch(operationLog, /<start>/);
       fs.rmSync(controlPath);
     }
     const commandLog = fs.readFileSync(fixture.log, "utf8");
@@ -615,23 +689,28 @@ test("runner rejects image, package, inspect, output, result, and execution drif
   } finally { server?.kill(); removeFixture(fixture); }
 });
 
-test("bounded runner client times out without putting credentials in arguments or logs", () => {
+test("bounded runner attach and wait time out without putting credentials in arguments or logs", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-runner-timeout-")); fs.chmodSync(directory, 0o700);
   const lock = path.join(directory, ".lock-wmux-staging-timeout"); const config = path.join(lock, "docker-config");
   const bin = path.join(directory, "bin"); const envFile = path.join(directory, "staging.env"); const logFile = path.join(directory, "e2e-run.log");
   fs.mkdirSync(config, { recursive: true, mode: 0o700 }); fs.chmodSync(config, 0o500); fs.mkdirSync(bin, { mode: 0o700 });
   const token = "a".repeat(64); const registration = "b".repeat(64);
   fs.writeFileSync(envFile, `WMUX_TOKEN=${token}\nWMUX_REGISTRATION_TOKEN=${registration}\n`, { mode: 0o600 });
-  executable(path.join(bin, "docker"), "#!/bin/sh\nsleep 5\n");
   try {
-    const started = Date.now();
-    const result = spawnSync(process.execPath, [sourcePolicy, "run-runner", envFile, logFile, "1", "direct", config, "context", "default", "runner"], {
-      encoding: "utf8", env: { PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`, HOME: process.env.HOME }, timeout: 5_000,
-    });
-    assert.notEqual(result.status, 0); assert.match(result.stderr, /bounded timeout/); assert.ok(Date.now() - started < 4_000);
-    assert.equal(result.stderr.includes(token) || result.stderr.includes(registration), false);
-    if (fs.existsSync(logFile)) {
-      const log = fs.readFileSync(logFile, "utf8"); assert.equal(log.includes(token) || log.includes(registration), false);
+    for (const phase of ["attach", "wait"]) {
+      executable(path.join(bin, "docker"), `#!/bin/sh
+[ "$3" != "${phase}" ] || sleep 5
+[ "$3" != wait ] || printf '0\\n'
+`);
+      const started = Date.now();
+      const result = spawnSync(process.execPath, [sourcePolicy, "run-runner", envFile, logFile, "1", "direct", config, "context", "default", runnerContainerId], {
+        encoding: "utf8", env: { PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`, HOME: process.env.HOME }, timeout: 5_000,
+      });
+      assert.notEqual(result.status, 0); assert.match(result.stderr, /bounded timeout/); assert.ok(Date.now() - started < 4_000);
+      assert.equal(result.stderr.includes(token) || result.stderr.includes(registration), false);
+      if (fs.existsSync(logFile)) {
+        const log = fs.readFileSync(logFile, "utf8"); assert.equal(log.includes(token) || log.includes(registration), false);
+      }
     }
   } finally { fs.rmSync(directory, { recursive: true, force: true }); }
 });
@@ -840,7 +919,7 @@ test("dedicated staging artifacts preserve exact private publish and omit produc
   assert.match(script, /-f "\$build_context\/deploy\/docker\/docker-compose\.staging\.yml"/);
   assert.doesNotMatch(script, /pack-objects "\$isolated_repo\/objects\/pack\/pack"/);
   assert.doesNotMatch(script, /(?:^|[;|&]\s*|\n\s*)(?:tar|cp)\s/m);
-  assert.match(script, /scan-runner-results/); assert.match(policy, /\["cp", `\$\{runnerName\}:\/tmp\/e2e-results/);
+  assert.match(script, /scan-runner-results/); assert.match(policy, /\["cp", `\$\{containerId\}:\/tmp\/e2e-results/);
   assert.doesNotMatch(policy, /spawnSync\("(?:tar|cp)"/);
   assert.match(policy, /validateCommittedTree/); assert.match(policy, /O_EXCL/); assert.match(policy, /O_NOFOLLOW/);
   assert.match(policy, /validateCleanupWorktree/); assert.match(policy, /"worktree", "remove", "--force"/);

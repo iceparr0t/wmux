@@ -1136,16 +1136,21 @@ const runnerTmpfs = (runnerUid, runnerGid) => ({
 });
 
 const validateRunnerContainer = async ([project, revision, runnerName, containerId, networkName, networkId, imageId,
-  context, bootstrap, baseUrl, runnerUser, imageInspectFile]) => {
+  context, bootstrap, baseUrl, runnerUser, imageInspectFile], phase) => {
   if (!/^\d+:\d+$/.test(runnerUser ?? "")) fail("runner user must be numeric uid:gid");
   const [runnerUid, runnerGid] = runnerUser.split(":").map(Number);
   const imageInspect = readJsonFile(imageInspectFile, "runner image identity");
   const value = await parseStdinJson();
-  exactKeys(value, ["Id", "Image", "Name", "Config", "HostConfig", "NetworkSettings", "Mounts"], "runner inspect");
+  const expectedKeys = ["Id", "Image", "Name", "Config", "HostConfig", "NetworkSettings", "Mounts"];
+  if (phase === "running") expectedKeys.push("State");
+  exactKeys(value, expectedKeys, "runner inspect");
   if (value.Id !== containerId || value.Image !== imageId || value.Name !== `/${runnerName}`) fail("runner container identity drift");
   const config = value.Config;
-  exactKeys(config, ["Cmd", "Entrypoint", "Env", "Image", "Labels", "User", "WorkingDir"], "runner Config");
-  if (config.Image !== runnerImage || config.User !== runnerUser || config.WorkingDir !== "/workspace") fail("runner image/user/workdir drift");
+  exactKeys(config, ["Cmd", "Entrypoint", "Env", "Image", "Labels", "OpenStdin", "StdinOnce", "Tty", "User", "WorkingDir"], "runner Config");
+  if (config.Image !== runnerImage || config.User !== runnerUser || config.WorkingDir !== "/workspace"
+    || config.OpenStdin !== true || config.StdinOnce !== false || config.Tty !== false) {
+    fail("runner image/user/workdir/stdin policy drift");
+  }
   exactMembers(config.Entrypoint, ["/runner-bootstrap"], "runner entrypoint");
   exactMembers(config.Cmd, ["run"], "runner command");
   exactMap(config.Labels, {
@@ -1195,8 +1200,24 @@ const validateRunnerContainer = async ([project, revision, runnerName, container
   ], "runner realized mounts");
   exactKeys(value.NetworkSettings, ["Networks", "Ports"], "runner NetworkSettings");
   exactKeys(value.NetworkSettings.Networks, [networkName], "runner attached networks");
-  if (value.NetworkSettings.Networks[networkName].NetworkID !== networkId) fail("runner network ID drift");
+  const attachedNetworkId = value.NetworkSettings.Networks[networkName].NetworkID;
+  if (phase === "prestart") {
+    if (attachedNetworkId !== "" && attachedNetworkId !== networkId) fail("runner pre-start network ID drift");
+  } else if (attachedNetworkId !== networkId) fail("runner running network ID drift");
   if (value.NetworkSettings.Ports !== null && Object.keys(value.NetworkSettings.Ports).length !== 0) fail("runner realized ports must be empty");
+  if (phase === "running") {
+    exactKeys(value.State, ["Dead", "Error", "ExitCode", "FinishedAt", "OOMKilled", "Paused", "Pid", "Restarting", "Running", "StartedAt", "Status"], "runner State");
+    if (value.State.Status !== "running" || value.State.Running !== true || value.State.Paused !== false
+      || value.State.Restarting !== false || value.State.OOMKilled !== false || value.State.Dead !== false
+      || !Number.isSafeInteger(value.State.Pid) || value.State.Pid < 1 || value.State.ExitCode !== 0 || value.State.Error !== "") {
+      fail("runner is not in the required running state");
+    }
+    if (typeof value.State.StartedAt !== "string" || value.State.StartedAt.length > 64
+      || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value.State.StartedAt)
+      || value.State.StartedAt.startsWith("0001-01-01T") || value.State.FinishedAt !== "0001-01-01T00:00:00Z") {
+      fail("runner state timestamps are invalid");
+    }
+  }
 };
 
 const dockerInvocation = (mode, dockerConfig, selector, endpoint, dockerArgs) => {
@@ -1218,7 +1239,7 @@ const dockerInvocation = (mode, dockerConfig, selector, endpoint, dockerArgs) =>
 
 const containsCredential = (bytes, token, registrationToken) => bytes.includes(Buffer.from(token)) || bytes.includes(Buffer.from(registrationToken));
 
-const runRunner = (metadataFile, logFile, timeoutText, mode, dockerConfig, selector, endpoint, runnerName) => {
+const runRunner = (metadataFile, logFile, timeoutText, mode, dockerConfig, selector, endpoint, containerId) => {
   const metadata = readMetadata(metadataFile);
   const token = metadata.WMUX_TOKEN; const registrationToken = metadata.WMUX_REGISTRATION_TOKEN;
   if (!/^[0-9a-f]{64}$/.test(token ?? "") || !/^[0-9a-f]{64}$/.test(registrationToken ?? "") || token === registrationToken) fail("runner credential metadata is invalid");
@@ -1226,7 +1247,9 @@ const runRunner = (metadataFile, logFile, timeoutText, mode, dockerConfig, selec
   if (!Number.isInteger(timeout) || timeout < 1 || timeout > 3600) fail("runner timeout is invalid");
   if (logFile !== path.join(path.dirname(metadataFile), "e2e-run.log")) fail("runner log path drift");
   if (fs.existsSync(logFile)) { validateMetadata(logFile); fs.unlinkSync(logFile); }
-  const invocation = dockerInvocation(mode, dockerConfig, selector, endpoint, ["start", "-a", "-i", runnerName]);
+  if (!/^[0-9a-f]{64}$/.test(containerId ?? "")) fail("runner container ID is invalid");
+  const deadline = Date.now() + timeout * 1000;
+  const invocation = dockerInvocation(mode, dockerConfig, selector, endpoint, ["attach", "--no-stdin=false", containerId]);
   const result = spawnSync(invocation.command, invocation.args, {
     env: invocation.env, input: `${token}\n${registrationToken}\n`, timeout: timeout * 1000,
     maxBuffer: runnerLogLimit,
@@ -1240,13 +1263,35 @@ const runRunner = (metadataFile, logFile, timeoutText, mode, dockerConfig, selec
   const combined = Buffer.concat([stdout, stderr]);
   writeExclusive(logFile, combined.subarray(0, runnerLogLimit));
   if (result.error?.code === "ETIMEDOUT") fail("runner exceeded its bounded timeout");
-  if (result.error) fail("runner output exceeded its bounded capture or Docker start failed");
-  if (result.status !== 0) fail(`runner exited with status ${result.status ?? "unknown"}`);
+  if (result.error) fail("runner output exceeded its bounded capture or Docker attach failed");
+
+  const remaining = Math.max(1, deadline - Date.now());
+  const waitTimeout = result.status === 0 ? remaining : Math.min(remaining, 5_000);
+  const waitInvocation = dockerInvocation(mode, dockerConfig, selector, endpoint, ["wait", containerId]);
+  const waitResult = spawnSync(waitInvocation.command, waitInvocation.args, {
+    env: waitInvocation.env, timeout: waitTimeout, maxBuffer: 64 * 1024,
+  });
+  const waitStdout = Buffer.isBuffer(waitResult.stdout) ? waitResult.stdout : Buffer.alloc(0);
+  const waitStderr = Buffer.isBuffer(waitResult.stderr) ? waitResult.stderr : Buffer.alloc(0);
+  if (containsCredential(waitStdout, token, registrationToken) || containsCredential(waitStderr, token, registrationToken)) {
+    try { fs.unlinkSync(logFile); } catch {}
+    fail("credential material detected in Docker wait output; output quarantined");
+  }
+  if (waitResult.error?.code === "ETIMEDOUT") {
+    if (result.status !== 0) fail(`Docker attach failed with status ${result.status ?? "unknown"}`);
+    fail("runner exceeded its bounded timeout");
+  }
+  if (waitResult.error || waitResult.status !== 0) fail("Docker wait failed");
+  const exitText = waitStdout.toString("utf8").trim();
+  if (!/^(?:0|[1-9]\d{0,2})$/.test(exitText) || Number(exitText) > 255) fail("Docker wait returned an invalid runner status");
+  if (Number(exitText) !== 0) fail(`runner exited with status ${exitText}`);
+  if (result.status !== 0) fail(`Docker attach failed with status ${result.status ?? "unknown"}`);
 };
 
-const scanRunnerResults = (metadataFile, mode, dockerConfig, selector, endpoint, runnerName) => {
+const scanRunnerResults = (metadataFile, mode, dockerConfig, selector, endpoint, containerId) => {
   const metadata = readMetadata(metadataFile);
-  const invocation = dockerInvocation(mode, dockerConfig, selector, endpoint, ["cp", `${runnerName}:/tmp/e2e-results/.`, "-"]);
+  if (!/^[0-9a-f]{64}$/.test(containerId ?? "")) fail("runner container ID is invalid");
+  const invocation = dockerInvocation(mode, dockerConfig, selector, endpoint, ["cp", `${containerId}:/tmp/e2e-results/.`, "-"]);
   const result = spawnSync(invocation.command, invocation.args, { env: invocation.env, timeout: 60_000, maxBuffer: 128 * 1024 * 1024 });
   if (result.error || result.status !== 0) fail("runner results could not be scanned");
   if (containsCredential(result.stdout ?? Buffer.alloc(0), metadata.WMUX_TOKEN, metadata.WMUX_REGISTRATION_TOKEN)
@@ -1295,7 +1340,8 @@ try {
     case "validate-network": await validateNetwork(args); break;
     case "validate-image": await validateImage(args); break;
     case "validate-runner-image": await validateRunnerImage(args); break;
-    case "validate-runner-container": await validateRunnerContainer(args); break;
+    case "validate-runner-container-prestart": await validateRunnerContainer(args, "prestart"); break;
+    case "validate-runner-container-running": await validateRunnerContainer(args, "running"); break;
     case "run-runner": runRunner(...args); break;
     case "scan-runner-results": scanRunnerResults(...args); break;
     default: fail(`unknown staging policy command: ${command ?? ""}`);

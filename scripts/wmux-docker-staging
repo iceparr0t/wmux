@@ -631,7 +631,7 @@ case "$command_name" in
     runner_user=$(id -u):$(id -g)
     runner_bootstrap=$e2e_context/deploy/docker/e2e-runner-bootstrap
     if docker_cmd inspect "$runner_name" >/dev/null 2>&1; then die "generated E2E runner name already exists"; fi
-    runner_container_id=$(docker_cmd create \
+    runner_container_id=$(docker_cmd create --interactive \
       --name "$runner_name" \
       --label "org.opencontainers.image.revision=$full_revision" \
       --label "wmux.staging.e2e=true" --label "wmux.staging.project=$project" \
@@ -651,21 +651,35 @@ case "$command_name" in
     [ "${#runner_container_id}" -eq 64 ] || die "Docker returned a non-canonical E2E runner container ID"
     runner_created=1
     inspect_output=$(mktemp "$runtime_dir/.e2e-inspect.XXXXXX")
-    docker_cmd inspect --format '{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Config":{"Cmd":{{json .Config.Cmd}},"Entrypoint":{{json .Config.Entrypoint}},"Env":{{json .Config.Env}},"Image":{{json .Config.Image}},"Labels":{{json .Config.Labels}},"User":{{json .Config.User}},"WorkingDir":{{json .Config.WorkingDir}}},"HostConfig":{"Binds":{{json .HostConfig.Binds}},"CapDrop":{{json .HostConfig.CapDrop}},"DeviceRequests":{{json .HostConfig.DeviceRequests}},"Devices":{{json .HostConfig.Devices}},"IpcMode":{{json .HostConfig.IpcMode}},"Init":{{json .HostConfig.Init}},"LogConfig":{{json .HostConfig.LogConfig}},"Memory":{{json .HostConfig.Memory}},"MemorySwap":{{json .HostConfig.MemorySwap}},"Mounts":{{json .HostConfig.Mounts}},"NanoCpus":{{json .HostConfig.NanoCpus}},"NetworkMode":{{json .HostConfig.NetworkMode}},"PidMode":{{json .HostConfig.PidMode}},"PidsLimit":{{json .HostConfig.PidsLimit}},"PortBindings":{{json .HostConfig.PortBindings}},"Privileged":{{json .HostConfig.Privileged}},"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"RestartPolicy":{{json .HostConfig.RestartPolicy}},"SecurityOpt":{{json .HostConfig.SecurityOpt}},"ShmSize":{{json .HostConfig.ShmSize}},"Tmpfs":{{json .HostConfig.Tmpfs}},"UsernsMode":{{json .HostConfig.UsernsMode}},"VolumesFrom":{{json .HostConfig.VolumesFrom}}},"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}},"Ports":{{json .NetworkSettings.Ports}}},"Mounts":{{json .Mounts}}}' "$runner_container_id" >"$inspect_output" \
+    docker_cmd inspect --format '{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Config":{"Cmd":{{json .Config.Cmd}},"Entrypoint":{{json .Config.Entrypoint}},"Env":{{json .Config.Env}},"Image":{{json .Config.Image}},"Labels":{{json .Config.Labels}},"OpenStdin":{{json .Config.OpenStdin}},"StdinOnce":{{json .Config.StdinOnce}},"Tty":{{json .Config.Tty}},"User":{{json .Config.User}},"WorkingDir":{{json .Config.WorkingDir}}},"HostConfig":{"Binds":{{json .HostConfig.Binds}},"CapDrop":{{json .HostConfig.CapDrop}},"DeviceRequests":{{json .HostConfig.DeviceRequests}},"Devices":{{json .HostConfig.Devices}},"IpcMode":{{json .HostConfig.IpcMode}},"Init":{{json .HostConfig.Init}},"LogConfig":{{json .HostConfig.LogConfig}},"Memory":{{json .HostConfig.Memory}},"MemorySwap":{{json .HostConfig.MemorySwap}},"Mounts":{{json .HostConfig.Mounts}},"NanoCpus":{{json .HostConfig.NanoCpus}},"NetworkMode":{{json .HostConfig.NetworkMode}},"PidMode":{{json .HostConfig.PidMode}},"PidsLimit":{{json .HostConfig.PidsLimit}},"PortBindings":{{json .HostConfig.PortBindings}},"Privileged":{{json .HostConfig.Privileged}},"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"RestartPolicy":{{json .HostConfig.RestartPolicy}},"SecurityOpt":{{json .HostConfig.SecurityOpt}},"ShmSize":{{json .HostConfig.ShmSize}},"Tmpfs":{{json .HostConfig.Tmpfs}},"UsernsMode":{{json .HostConfig.UsernsMode}},"VolumesFrom":{{json .HostConfig.VolumesFrom}}},"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}},"Ports":{{json .NetworkSettings.Ports}}},"Mounts":{{json .Mounts}}}' "$runner_container_id" >"$inspect_output" \
       || die "cannot inspect isolated E2E runner"
-    node_cmd "$policy" validate-runner-container "$project" "$full_revision" "$runner_name" "$runner_container_id" \
+    node_cmd "$policy" validate-runner-container-prestart "$project" "$full_revision" "$runner_name" "$runner_container_id" \
       "$network_name" "$(env_value "$live_file" WMUX_NETWORK_ID)" "$runner_image_id" "$e2e_context" "$runner_bootstrap" \
       "$base_url" "$runner_user" "$runner_image_inspect" <"$inspect_output" \
       || die "isolated E2E runner inspect policy failed before credential delivery"
     rm -f "$inspect_output"; inspect_output=
 
+    recorded_network_id=$(env_value "$live_file" WMUX_NETWORK_ID)
+    docker_cmd network inspect --format '{"Attachable":{{json .Attachable}},"Driver":{{json .Driver}},"Id":{{json .Id}},"Internal":{{json .Internal}},"Labels":{{json .Labels}},"Name":{{json .Name}},"Options":{{json .Options}}}' "$recorded_network_id" \
+      | node_cmd "$policy" validate-network "$project" "$recorded_network_id" \
+      || die "staging network identity changed before E2E runner start"
+    docker_cmd start "$runner_container_id" >/dev/null || die "cannot start isolated E2E runner"
+    inspect_output=$(mktemp "$runtime_dir/.e2e-inspect.XXXXXX")
+    docker_cmd inspect --format '{"Id":{{json .Id}},"Image":{{json .Image}},"Name":{{json .Name}},"Config":{"Cmd":{{json .Config.Cmd}},"Entrypoint":{{json .Config.Entrypoint}},"Env":{{json .Config.Env}},"Image":{{json .Config.Image}},"Labels":{{json .Config.Labels}},"OpenStdin":{{json .Config.OpenStdin}},"StdinOnce":{{json .Config.StdinOnce}},"Tty":{{json .Config.Tty}},"User":{{json .Config.User}},"WorkingDir":{{json .Config.WorkingDir}}},"HostConfig":{"Binds":{{json .HostConfig.Binds}},"CapDrop":{{json .HostConfig.CapDrop}},"DeviceRequests":{{json .HostConfig.DeviceRequests}},"Devices":{{json .HostConfig.Devices}},"IpcMode":{{json .HostConfig.IpcMode}},"Init":{{json .HostConfig.Init}},"LogConfig":{{json .HostConfig.LogConfig}},"Memory":{{json .HostConfig.Memory}},"MemorySwap":{{json .HostConfig.MemorySwap}},"Mounts":{{json .HostConfig.Mounts}},"NanoCpus":{{json .HostConfig.NanoCpus}},"NetworkMode":{{json .HostConfig.NetworkMode}},"PidMode":{{json .HostConfig.PidMode}},"PidsLimit":{{json .HostConfig.PidsLimit}},"PortBindings":{{json .HostConfig.PortBindings}},"Privileged":{{json .HostConfig.Privileged}},"ReadonlyRootfs":{{json .HostConfig.ReadonlyRootfs}},"RestartPolicy":{{json .HostConfig.RestartPolicy}},"SecurityOpt":{{json .HostConfig.SecurityOpt}},"ShmSize":{{json .HostConfig.ShmSize}},"Tmpfs":{{json .HostConfig.Tmpfs}},"UsernsMode":{{json .HostConfig.UsernsMode}},"VolumesFrom":{{json .HostConfig.VolumesFrom}}},"NetworkSettings":{"Networks":{{json .NetworkSettings.Networks}},"Ports":{{json .NetworkSettings.Ports}}},"Mounts":{{json .Mounts}},"State":{"Dead":{{json .State.Dead}},"Error":{{json .State.Error}},"ExitCode":{{json .State.ExitCode}},"FinishedAt":{{json .State.FinishedAt}},"OOMKilled":{{json .State.OOMKilled}},"Paused":{{json .State.Paused}},"Pid":{{json .State.Pid}},"Restarting":{{json .State.Restarting}},"Running":{{json .State.Running}},"StartedAt":{{json .State.StartedAt}},"Status":{{json .State.Status}}}}' "$runner_container_id" >"$inspect_output" \
+      || die "cannot inspect running isolated E2E runner"
+    node_cmd "$policy" validate-runner-container-running "$project" "$full_revision" "$runner_name" "$runner_container_id" \
+      "$network_name" "$recorded_network_id" "$runner_image_id" "$e2e_context" "$runner_bootstrap" \
+      "$base_url" "$runner_user" "$runner_image_inspect" <"$inspect_output" \
+      || die "running E2E runner inspect policy failed before credential delivery"
+    rm -f "$inspect_output"; inspect_output=
+
     runner_status=0
     node_cmd "$policy" run-runner "$env_file" "$runtime_dir/e2e-run.log" 1800 "$docker_mode" "$docker_config" \
-      "$docker_selector" "$( [ "$docker_selector" = host ] && printf '%s' "$docker_endpoint" || printf '%s' "$docker_context" )" "$runner_name" \
+      "$docker_selector" "$( [ "$docker_selector" = host ] && printf '%s' "$docker_endpoint" || printf '%s' "$docker_context" )" "$runner_container_id" \
       || runner_status=$?
     result_scan_status=0
     node_cmd "$policy" scan-runner-results "$env_file" "$docker_mode" "$docker_config" "$docker_selector" \
-      "$( [ "$docker_selector" = host ] && printf '%s' "$docker_endpoint" || printf '%s' "$docker_context" )" "$runner_name" \
+      "$( [ "$docker_selector" = host ] && printf '%s' "$docker_endpoint" || printf '%s' "$docker_context" )" "$runner_container_id" \
       || result_scan_status=$?
     context_status=0
     node_cmd "$policy" validate-e2e-context "$e2e_dependency_file" "$e2e_context_file" "$isolated_repo" >/dev/null || context_status=$?
