@@ -337,6 +337,7 @@ if [ "$1" = inspect ]; then
     healthy=0; case "$3" in *'"Health"'*) healthy=1;; esac
     post=0; case "$3" in *'"State"'*) post=1;; esac
     [ "$post" = "$started" ] || exit 79
+    if ctl fixture-hostconfig-mounts-absent; then case "$3" in *'json (index .HostConfig "Mounts")'*) ;; *) exit 77;; esac; fi
     node -e '
       const fs=require("node:fs"),s=process.argv[1],post=process.argv[2]==="1",healthy=process.argv[3]==="1";
       const read=n=>fs.readFileSync(s+"/"+n,"utf8"),ctl=n=>fs.existsSync(s+"/control-"+n);
@@ -350,6 +351,7 @@ if [ "$1" = inspect ]; then
       if(post)value.State={Dead:false,Error:"",ExitCode:0,FinishedAt:"0001-01-01T00:00:00Z",OOMKilled:false,Paused:false,Pid:2345,Restarting:false,Running:true,StartedAt:"2026-08-05T12:00:01.000000000Z",Status:"running"};
       if(healthy)value.Health={Status:ctl("fixture-health-drift")?"unhealthy":"healthy"};
       if(ctl("fixture-inspect-privileged"))h.Privileged=true;
+      if(ctl("fixture-hostconfig-mounts-absent"))h.Mounts=null;
       if(ctl("fixture-inspect-mount")){h.Mounts=[{Type:"bind",Source:"/etc",Target:"/host",ReadOnly:true}];value.Mounts=[{Type:"bind",Source:"/etc",Destination:"/host",RW:false,Propagation:"rprivate"}];}
       if(ctl("fixture-inspect-token-env"))env.push("WMUX_TOKEN=metadata-secret");
       if(post&&ctl("fixture-post-inspect-state"))value.State.Running=false;
@@ -888,6 +890,21 @@ test("fixture and internal-network policy rejects identity, resource, mount, met
       }
       fs.rmSync(controlPath);
     }
+    assert.equal(run(fixture, "down").status, 0);
+  } finally { server?.kill(); removeFixture(fixture); }
+});
+
+test("fixture accepts a Docker-safe null HostConfig.Mounts inspect value", () => {
+  const fixture = makeFixture();
+  let server: ChildProcess | undefined;
+  try {
+    assert.equal(run(fixture, "up").status, 0);
+    server = startHttpFixture(fixture.directory, "ok", fixture.port);
+    fs.writeFileSync(path.join(fixture.state, "control-fixture-hostconfig-mounts-absent"), "");
+    const result = run(fixture, "e2e");
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.existsSync(path.join(fixture.state, "fixture")), false);
+    assert.equal(fs.existsSync(path.join(fixture.state, "e2e-network")), false);
     assert.equal(run(fixture, "down").status, 0);
   } finally { server?.kill(); removeFixture(fixture); }
 });
