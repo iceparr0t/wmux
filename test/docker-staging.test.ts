@@ -29,15 +29,32 @@ const metadata = (filePath: string) => Object.fromEntries(fs.readFileSync(filePa
 type Fixture = ReturnType<typeof makeFixture>;
 
 const removeFixture = (fixture: Fixture) => {
-  try {
-    const identity = path.join(fixture.runtime, fixture.project, "identity.env");
-    if (fs.existsSync(identity)) {
-      const values = metadata(identity);
-      if (fs.existsSync(values.WMUX_ISOLATED_REPOSITORY)) {
-        spawnSync("git", ["--git-dir", values.WMUX_ISOLATED_REPOSITORY, "worktree", "remove", "--force", values.WMUX_WORKTREE]);
-      }
-      fs.rmSync(values.WMUX_WORKTREE, { recursive: true, force: true });
+  const safeWorktree = (value: string | undefined): value is string => {
+    if (!value) return false;
+    const basename = path.basename(value);
+    return path.dirname(value) === approvedWorktreeRoot && value.startsWith(approvedWorktreeRoot + path.sep)
+      && /^stage-[0-9a-f]{12}-[0-9a-f]{16}$/.test(basename);
+  };
+  const removeWorktree = (metadataPath: string) => {
+    let values: Record<string, string>;
+    try {
+      values = metadata(metadataPath);
+    } catch {
+      return;
     }
+    const worktree = values.WMUX_WORKTREE;
+    if (!safeWorktree(worktree)) return;
+    const repository = values.WMUX_ISOLATED_REPOSITORY;
+    if (repository && fs.existsSync(repository)) {
+      spawnSync("git", ["--git-dir", repository, "worktree", "remove", "--force", worktree]);
+    }
+    if (fs.existsSync(worktree)) {
+      fs.rmSync(worktree, { recursive: true, force: true });
+    }
+  };
+  try {
+    removeWorktree(path.join(fixture.runtime, fixture.project, "identity.env"));
+    removeWorktree(path.join(fixture.runtime, fixture.project, "provision.env"));
   } finally {
     fs.rmSync(fixture.directory, { recursive: true, force: true });
   }
@@ -172,12 +189,21 @@ const run = (fixture: Fixture, command: string, changes: NodeJS.ProcessEnv = {})
   return result;
 };
 
+const runRaw = (fixture: Fixture, command: string, changes: NodeJS.ProcessEnv = {}) => spawnSync("/bin/sh", [fixture.script, command], {
+  cwd: os.tmpdir(), env: { ...fixture.environment, ...changes }, encoding: "utf8", timeout: 30_000,
+});
+
 const startHttpFixture = (directory: string, mode: string, port: string): ChildProcess => {
   const server = path.join(directory, `server-${mode}.mjs`);
   fs.writeFileSync(server, `import http from 'node:http';const mode=process.argv[2];http.createServer((req,res)=>{if(mode==='slow')return;if(mode==='redirect'){res.writeHead(302,{location:'/elsewhere'});return res.end();}if(mode==='endless'){res.writeHead(200,{'content-type':'application/json'});return setInterval(()=>res.write(' '),100);}if(mode==='oversized'){res.writeHead(200,{'content-type':'application/json'});return res.end('x'.repeat(300000));}res.writeHead(200,{'content-type':'application/json'});res.end(req.url==='/api/health'?'{"ok":true}':'{"settings":{"groupSidebarSessionsByHost":true}}')}).listen(Number(process.argv[3]),'0.0.0.0');`);
   const child = spawn(process.execPath, [server, mode, port], { stdio: "ignore" });
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
   return child;
+};
+
+const replaceSudo = (fixture: Fixture, scriptSource: string) => {
+  const sudo = path.join(fixture.bin, "sudo");
+  executable(sudo, scriptSource);
 };
 
 test("bootstrap ignores source attributes, filters, replace refs, untracked files, and hostile Git/tool environment", () => {
@@ -281,6 +307,77 @@ test("sudo Docker Buildx artifacts are removed after successful and failed opera
       assert.equal(fs.existsSync(path.join(fixture.state, "sudo-cleanup")), false);
       if (!failSelection) assert.equal(run(fixture, "down").status, 0);
     } finally { removeFixture(fixture); }
+  }
+});
+
+test("sudo docker-config cleanup uses /bin/rm without policy execution and clears lock+marker", () => {
+  const fixture = makeFixture();
+  try {
+    fs.writeFileSync(path.join(fixture.state, "control-sudo-only"), "");
+    fs.writeFileSync(path.join(fixture.state, "control-sudo-artifacts"), "");
+    const up = run(fixture, "up");
+    assert.equal(up.status, 0, up.stderr);
+    const runtimeDirectory = path.join(fixture.runtime, fixture.project);
+    const lockDir = path.join(fixture.runtime, `.lock-${fixture.project}`);
+    const dockerConfig = path.join(lockDir, "docker-config");
+    const marker = path.join(lockDir, ".docker-sudo-used");
+    const chown = spawnSync("sudo", ["-n", "chown", "-R", "0:0", dockerConfig], { encoding: "utf8" });
+    if (chown.status !== 0) return;
+    const script = `#!/bin/sh\n` +
+      `[ "$1" = -n ] && shift\n` +
+      `[ "$1" = env ] || exit 81\n` +
+      `shift\n` +
+      `while [ $# -gt 0 ] && [ "${"${1#-}"}" != "${"$1"}" ]; do\n` +
+      `  [ "$1" = -i ] || exit 82\n` +
+      `  shift\n` +
+      `done\n` +
+      `case " $* " in *\' remove-docker-config-tree \'*) exit 91;; esac\n` +
+      `exec env -i WMUX_TEST_SUDO=1 "$@"\n`;
+    replaceSudo(fixture, script);
+    const down = runRaw(fixture, "down");
+    assert.equal(down.status, 0, down.stderr);
+    assert.equal(down.stdout.includes("already down"), false);
+    assert.equal(fs.existsSync(lockDir), false, `lock directory should be removed on successful cleanup\n${down.stderr}`);
+    assert.equal(fs.existsSync(marker), false, `marker should be removed on successful cleanup\n${down.stderr}`);
+    assert.equal(fs.existsSync(dockerConfig), false, `docker config should be removed\n${down.stderr}`);
+    assert.equal(fs.existsSync(runtimeDirectory), false, `runtime dir should be removed\n${down.stderr}`);
+  } finally {
+    removeFixture(fixture);
+  }
+});
+
+test("failed sudo docker-config cleanup preserves lock and marker", () => {
+  const fixture = makeFixture();
+  try {
+    fs.writeFileSync(path.join(fixture.state, "control-sudo-only"), "");
+    fs.writeFileSync(path.join(fixture.state, "control-sudo-artifacts"), "");
+    const up = run(fixture, "up");
+    assert.equal(up.status, 0, up.stderr);
+    const runtimeDirectory = path.join(fixture.runtime, fixture.project);
+    const lockDir = path.join(fixture.runtime, `.lock-${fixture.project}`);
+    const dockerConfig = path.join(lockDir, "docker-config");
+    const marker = path.join(lockDir, ".docker-sudo-used");
+    const chown = spawnSync("sudo", ["-n", "chown", "-R", "0:0", dockerConfig], { encoding: "utf8" });
+    if (chown.status !== 0) return;
+    const script = `#!/bin/sh\n` +
+      `[ "$1" = -n ] && shift\n` +
+      `[ "$1" = env ] || exit 81\n` +
+      `shift\n` +
+      `while [ $# -gt 0 ] && [ "${"${1#-}"}" != "${"$1"}" ]; do\n` +
+      `  [ "$1" = -i ] || exit 82\n` +
+      `  shift\n` +
+      `done\n` +
+      `case " $* " in *\' /bin/rm \'*) exit 92;; esac\n` +
+      `exec env -i WMUX_TEST_SUDO=1 "$@"\n`;
+    replaceSudo(fixture, script);
+    const down = runRaw(fixture, "down");
+    assert.notEqual(down.status, 0);
+    assert.equal(fs.existsSync(runtimeDirectory), true, "runtime directory should remain for retry\n" + down.stderr);
+    assert.equal(fs.existsSync(lockDir), true, "lock directory should remain after failed cleanup\n" + down.stderr);
+    assert.equal(fs.existsSync(marker), true, "marker should be preserved on failed cleanup\n" + down.stderr);
+    assert.equal(fs.existsSync(dockerConfig), true, "docker config should remain for retry\n" + down.stderr);
+  } finally {
+    removeFixture(fixture);
   }
 });
 

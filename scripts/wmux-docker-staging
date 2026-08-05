@@ -225,12 +225,13 @@ remove_docker_config() {
     [ -f "$docker_sudo_marker" ] || return 1
     env -i PATH="$tool_path" HOME="${HOME:?HOME is required}" \
       sudo -n env -i PATH="$tool_path" HOME=/root LC_ALL=C LANG=C \
-        node "$policy" remove-docker-config-tree "$lock_dir" "$docker_config"
+        /bin/rm -rf -- "$docker_config" || return 1
   elif [ "$cleanup_authority" = direct ]; then
     node_cmd "$policy" remove-docker-config-tree "$lock_dir" "$docker_config"
   else
     return 1
   fi
+  [ -e "$docker_config" ] && return 1
   rm -f "$docker_sudo_marker"
 }
 
