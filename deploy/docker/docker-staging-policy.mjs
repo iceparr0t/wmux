@@ -763,9 +763,11 @@ const validateCompose = async ([project, context, host, port, image, revision, v
   exactKeys(config.services, ["wmux"], "Compose services");
   exactKeys(config.networks, ["default"], "Compose networks");
   const service = config.services.wmux;
-  exactKeys(service, [
+  if (service.pid !== undefined && service.pid !== "") fail("Compose PID mode must be omitted or empty");
+  const { pid: _pid, ...serviceWithoutPid } = service;
+  exactKeys(serviceWithoutPid, [
     "build", "cap_drop", "command", "container_name", "cpus", "entrypoint", "environment", "image", "init", "ipc",
-    "logging", "mem_limit", "memswap_limit", "networks", "pid", "pids_limit", "ports", "read_only", "restart",
+    "logging", "mem_limit", "memswap_limit", "networks", "pids_limit", "ports", "read_only", "restart",
     "security_opt", "tmpfs", "user",
   ], "Compose service");
   if (service.command !== null || service.entrypoint !== null) fail("Compose command/entrypoint drift");
@@ -773,7 +775,7 @@ const validateCompose = async ([project, context, host, port, image, revision, v
     fail("Compose service identity drift");
   }
   if (service.privileged === true || service.read_only !== true || service.restart !== "no"
-    || service.pid !== "private" || service.ipc !== "private") fail("Compose namespace/lifecycle drift");
+    || service.ipc !== "private") fail("Compose namespace/lifecycle drift");
   if (service.cpus !== 2 || service.pids_limit !== 512 || Number(service.mem_limit) !== 1_073_741_824
     || Number(service.memswap_limit) !== 1_073_741_824) fail("Compose resource limit drift");
   exactMembers(service.cap_drop, ["ALL"], "Compose cap_drop");
@@ -846,7 +848,7 @@ const validateContainer = async ([project, host, port, image, revision, containe
     "PidMode", "PidsLimit", "PortBindings", "Privileged", "ReadonlyRootfs", "RestartPolicy", "SecurityOpt", "Tmpfs",
     "VolumesFrom",
   ], "live HostConfig");
-  if (h.Privileged !== false || h.ReadonlyRootfs !== true || h.PidMode !== "private" || h.IpcMode !== "private"
+  if (h.Privileged !== false || h.ReadonlyRootfs !== true || h.PidMode !== "" || h.IpcMode !== "private"
     || h.NetworkMode !== `${project}_default` || h.PidsLimit !== 512 || h.NanoCpus !== 2_000_000_000
     || h.Memory !== 1_073_741_824 || h.MemorySwap !== 1_073_741_824 || h.RestartPolicy?.Name !== "no") {
     fail("live namespace/resource policy drift");

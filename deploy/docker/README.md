@@ -222,7 +222,8 @@ consumes that entire effective model and rejects every non-allowlisted service,
 build option/argument, environment key, mount, config, secret, namespace,
 device, port, network, or logging option without writing or logging rendered
 credentials. The service explicitly selects the `node` user, disables
-privilege and restart, uses private PID/IPC namespaces, a read-only root, drops
+privilege and restart, leaves PID mode at Docker's default private namespace,
+uses an explicit private IPC namespace, a read-only root, drops
 every capability, enables `no-new-privileges`, and bounds the container at 2
 CPUs, 1 GiB memory with the memory-plus-swap ceiling also at 1 GiB, 512
 processes, and three 10 MiB local log files.
