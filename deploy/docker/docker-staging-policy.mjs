@@ -973,6 +973,64 @@ const parseStdinJson = async () => {
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 };
 
+const projectRequiredFields = (value, fields, name, optionalNullFields = []) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) fail(`${name} must be an object`);
+  const optional = new Set(optionalNullFields);
+  const projected = {};
+  for (const field of fields) {
+    if (!Object.hasOwn(value, field)) {
+      if (optional.has(field)) projected[field] = null;
+      else fail(`${name}.${field} is missing`);
+    } else projected[field] = value[field];
+  }
+  return projected;
+};
+
+const rejectCredentialMetadata = (value, name) => {
+  const visit = (entry) => {
+    if (typeof entry === "string") {
+      if (/(?:^|_)(?:TOKEN|SECRET|PASSWORD|CREDENTIAL)=/i.test(entry)) fail(`credential found in ${name}`);
+      return;
+    }
+    if (Array.isArray(entry)) { for (const child of entry) visit(child); return; }
+    if (!entry || typeof entry !== "object") return;
+    for (const [key, child] of Object.entries(entry)) {
+      if (/(?:^|_)(?:TOKEN|SECRET|PASSWORD|CREDENTIAL)(?:$|_)/i.test(key)) fail(`credential key found in ${name}`);
+      visit(child);
+    }
+  };
+  visit(value);
+};
+
+const projectFixtureInspect = async (phase) => {
+  const inspect = await parseStdinJson();
+  if (!Array.isArray(inspect) || inspect.length !== 1) fail("fixture inspect must be a one-element Docker inspect array");
+  const raw = inspect[0];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) fail("fixture inspect entry must be an object");
+  rejectCredentialMetadata(raw, "fixture inspect");
+  const config = projectRequiredFields(raw.Config, [
+    "Cmd", "Entrypoint", "Env", "Image", "Labels", "OpenStdin", "StdinOnce", "Tty", "User", "WorkingDir",
+  ], "fixture Config");
+  const hostConfig = projectRequiredFields(raw.HostConfig, [
+    "Binds", "CapDrop", "DeviceRequests", "Devices", "IpcMode", "Init", "LogConfig", "Memory", "MemorySwap",
+    "Mounts", "NanoCpus", "NetworkMode", "PidMode", "PidsLimit", "PortBindings", "Privileged", "ReadonlyRootfs",
+    "RestartPolicy", "SecurityOpt", "ShmSize", "Tmpfs", "UsernsMode", "VolumesFrom",
+  ], "fixture HostConfig", ["Mounts"]);
+  const value = {
+    ...projectRequiredFields(raw, ["Id", "Image", "Name", "Mounts"], "fixture inspect entry"),
+    Config: config,
+    HostConfig: hostConfig,
+    NetworkSettings: projectRequiredFields(raw.NetworkSettings, ["Networks", "Ports"], "fixture NetworkSettings"),
+  };
+  if (phase !== "prestart") {
+    value.State = projectRequiredFields(raw.State, [
+      "Dead", "Error", "ExitCode", "FinishedAt", "OOMKilled", "Paused", "Pid", "Restarting", "Running", "StartedAt", "Status",
+    ], "fixture State");
+  }
+  if (phase === "healthy") value.Health = projectRequiredFields(raw.State?.Health, ["Status"], "fixture Health");
+  return { raw, value };
+};
+
 const expectedBuildArgs = (revision, version) => ({
   ALL_PROXY: "", FTP_PROXY: "", HTTPS_PROXY: "", HTTP_PROXY: "", NO_PROXY: "",
   WMUX_REVISION: revision, WMUX_VERSION: version,
@@ -1194,12 +1252,8 @@ const validateRunningState = (state, name) => {
   }
 };
 
-const validateCreatedContainerState = async ([containerId, name]) => {
-  const value = await parseStdinJson();
-  exactKeys(value, ["Id", "State"], `${name} prestart inspect`);
-  if (value.Id !== containerId) fail(`${name} prestart container ID drift`);
-  exactKeys(value.State, ["Dead", "Error", "ExitCode", "FinishedAt", "OOMKilled", "Paused", "Pid", "Restarting", "Running", "StartedAt", "Status"], `${name} prestart State`);
-  const state = value.State;
+const validateCreatedState = (state, name) => {
+  exactKeys(state, ["Dead", "Error", "ExitCode", "FinishedAt", "OOMKilled", "Paused", "Pid", "Restarting", "Running", "StartedAt", "Status"], `${name} prestart State`);
   if (state.Status !== "created" || state.Running !== false || state.Paused !== false || state.Restarting !== false
     || state.OOMKilled !== false || state.Dead !== false || state.Pid !== 0 || state.ExitCode !== 0 || state.Error !== ""
     || state.StartedAt !== "0001-01-01T00:00:00Z" || state.FinishedAt !== "0001-01-01T00:00:00Z") {
@@ -1207,10 +1261,17 @@ const validateCreatedContainerState = async ([containerId, name]) => {
   }
 };
 
+const validateCreatedContainerState = async ([containerId, name]) => {
+  const value = await parseStdinJson();
+  exactKeys(value, ["Id", "State"], `${name} prestart inspect`);
+  if (value.Id !== containerId) fail(`${name} prestart container ID drift`);
+  validateCreatedState(value.State, name);
+};
+
 const validateFixtureContainer = async ([project, revision, runId, fixtureName, containerId, networkName, networkId,
   imageId, imageInspectFile, baseUrl], phase) => {
   const imageInspect = readJsonFile(imageInspectFile, "E2E candidate image identity");
-  const value = await parseStdinJson();
+  const { raw, value } = await projectFixtureInspect(phase);
   const expectedKeys = ["Id", "Image", "Name", "Config", "HostConfig", "NetworkSettings", "Mounts"];
   if (phase !== "prestart") expectedKeys.push("State");
   if (phase === "healthy") expectedKeys.push("Health");
@@ -1262,7 +1323,12 @@ const validateFixtureContainer = async ([project, revision, runId, fixtureName, 
     exactKeys(value.NetworkSettings.Ports, ["3478/tcp"], "fixture realized ports");
     if (value.NetworkSettings.Ports["3478/tcp"] !== null) fail("fixture realized port drift");
   }
-  if (phase !== "prestart") validateRunningState(value.State, "fixture");
+  if (phase === "prestart") {
+    const state = projectRequiredFields(raw.State, [
+      "Dead", "Error", "ExitCode", "FinishedAt", "OOMKilled", "Paused", "Pid", "Restarting", "Running", "StartedAt", "Status",
+    ], "fixture State");
+    validateCreatedState(state, "fixture");
+  } else validateRunningState(value.State, "fixture");
   if (phase === "healthy") {
     exactKeys(value.Health, ["Status"], "fixture Health");
     if (value.Health.Status !== "healthy") fail("fixture is not healthy");

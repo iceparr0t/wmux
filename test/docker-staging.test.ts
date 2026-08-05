@@ -280,11 +280,13 @@ if [ "$1" = rm ] && [ "$2" = -f ]; then
 fi
 if [ "$1" = exec ]; then printf '1000\n'; exit; fi
 if [ "$1" = inspect ]; then
+  native_fixture=0
   if [ "$2" != --format ]; then
     case "$2" in
-      '${runnerContainerId}') has runner-id;; '${fixtureContainerId}') has fixture-id;;
-      *fixture*) has fixture;; *runner*) has runner;; *) has container;;
-    esac; exit
+      '${fixtureContainerId}') has fixture-id || exit 1; native_fixture=1;;
+      '${runnerContainerId}') has runner-id; exit;;
+      *fixture*) has fixture; exit;; *runner*) has runner; exit;; *) has container; exit;;
+    esac
   fi
   if [ "$3" = '{{.Id}}' ]; then
     case "$4" in
@@ -332,14 +334,13 @@ if [ "$1" = inspect ]; then
       printf '{"Id":"%s","State":{"Dead":false,"Error":"","ExitCode":0,"FinishedAt":"0001-01-01T00:00:00Z","OOMKilled":false,"Paused":false,"Pid":0,"Restarting":false,"Running":false,"StartedAt":"0001-01-01T00:00:00Z","Status":"%s"}}\n' "$4" "$status"
       exit;; esac;;
   esac
-  if [ "$4" = '${fixtureContainerId}' ]; then
+  if [ "$4" = '${fixtureContainerId}' ] || [ "$native_fixture" = 1 ]; then
     started=0; has fixture-started && started=1
-    healthy=0; case "$3" in *'"Health"'*) healthy=1;; esac
-    post=0; case "$3" in *'"State"'*) post=1;; esac
+    healthy=0; has fixture-healthy && healthy=1
+    post=$started
     [ "$post" = "$started" ] || exit 79
-    if ctl fixture-hostconfig-mounts-absent; then case "$3" in *'json (index .HostConfig "Mounts")'*) ;; *) exit 77;; esac; fi
     node -e '
-      const fs=require("node:fs"),s=process.argv[1],post=process.argv[2]==="1",healthy=process.argv[3]==="1";
+      const fs=require("node:fs"),s=process.argv[1],post=process.argv[2]==="1",healthy=process.argv[3]==="1",native=process.argv[4]==="1";
       const read=n=>fs.readFileSync(s+"/"+n,"utf8"),ctl=n=>fs.existsSync(s+"/control-"+n);
       const p=read("project"),r=read("fixture-revision"),run=read("fixture-run"),name=read("fixture-name"),net=read("fixture-network"),url=read("fixture-url");
       const opt=(mode,size)=>"rw,nosuid,nodev,noexec,mode="+mode+",size="+size+",uid=1000,gid=1000";
@@ -348,11 +349,14 @@ if [ "$1" = inspect ]; then
       const env=["PATH=/usr/bin:/bin","NODE_ENV=production","HOME=/home/node","WMUX_PORT=3478","WMUX_BUILD_REVISION="+r,"WMUX_E2E_RUN_ID="+run,"WMUX_E2E_BASE_URL="+url];
       const networkId=post?"${e2eNetworkId}":"";
       const ports=post?{"3478/tcp":null}:{};
-      const value={Id:"${fixtureContainerId}",Image:"${imageId}",Name:"/"+name,Config:{Cmd:["run"],Entrypoint:["/usr/local/lib/wmux/e2e-fixture-bootstrap"],Env:env,Image:"${imageId}",Labels:labels,OpenStdin:true,StdinOnce:true,Tty:false,User:"1000:1000",WorkingDir:"/app"},HostConfig:h,NetworkSettings:{Networks:{[net]:{NetworkID:networkId}},Ports:ports},Mounts:[]};
-      if(post)value.State={Dead:false,Error:"",ExitCode:0,FinishedAt:"0001-01-01T00:00:00Z",OOMKilled:false,Paused:false,Pid:2345,Restarting:false,Running:true,StartedAt:"2026-08-05T12:00:01.000000000Z",Status:"running"};
-      if(healthy)value.Health={Status:ctl("fixture-health-drift")?"unhealthy":"healthy"};
+      const state=post
+        ? {Dead:false,Error:"",ExitCode:0,FinishedAt:"0001-01-01T00:00:00Z",OOMKilled:false,Paused:false,Pid:2345,Restarting:false,Running:true,StartedAt:"2026-08-05T12:00:01.000000000Z",Status:"running"}
+        : {Dead:false,Error:"",ExitCode:0,FinishedAt:"0001-01-01T00:00:00Z",OOMKilled:false,Paused:false,Pid:0,Restarting:false,Running:false,StartedAt:"0001-01-01T00:00:00Z",Status:"created"};
+      if(!post&&ctl("fixture-prestart-state-drift"))state.Status="running";
+      if(healthy)state.Health={Status:ctl("fixture-health-drift")?"unhealthy":"healthy",FailingStreak:0,Log:[]};
+      const value={Id:"${fixtureContainerId}",Created:"2026-08-05T12:00:00.000000000Z",Path:"/usr/local/lib/wmux/e2e-fixture-bootstrap",Args:["run"],Image:"${imageId}",Name:"/"+name,Config:{AttachStderr:true,AttachStdin:true,AttachStdout:true,Cmd:["run"],Entrypoint:["/usr/local/lib/wmux/e2e-fixture-bootstrap"],Env:env,ExposedPorts:{"3478/tcp":{}},Hostname:"fixture",Image:"${imageId}",Labels:labels,OpenStdin:true,StdinOnce:true,Tty:false,User:"1000:1000",WorkingDir:"/app"},HostConfig:h,NetworkSettings:{Bridge:"",Networks:{[net]:{Aliases:["wmux-e2e-fixture"],NetworkID:networkId}},Ports:ports,SandboxID:post?"sandbox":""},Mounts:[],State:state};
       if(ctl("fixture-inspect-privileged"))h.Privileged=true;
-      if(ctl("fixture-hostconfig-mounts-absent"))h.Mounts=null;
+      if(ctl("fixture-hostconfig-mounts-absent"))delete h.Mounts;
       if(ctl("fixture-inspect-mount")){h.Mounts=[{Type:"bind",Source:"/etc",Target:"/host",ReadOnly:true}];value.Mounts=[{Type:"bind",Source:"/etc",Destination:"/host",RW:false,Propagation:"rprivate"}];}
       if(ctl("fixture-inspect-token-env"))env.push("WMUX_TOKEN=metadata-secret");
       if(ctl("fixture-hostconfig-port"))h.PortBindings={"3478/tcp":[{HostIp:"0.0.0.0",HostPort:"3478"}]};
@@ -361,8 +365,11 @@ if [ "$1" = inspect ]; then
       if(post&&ctl("fixture-running-realized-port"))value.NetworkSettings.Ports={"3478/tcp":[{HostIp:"0.0.0.0",HostPort:"3478"}]};
       if(post&&ctl("fixture-running-realized-extra-port"))value.NetworkSettings.Ports={"3478/tcp":null,"8080/tcp":null};
       if(post&&ctl("fixture-post-inspect-state"))value.State.Running=false;
-      process.stdout.write(JSON.stringify(value));
-    ' "$STATE" "$post" "$healthy"
+      if(native&&ctl("fixture-inspect-malformed"))process.stdout.write("{");
+      else if(native&&ctl("fixture-inspect-empty"))process.stdout.write("[]");
+      else if(native&&ctl("fixture-inspect-multiple"))process.stdout.write(JSON.stringify([value,value]));
+      else process.stdout.write(JSON.stringify(native?[value]:value));
+    ' "$STATE" "$post" "$healthy" "$native_fixture"
     if [ "$post" = 1 ]; then touch "$STATE/fixture-post-inspected"; fi
     exit
   fi
@@ -879,7 +886,8 @@ test("fixture and internal-network policy rejects identity, resource, mount, met
     server = startHttpFixture(fixture.directory, "ok", fixture.port);
     for (const control of [
       "e2e-network-internal-drift", "fixture-create-fail", "fixture-inspect-privileged", "fixture-inspect-mount",
-      "fixture-inspect-token-env", "fixture-hostconfig-port", "fixture-prestart-realized-port", "fixture-prestart-realized-extra-port", "fixture-running-realized-port", "fixture-running-realized-extra-port", "fixture-prestart-state-drift", "fixture-start-fail", "fixture-post-inspect-state", "fixture-health-drift", "fixture-health-fail",
+      "fixture-inspect-token-env", "fixture-inspect-malformed", "fixture-inspect-empty", "fixture-inspect-multiple",
+      "fixture-hostconfig-port", "fixture-prestart-realized-port", "fixture-prestart-realized-extra-port", "fixture-running-realized-port", "fixture-running-realized-extra-port", "fixture-prestart-state-drift", "fixture-start-fail", "fixture-post-inspect-state", "fixture-health-drift", "fixture-health-fail",
     ]) {
       const controlPath = path.join(fixture.state, `control-${control}`); fs.writeFileSync(controlPath, "");
       const before = fs.statSync(fixture.log).size;
@@ -900,7 +908,7 @@ test("fixture and internal-network policy rejects identity, resource, mount, met
   } finally { server?.kill(); removeFixture(fixture); }
 });
 
-test("fixture accepts a Docker-safe null HostConfig.Mounts inspect value", () => {
+test("fixture accepts a native Docker inspect array with optional HostConfig.Mounts missing", () => {
   const fixture = makeFixture();
   let server: ChildProcess | undefined;
   try {
