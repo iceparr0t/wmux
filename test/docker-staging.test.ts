@@ -347,13 +347,19 @@ if [ "$1" = inspect ]; then
       const labels={"org.opencontainers.image.revision":r,"wmux.staging.e2e":"true","wmux.staging.project":p,"wmux.staging.revision":r,"wmux.staging.role":"fixture","wmux.staging.run":run};
       const env=["PATH=/usr/bin:/bin","NODE_ENV=production","HOME=/home/node","WMUX_PORT=3478","WMUX_BUILD_REVISION="+r,"WMUX_E2E_RUN_ID="+run,"WMUX_E2E_BASE_URL="+url];
       const networkId=post?"${e2eNetworkId}":"";
-      const value={Id:"${fixtureContainerId}",Image:"${imageId}",Name:"/"+name,Config:{Cmd:["run"],Entrypoint:["/usr/local/lib/wmux/e2e-fixture-bootstrap"],Env:env,Image:"${imageId}",Labels:labels,OpenStdin:true,StdinOnce:true,Tty:false,User:"1000:1000",WorkingDir:"/app"},HostConfig:h,NetworkSettings:{Networks:{[net]:{NetworkID:networkId}},Ports:{}},Mounts:[]};
+      const ports=post?{"3478/tcp":null}:{};
+      const value={Id:"${fixtureContainerId}",Image:"${imageId}",Name:"/"+name,Config:{Cmd:["run"],Entrypoint:["/usr/local/lib/wmux/e2e-fixture-bootstrap"],Env:env,Image:"${imageId}",Labels:labels,OpenStdin:true,StdinOnce:true,Tty:false,User:"1000:1000",WorkingDir:"/app"},HostConfig:h,NetworkSettings:{Networks:{[net]:{NetworkID:networkId}},Ports:ports},Mounts:[]};
       if(post)value.State={Dead:false,Error:"",ExitCode:0,FinishedAt:"0001-01-01T00:00:00Z",OOMKilled:false,Paused:false,Pid:2345,Restarting:false,Running:true,StartedAt:"2026-08-05T12:00:01.000000000Z",Status:"running"};
       if(healthy)value.Health={Status:ctl("fixture-health-drift")?"unhealthy":"healthy"};
       if(ctl("fixture-inspect-privileged"))h.Privileged=true;
       if(ctl("fixture-hostconfig-mounts-absent"))h.Mounts=null;
       if(ctl("fixture-inspect-mount")){h.Mounts=[{Type:"bind",Source:"/etc",Target:"/host",ReadOnly:true}];value.Mounts=[{Type:"bind",Source:"/etc",Destination:"/host",RW:false,Propagation:"rprivate"}];}
       if(ctl("fixture-inspect-token-env"))env.push("WMUX_TOKEN=metadata-secret");
+      if(ctl("fixture-hostconfig-port"))h.PortBindings={"3478/tcp":[{HostIp:"0.0.0.0",HostPort:"3478"}]};
+      if(!post&&ctl("fixture-prestart-realized-port"))value.NetworkSettings.Ports={"3478/tcp":[{HostIp:"0.0.0.0",HostPort:"3478"}]};
+      if(!post&&ctl("fixture-prestart-realized-extra-port"))value.NetworkSettings.Ports={"8080/tcp":null};
+      if(post&&ctl("fixture-running-realized-port"))value.NetworkSettings.Ports={"3478/tcp":[{HostIp:"0.0.0.0",HostPort:"3478"}]};
+      if(post&&ctl("fixture-running-realized-extra-port"))value.NetworkSettings.Ports={"3478/tcp":null,"8080/tcp":null};
       if(post&&ctl("fixture-post-inspect-state"))value.State.Running=false;
       process.stdout.write(JSON.stringify(value));
     ' "$STATE" "$post" "$healthy"
@@ -873,7 +879,7 @@ test("fixture and internal-network policy rejects identity, resource, mount, met
     server = startHttpFixture(fixture.directory, "ok", fixture.port);
     for (const control of [
       "e2e-network-internal-drift", "fixture-create-fail", "fixture-inspect-privileged", "fixture-inspect-mount",
-      "fixture-inspect-token-env", "fixture-prestart-state-drift", "fixture-start-fail", "fixture-post-inspect-state", "fixture-health-drift", "fixture-health-fail",
+      "fixture-inspect-token-env", "fixture-hostconfig-port", "fixture-prestart-realized-port", "fixture-prestart-realized-extra-port", "fixture-running-realized-port", "fixture-running-realized-extra-port", "fixture-prestart-state-drift", "fixture-start-fail", "fixture-post-inspect-state", "fixture-health-drift", "fixture-health-fail",
     ]) {
       const controlPath = path.join(fixture.state, `control-${control}`); fs.writeFileSync(controlPath, "");
       const before = fs.statSync(fixture.log).size;
@@ -905,6 +911,19 @@ test("fixture accepts a Docker-safe null HostConfig.Mounts inspect value", () =>
     assert.equal(result.status, 0, result.stderr);
     assert.equal(fs.existsSync(path.join(fixture.state, "fixture")), false);
     assert.equal(fs.existsSync(path.join(fixture.state, "e2e-network")), false);
+    assert.equal(run(fixture, "down").status, 0);
+  } finally { server?.kill(); removeFixture(fixture); }
+});
+
+test("fixture accepts only its image-declared unbound realized port", () => {
+  const fixture = makeFixture();
+  let server: ChildProcess | undefined;
+  try {
+    assert.equal(run(fixture, "up").status, 0);
+    server = startHttpFixture(fixture.directory, "ok", fixture.port);
+    const result = run(fixture, "e2e");
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.existsSync(path.join(fixture.state, "fixture")), false);
     assert.equal(run(fixture, "down").status, 0);
   } finally { server?.kill(); removeFixture(fixture); }
 });

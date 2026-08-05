@@ -41,6 +41,12 @@ const requireEmptyList = (value, name) => {
   if (value !== null && (!Array.isArray(value) || value.length !== 0)) fail(`${name} must be empty`);
 };
 
+const requireEmptyMap = (value, name) => {
+  if (value !== null && (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).length !== 0)) {
+    fail(`${name} must be empty`);
+  }
+};
+
 const requireOptionalStringList = (value, name) => {
   if (value !== null && (!Array.isArray(value) || value.some((entry) => typeof entry !== "string"))) {
     fail(`${name} must be null or a string array`);
@@ -1250,7 +1256,12 @@ const validateFixtureContainer = async ([project, revision, runId, fixtureName, 
   if (phase === "prestart") {
     if (attachedNetworkId !== "" && attachedNetworkId !== networkId) fail("fixture pre-start network ID drift");
   } else if (attachedNetworkId !== networkId) fail("fixture running network ID drift");
-  if (value.NetworkSettings.Ports !== null && Object.keys(value.NetworkSettings.Ports).length !== 0) fail("fixture realized ports must be empty");
+  if (phase === "prestart") {
+    requireEmptyMap(value.NetworkSettings.Ports, "fixture pre-start realized ports");
+  } else {
+    exactKeys(value.NetworkSettings.Ports, ["3478/tcp"], "fixture realized ports");
+    if (value.NetworkSettings.Ports["3478/tcp"] !== null) fail("fixture realized port drift");
+  }
   if (phase !== "prestart") validateRunningState(value.State, "fixture");
   if (phase === "healthy") {
     exactKeys(value.Health, ["Status"], "fixture Health");
