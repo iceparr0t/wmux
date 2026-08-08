@@ -3,6 +3,11 @@ import type { AgentInputQuestion, AgentInputRequestState } from "./types";
 const MAX_ANSWER_VALUE_BYTES = 4_096;
 const MAX_ANSWER_BYTES = 16_384;
 const utf8Bytes = (value: string): number => new TextEncoder().encode(value).byteLength;
+const DECEPTIVE_DISPLAY_CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u27e6\u27e7\p{Cf}]/gu;
+
+export const escapeAgentInputDisplayControls = (value: string): string =>
+  value.replace(DECEPTIVE_DISPLAY_CONTROL, (character) =>
+    `⟦U+${character.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}⟧`);
 
 export const isAgentInputRequestVisible = (state: AgentInputRequestState): boolean =>
   state !== "answered"

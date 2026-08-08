@@ -3,6 +3,7 @@ import { api, UnauthorizedError } from "./api";
 import type { AgentInputAnswerResult, AgentInputQuestion, AgentInputRequest } from "./types";
 import {
   buildAgentInputAnswers,
+  escapeAgentInputDisplayControls,
   newAgentInputSubmissionId,
   validAgentInputAnswers,
 } from "./agent-input-reference";
@@ -95,8 +96,8 @@ const AgentInputRequestCard = ({
       <header><strong>[INPUT] OPENCODE</strong><span>{displayState.replaceAll("_", " ")}</span></header>
       {request.questions.map((question, questionIndex) => (
         <fieldset key={`${request.id}:${questionIndex}`} disabled={!editable}>
-          <legend>{question.header}</legend>
-          <p>{question.question}</p>
+          <legend><bdi className="agent-input-display-text">{escapeAgentInputDisplayControls(question.header)}</bdi></legend>
+          <p><bdi className="agent-input-display-text">{escapeAgentInputDisplayControls(question.question)}</bdi></p>
           {question.options.map((option) => (
             <label key={option.label}>
               <input
@@ -105,13 +106,16 @@ const AgentInputRequestCard = ({
                 checked={selected[questionIndex].includes(option.label)}
                 onChange={() => toggle(question, questionIndex, option.label)}
               />
-              <span>{option.label}<small>{option.description}</small></span>
+              <span>
+                <bdi className="agent-input-display-text">{escapeAgentInputDisplayControls(option.label)}</bdi>
+                <small><bdi className="agent-input-display-text">{escapeAgentInputDisplayControls(option.description)}</bdi></small>
+              </span>
             </label>
           ))}
           {question.custom ? (
             <input
               className="agent-input-custom"
-              aria-label={`${question.header} custom answer`}
+              aria-label={`${escapeAgentInputDisplayControls(question.header)} custom answer`}
               value={custom[questionIndex]}
               maxLength={4096}
               placeholder="Custom response"

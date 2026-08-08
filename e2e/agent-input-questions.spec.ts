@@ -1,5 +1,5 @@
 import { expect, test, type WebSocketRoute } from "./fixtures";
-import type { AgentInputRequest, BootstrapPayload, TerminalNotification } from "../src/shared/protocol.js";
+import type { AgentInputRequest, BootstrapPayload, PaneClientMessage, PaneServerMessage, TerminalNotification } from "../src/shared/protocol.js";
 
 test("rendered OpenCode shelf submits exact answers, renders outcomes, routes notifications, and resyncs gaps", async ({ page, request }, testInfo) => {
   test.setTimeout(150_000);
@@ -77,6 +77,15 @@ test("rendered OpenCode shelf submits exact answers, renders outcomes, routes no
     const contiguousRequest = makeRequest("input-rendered-contiguous", [
       { header: "Delta", question: "Contiguous", options: [{ label: "OK", description: "OK" }], multiple: false, custom: false },
     ]);
+    const deceptive = makeRequest("input-rendered-deceptive", [
+      {
+        header: "SAFE\u202Etxt",
+        question: "Apply\u2066 now\u2069",
+        options: [{ label: "Approve\u200F", description: "detail\u0007" }],
+        multiple: false,
+        custom: true,
+      },
+    ]);
     const href = `/workspaces/${encodeURIComponent(target.id)}/tabs/${encodeURIComponent(targetTab.id)}?agentInput=${main.id}&generation=${main.generation}`;
     const notification: TerminalNotification = {
       id: "agent-input-rendered-note",
@@ -107,6 +116,7 @@ test("rendered OpenCode shelf submits exact answers, renders outcomes, routes no
         staleRejected,
         staleCancelled,
         staleClosed,
+        deceptive,
       ],
       futureServerField: { ignoredByOlderClients: true },
     };
@@ -178,10 +188,16 @@ test("rendered OpenCode shelf submits exact answers, renders outcomes, routes no
     await expect(page.locator("main.app-shell")).toBeVisible({ timeout: 20_000 });
     await expect.poll(() => Boolean(eventSocket)).toBeTruthy();
     await page.waitForTimeout(200);
-    expect(await page.evaluate(async () => (await (await fetch("/api/bootstrap")).json()).agentInputRequests.length)).toBe(11);
+    expect(await page.evaluate(async () => (await (await fetch("/api/bootstrap")).json()).agentInputRequests.length)).toBe(12);
     for (const requestItem of [staleRejected, staleCancelled, staleClosed]) {
       await expect(page.locator(`[data-request-id="${requestItem.id}"]`)).toHaveCount(0);
     }
+    const deceptiveCard = page.locator(`[data-request-id="${deceptive.id}"]`);
+    await expect(deceptiveCard).toContainText("SAFE⟦U+202E⟧txt");
+    await expect(deceptiveCard).toContainText("Apply⟦U+2066⟧ now⟦U+2069⟧");
+    await expect(deceptiveCard.getByRole("radio")).toHaveAccessibleName("Approve⟦U+200F⟧ detail⟦U+0007⟧");
+    await expect(deceptiveCard.getByRole("textbox")).toHaveAccessibleName("SAFE⟦U+202E⟧txt custom answer");
+    expect(await deceptiveCard.textContent()).not.toMatch(/[\u0007\u200f\u202e\u2066\u2069]/u);
 
     const mainCard = page.locator(`[data-request-id="${main.id}"]`);
     await expect(mainCard).toBeVisible();
@@ -296,6 +312,7 @@ test("rendered OpenCode shelf submits exact answers, renders outcomes, routes no
         staleRejected,
         staleCancelled,
         staleClosed,
+        deceptive,
         contiguousRequest,
         gapRequest,
       ],
@@ -343,4 +360,101 @@ test("old bootstrap without agentInputRequests renders safely with an agentInput
   await expect(page.locator("main.app-shell")).toBeVisible({ timeout: 20_000 });
   await expect(page.locator("[data-request-id]")).toHaveCount(0);
   expect(pageErrors).toEqual([]);
+});
+
+test("hard-proof instrumentation observes and delivers full-duplex pane input", async ({ page, request }, testInfo) => {
+  test.skip(testInfo.project.name !== "chromium", "desktop full-duplex proof instrumentation");
+  const created = await request.post("/api/workspaces", { data: { machineId: "local" } });
+  expect(created.ok()).toBeTruthy();
+  const workspace = (await created.json() as { workspace: BootstrapPayload["workspaces"][number] }).workspace;
+  const tab = workspace.tabs[0]!;
+  const pane = tab.panes[0]!;
+  const marker = "WMUX_FULL_DUPLEX_PROOF_SOCKET_OK";
+  const octalMarker = [...marker].map((character) => `\\${character.charCodeAt(0).toString(8).padStart(3, "0")}`).join("");
+  const command = `printf '${octalMarker}\\n'`;
+  let observedInput = "";
+  let observedOutput = "";
+  try {
+    await page.routeWebSocket(new RegExp(`/ws/panes/${pane.id}(?:\\?.*)?$`), (socket) => {
+      const server = socket.connectToServer();
+      socket.onMessage((message) => {
+        if (typeof message === "string") {
+          try {
+            const parsed = JSON.parse(message) as PaneClientMessage;
+            if (parsed.type === "input") observedInput += parsed.data;
+          } catch {
+            // Forward malformed fixture traffic; the assertions cannot use it.
+          }
+        }
+        server.send(message);
+      });
+      server.onMessage((message) => {
+        if (typeof message === "string") {
+          try {
+            const parsed = JSON.parse(message) as PaneServerMessage;
+            if (parsed.type === "ready") observedOutput += parsed.replay;
+            if (parsed.type === "output") observedOutput += parsed.data;
+          } catch {
+            // Forward malformed fixture traffic; the assertions cannot use it.
+          }
+        }
+        socket.send(message);
+      });
+    });
+    await page.goto(`/workspaces/${workspace.id}/tabs/${tab.id}`);
+    await expect(page.locator("main.app-shell")).toBeVisible({ timeout: 20_000 });
+    await expect.poll(async () => {
+      const current = await request.get("/api/bootstrap");
+      const payload = await current.json() as BootstrapPayload;
+      return payload.workspaces.find((candidate) => candidate.id === workspace.id)
+        ?.tabs.find((candidate) => candidate.id === tab.id)
+        ?.panes.find((candidate) => candidate.id === pane.id)?.status;
+    }, { timeout: 20_000 }).toBe("running");
+    const proofStart = await request.post("/api/proof/opencode-question", {
+      data: { paneId: pane.id, nonce: "0123456789abcdef" },
+    });
+    expect(proofStart.status()).toBe(201);
+    const proofId = (await proofStart.json() as { id: string }).id;
+    await page.evaluate(async ({ paneId, input }) => {
+      await new Promise<void>((resolve, reject) => {
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const query = new URLSearchParams({ cols: "100", rows: "32" });
+        const token = window.localStorage.getItem("wmux.token");
+        if (token) query.set("token", token);
+        const socket = new WebSocket(`${protocol}//${window.location.host}/ws/panes/${encodeURIComponent(paneId)}?${query}`);
+        const timeout = window.setTimeout(() => reject(new Error("full-duplex fixture socket timed out")), 20_000);
+        socket.addEventListener("message", (event) => {
+          if (typeof event.data !== "string") return;
+          const message = JSON.parse(event.data) as { type?: string; outputOnly?: boolean };
+          if (message.type !== "ready") return;
+          if (message.outputOnly) {
+            reject(new Error("fixture received an output-only socket"));
+            return;
+          }
+          socket.send(JSON.stringify({ type: "input", data: input }));
+          socket.send(JSON.stringify({ type: "input", data: "\r" }));
+          socket.send(JSON.stringify({ type: "input", data: "Al", terminalResponse: true }));
+          socket.send(JSON.stringify({ type: "input", data: "pha", terminalResponse: true }));
+          window.clearTimeout(timeout);
+          window.setTimeout(() => {
+            socket.close();
+            resolve();
+          }, 250);
+        });
+      });
+    }, { paneId: pane.id, input: command });
+    await expect.poll(() => observedInput.includes(command)).toBe(true);
+    expect(observedInput).not.toContain(marker);
+    await expect.poll(() => observedOutput.includes(marker), { timeout: 20_000 }).toBe(true);
+    const proofFinish = await request.delete(`/api/proof/opencode-question/${proofId}`);
+    expect(proofFinish.ok()).toBeTruthy();
+    expect(await proofFinish.json()).toMatchObject({
+      userWrites: 2,
+      terminalResponseWrites: 2,
+      answerBytesObserved: true,
+      syntheticEnterObserved: true,
+    });
+  } finally {
+    await request.delete(`/api/workspaces/${workspace.id}`).catch(() => undefined);
+  }
 });

@@ -27,7 +27,8 @@ const principal = (kind: AuthPrincipal["kind"]): AuthPrincipal => kind === "brow
     : { kind } as AuthPrincipal;
 
 const routeCases: Array<[string, string, string]> = [
-  ["health", "GET", "/api/health"], ["auth-info", "GET", "/api/auth-info"], ["login", "POST", "/api/login"],
+  ["health", "GET", "/api/health"], ["repository-provenance", "GET", "/api/provenance"],
+  ["auth-info", "GET", "/api/auth-info"], ["login", "POST", "/api/login"],
   ["auth-session", "GET", "/api/auth/session"],
   ["auth-sessions", "GET", "/api/auth/sessions"],
   ["auth-session-revoke", "DELETE", "/api/auth/sessions/session"],
@@ -48,6 +49,8 @@ const routeCases: Array<[string, string, string]> = [
   ["agent-input-native-pending-reconcile", "POST", "/api/agent-input/sources/source/requests/request/pending"],
   ["agent-input-native-resolve", "POST", "/api/agent-input/sources/source/requests/request/resolve"],
   ["agent-input-answer", "POST", "/api/agent-input/requests/request/answer"],
+  ["opencode-question-proof-start", "POST", "/api/proof/opencode-question"],
+  ["opencode-question-proof-finish", "DELETE", "/api/proof/opencode-question/00000000-0000-4000-8000-000000000000"],
   ["delegation-status", "GET", "/api/delegations/run"],
   ["machine-management-list", "GET", "/api/machines/manage"],
   ["machine-management-create", "POST", "/api/machines"],
@@ -98,6 +101,10 @@ test("browser, automation, helper, registration, and legacy policies are separat
     return found;
   };
   assert.equal(authorizeHttpPrincipal(auth, principal("browser-session"), policy("POST", "/api/settings")), true);
+  assert.equal(authorizeHttpPrincipal(auth, principal("browser-session"), policy("POST", "/api/proof/opencode-question")), true);
+  assert.equal(authorizeHttpPrincipal(auth, principal("automation"), policy("POST", "/api/proof/opencode-question")), false);
+  assert.equal(authorizeHttpPrincipal(auth, principal("browser-session"), policy("GET", "/api/provenance")), true);
+  assert.equal(authorizeHttpPrincipal(auth, principal("automation"), policy("GET", "/api/provenance")), false);
   assert.equal(authorizeHttpPrincipal(auth, principal("browser-session"), policy("GET", "/api/helpers/windows/win")), false);
   assert.equal(authorizeHttpPrincipal(auth, principal("browser-session"), policy("GET", "/api/helpers/windows/win/bootstrap")), false);
   assert.equal(authorizeHttpPrincipal(auth, principal("automation"), policy("GET", "/api/bootstrap")), true);

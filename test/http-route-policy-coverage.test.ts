@@ -13,6 +13,7 @@ import { StateStore } from "../src/server/state.js";
 
 const documentedRoutes = [
   ["health", "GET", "/api/health"],
+  ["repository-provenance", "GET", "/api/provenance"],
   ["auth-info", "GET", "/api/auth-info"],
   ["login", "POST", "/api/login"],
   ["bootstrap", "GET", "/api/bootstrap"],
@@ -43,6 +44,8 @@ const documentedRoutes = [
   ["agent-input-native-pending-reconcile", "POST", "/api/agent-input/sources/source/requests/request/pending"],
   ["agent-input-native-resolve", "POST", "/api/agent-input/sources/source/requests/request/resolve"],
   ["agent-input-answer", "POST", "/api/agent-input/requests/request/answer"],
+  ["opencode-question-proof-start", "POST", "/api/proof/opencode-question"],
+  ["opencode-question-proof-finish", "DELETE", "/api/proof/opencode-question/00000000-0000-4000-8000-000000000000"],
   ["repository-snapshot-read", "GET", "/api/repository-snapshots/snapshot"],
   ["run-event", "POST", "/api/run-events"],
   ["stream-request", "POST", "/api/streams/linux-box/request"],

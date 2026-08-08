@@ -18,7 +18,7 @@ const externalStorageState = externalBaseURL && externalToken ? {
 
 export default defineConfig({
   testDir: "./e2e",
-  testIgnore: "auth-login-only.spec.ts",
+  testIgnore: ["auth-login-only.spec.ts", "opencode-question-live-proof.spec.ts"],
   outputDir: "test-results/playwright",
   timeout: 90_000,
   fullyParallel: false,

@@ -46,6 +46,72 @@ test("registered sessions never receive the broad wmux API token", () => {
   assert.equal(sessionAccessTokenForMachine({ ...registered, source: "config" }, "broad-token"), "broad-token");
 });
 
+test("pane-input proof observes the actual backend write boundary without retaining answers", () => {
+  const dir = fs.mkdtempSync(path.join(canonicalTempRoot, "wmux-pane-input-proof-"));
+  const machine: MachineConfig = { id: "local", name: "Local", kind: "local" };
+  const state = new StateStore([machine], path.join(dir, "state.json"));
+  const workspace = state.createWorkspace(machine.id);
+  const pane = workspace.tabs[0]!.panes[0]!;
+  state.updatePane(pane.id, { status: "running" });
+  const manager = new SessionManager(state, [machine]);
+  const writes: Array<{ data: string; terminalResponse?: boolean }> = [];
+  const session = { isExited: false };
+  const internals = manager as unknown as {
+    sessions: Map<string, typeof session>;
+    backends: Map<string, { write: (candidate: unknown, data: string, terminalResponse?: boolean) => void }>;
+    writePaneBackend: (paneId: string, candidate: unknown, data: string, terminalResponse: boolean) => void;
+  };
+  internals.sessions.set(pane.id, session);
+  internals.backends.set(pane.id, {
+    write: (_candidate, data, terminalResponse) => writes.push({ data, terminalResponse }),
+  });
+  try {
+    const proof = manager.beginPaneInputProof(pane.id, "0123456789abcdef");
+    assert.equal(manager.writePane(pane.id, "Alpha\r"), true);
+    internals.writePaneBackend(pane.id, session, "\u001b[0n", true);
+    assert.deepEqual(manager.finishPaneInputProof(proof.id), {
+      id: proof.id,
+      paneId: pane.id,
+      backendWrites: 2,
+      userWrites: 1,
+      terminalResponseWrites: 1,
+      answerBytesObserved: true,
+      syntheticEnterObserved: true,
+    });
+    assert.deepEqual(writes, [
+      { data: "Alpha\r", terminalResponse: false },
+      { data: "\u001b[0n", terminalResponse: true },
+    ]);
+    assert.throws(() => manager.finishPaneInputProof(proof.id), /proof_not_found/);
+
+    for (const answer of ["Alpha", "One", "Two", "custom-0123456789abcdef"]) {
+      for (let split = 1; split < answer.length; split += 1) {
+        const fragmented = manager.beginPaneInputProof(pane.id, "0123456789abcdef");
+        internals.writePaneBackend(pane.id, session, answer.slice(0, split), true);
+        internals.writePaneBackend(pane.id, session, answer.slice(split), true);
+        const result = manager.finishPaneInputProof(fragmented.id);
+        assert.equal(result.userWrites, 0);
+        assert.equal(result.terminalResponseWrites, 2);
+        assert.equal(result.answerBytesObserved, true, `${answer} split at ${split}`);
+      }
+    }
+
+    const interrupted = manager.beginPaneInputProof(pane.id, "0123456789abcdef");
+    internals.writePaneBackend(pane.id, session, "Al", true);
+    internals.writePaneBackend(pane.id, session, "xpha", true);
+    assert.equal(manager.finishPaneInputProof(interrupted.id).answerBytesObserved, false);
+
+    const flaggedEnter = manager.beginPaneInputProof(pane.id, "0123456789abcdef");
+    internals.writePaneBackend(pane.id, session, "\r", true);
+    assert.equal(manager.finishPaneInputProof(flaggedEnter.id).syntheticEnterObserved, true);
+  } finally {
+    internals.sessions.clear();
+    internals.backends.clear();
+    manager.disposeAll();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("pane auth staging prefers helper scope, preserves default fallback, and keeps registered panes empty", () => {
   const configured: MachineConfig = { id: "static", name: "Static", kind: "ssh", source: "config" };
   const registered: MachineConfig = { ...configured, id: "dynamic", source: "registered" };

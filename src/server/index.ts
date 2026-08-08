@@ -17,6 +17,7 @@ import { terminalThemeEnvironment } from "./terminal-theme.js";
 import { SessionManager } from "./session-manager.js";
 import { StateStore } from "./state.js";
 import { StaticMachineStore } from "./static-machine-store.js";
+import { createWmuxRuntimeAttestor } from "./repository-provenance.js";
 
 const arg = (name: string, fallback: string): string => {
   const index = process.argv.indexOf(name);
@@ -49,6 +50,7 @@ const loadTlsOptions = (): HttpsServerOptions | undefined => {
 };
 
 const main = async (): Promise<void> => {
+  const runtimeAttestor = createWmuxRuntimeAttestor(import.meta.url);
   const host = arg("--host", process.env.WMUX_HOST ?? "127.0.0.1");
   const port = Number(arg("--port", process.env.WMUX_PORT ?? "3478"));
   const dev = process.argv.includes("--dev");
@@ -132,6 +134,7 @@ const main = async (): Promise<void> => {
     terminalFontFamily: config.terminalFontFamily ?? DEFAULT_TERMINAL_FONT_FAMILY,
     delegation: config.delegation,
     agentSessions,
+    runtimeAttestor,
   });
   // Persist the helper callback URL next to ~/.wmux/token: helpers and agent hooks
   // in existing durable panes read this before their stale inherited env.

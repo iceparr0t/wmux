@@ -25,3 +25,9 @@ export const browserOnlyE2eSpecs = [
   "workspace-navigation.spec.ts",
   "workspace-ordering.spec.ts",
 ];
+
+// Mutation-capable acceptance gates require explicit target authorization and
+// dedicated fail-closed configuration; normal E2E commands must never run them.
+export const dedicatedE2eSpecs = [
+  "opencode-question-live-proof.spec.ts",
+];

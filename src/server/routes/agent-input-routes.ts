@@ -25,6 +25,10 @@ const MAX_ANSWER_BODY = 256 * 1024;
 const MAX_ANSWER_VALUES = 129;
 const MAX_ANSWER_VALUE_BYTES = 4_096;
 const MAX_ANSWER_BYTES = 16_384;
+const paneInputProofStartSchema = z.object({
+  paneId: z.string().regex(/^[A-Za-z0-9_-]{1,256}$/),
+  nonce: z.string().regex(/^[a-f0-9]{16}$/),
+}).strict();
 const text = (max = 256) => z.string().min(1).max(max);
 const questionSchema = z.object({
   header: text(120),
@@ -126,6 +130,39 @@ const liveContext = (ctx: RouteContext, context: {
 };
 
 export const agentInputRoutes: readonly ApiRoute[] = [
+  {
+    id: "opencode-question-proof-start",
+    method: "POST",
+    pattern: "/api/proof/opencode-question",
+    policy: {
+      ...routePolicy("opencode-question-proof-start", "POST", "/api/proof/opencode-question"),
+      userOnly: true,
+    },
+    handler: async (ctx) => {
+      const body = parse(paneInputProofStartSchema, await ctx.readJsonBody(MAX_CHALLENGE_BODY));
+      try {
+        ctx.sendJson(201, ctx.deps.sessions.beginPaneInputProof(body.paneId, body.nonce), NO_STORE);
+      } catch (error) {
+        throw new HttpError(409, error instanceof Error ? error.message : "proof_unavailable");
+      }
+    },
+  },
+  {
+    id: "opencode-question-proof-finish",
+    method: "DELETE",
+    pattern: /^\/api\/proof\/opencode-question\/([0-9a-f-]{36})$/,
+    policy: {
+      ...routePolicy("opencode-question-proof-finish", "DELETE", /^\/api\/proof\/opencode-question\/([0-9a-f-]{36})$/),
+      userOnly: true,
+    },
+    handler: async (ctx) => {
+      try {
+        ctx.sendJson(200, ctx.deps.sessions.finishPaneInputProof(ctx.match![1]), NO_STORE);
+      } catch (error) {
+        throw new HttpError(404, error instanceof Error ? error.message : "proof_not_found");
+      }
+    },
+  },
   {
     id: "agent-input-registration-challenge",
     method: "POST",

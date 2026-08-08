@@ -16,6 +16,7 @@ import type { AgentInputCredentialStore } from "../agent-input-credential-store.
 import type { AgentInputRegistrationCapability } from "../agent-input-credential-store.js";
 import type { AgentInputRelay } from "../agent-input-relay.js";
 import type { StreamRequestStore } from "../streams.js";
+import type { WmuxRuntimeAttestor } from "../repository-provenance.js";
 import type {
   MachineConfig,
   MachineStatus,
@@ -67,6 +68,7 @@ export interface ServerDeps {
   hostRegistry?: HostRegistry;
   streamRequests: StreamRequestStore;
   repositoryReviews: RepositoryReviewService;
+  runtimeAttestor: WmuxRuntimeAttestor;
   currentMachines: () => MachineConfig[];
   currentPayload: () => unknown;
   bootstrapFresh: () => Promise<unknown>;

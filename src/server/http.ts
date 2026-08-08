@@ -44,6 +44,10 @@ import {
 } from "./agent-input-credential-store.js";
 import { AgentInputRequestStore } from "./agent-input-request-store.js";
 import { AgentInputRelay } from "./agent-input-relay.js";
+import {
+  unavailableWmuxRuntimeAttestor,
+  type WmuxRuntimeAttestor,
+} from "./repository-provenance.js";
 
 export { readBinaryBody } from "./request-dispatch.js";
 
@@ -92,6 +96,7 @@ export const createHttpServer = (
     agentInputRequests?: AgentInputRequestStore;
     agentInputRelay?: AgentInputRelay;
     agentInputEnabled?: boolean;
+    runtimeAttestor?: WmuxRuntimeAttestor;
   },
 ): Promise<WmuxHttpServer> => {
   const {
@@ -280,6 +285,7 @@ export const createHttpServer = (
     hostRegistry,
     streamRequests,
     repositoryReviews,
+    runtimeAttestor: options.runtimeAttestor ?? unavailableWmuxRuntimeAttestor(),
     currentMachines,
     currentPayload: events.currentPayload,
     bootstrapFresh: events.bootstrapFresh,

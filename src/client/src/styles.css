@@ -7484,6 +7484,7 @@ button.active-tool {
 .agent-input-card p { margin: 5px 0 8px; }
 .agent-input-card label { display: flex; gap: 8px; padding: 4px 0; }
 .agent-input-card label small { display: block; opacity: 0.7; }
+.agent-input-display-text { unicode-bidi: plaintext; white-space: pre-wrap; overflow-wrap: anywhere; }
 .agent-input-custom { width: 100%; margin-top: 6px; font: inherit; color: inherit; background: transparent; border: 1px solid var(--line); padding: 6px; }
 .agent-input-card button { border: 0; background: transparent; color: var(--gold); font: inherit; padding: 8px 0; cursor: pointer; }
 .agent-input-card button:disabled { opacity: 0.45; cursor: default; }

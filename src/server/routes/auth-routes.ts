@@ -26,6 +26,15 @@ export const authRoutes: readonly ApiRoute[] = [
     },
   },
   {
+    id: "repository-provenance",
+    method: "GET",
+    pattern: "/api/provenance",
+    policy: routePolicy("repository-provenance", "GET", "/api/provenance"),
+    handler: async ({ deps, sendJson }) => {
+      sendJson(200, await deps.runtimeAttestor.current(), { "cache-control": "no-store" });
+    },
+  },
+  {
     id: "auth-info",
     method: "GET",
     pattern: "/api/auth-info",

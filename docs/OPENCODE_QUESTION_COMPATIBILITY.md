@@ -183,7 +183,11 @@ rejected, and authoritative list absence closes it as already resolved when an
 identity-only resolution event was missed. The shelf exposes an Open
 Terminal action that only focuses the pane. Browser answers use
 `POST /api/agent-input/requests/:id/answer`; neither the shelf nor the plugin
-uses pane input as an answer transport.
+uses pane input as an answer transport. The shelf renders non-layout C0/C1 controls and
+Unicode format controls (including directional and zero-width controls) as explicit `⟦U+XXXX⟧` tokens
+inside isolated text runs. Literal token delimiters are escaped too, making the
+display encoding injective. This prevents visually reordered or hidden question
+content while preserving the exact raw option label used in the typed SDK reply.
 
 ## Persistence and privacy
 
@@ -401,3 +405,7 @@ required injected transport and v2 methods plus the exact live OpenCode health
 release through that transport before that gate; it does not itself prove
 end-to-end browser answer acceptance. Do not
 infer or claim that live gate from fixture results.
+
+The authorization boundary, exact-target checks, repeatable browser/pane
+instrumentation, and answer-free evidence format for this gate are defined in
+[OpenCode structured-question live proof](OPENCODE_QUESTION_LIVE_PROOF.md).

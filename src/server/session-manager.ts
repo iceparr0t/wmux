@@ -189,6 +189,34 @@ const BACKPRESSURE_HIGH_WATER = 4 * 1024 * 1024;
 const BACKPRESSURE_LOW_WATER = 1 * 1024 * 1024;
 const AGENT_WORKSPACE_CLEANUP_SWEEP_MS = 5_000;
 const STRANDED_ENDPOINT_CLEANUP_SWEEP_MS = 60_000;
+const PANE_INPUT_PROOF_TTL_MS = 10 * 60 * 1_000;
+const MAX_PANE_INPUT_PROOFS = 8;
+
+export interface PaneInputProofSnapshot {
+  id: string;
+  paneId: string;
+  backendWrites: number;
+  userWrites: number;
+  terminalResponseWrites: number;
+  answerBytesObserved: boolean;
+  syntheticEnterObserved: boolean;
+}
+
+interface PaneInputProofRecord extends PaneInputProofSnapshot {
+  matchers: Array<{ pattern: Buffer; failure: number[]; matched: number }>;
+  expiresAt: number;
+}
+
+const proofMatcher = (value: string): PaneInputProofRecord["matchers"][number] => {
+  const pattern = Buffer.from(value, "utf8");
+  const failure = Array<number>(pattern.length).fill(0);
+  for (let index = 1, matched = 0; index < pattern.length; index += 1) {
+    while (matched > 0 && pattern[index] !== pattern[matched]) matched = failure[matched - 1]!;
+    if (pattern[index] === pattern[matched]) matched += 1;
+    failure[index] = matched;
+  }
+  return { pattern, failure, matched: 0 };
+};
 
 export class SessionManager {
   private sessions = new Map<string, BackendSession>();
@@ -211,6 +239,7 @@ export class SessionManager {
     closeAt: string;
     timer: ReturnType<typeof setTimeout>;
   }>();
+  private paneInputProofs = new Map<string, PaneInputProofRecord>();
   private readonly agentWorkspaceCleanupTimer: ReturnType<typeof setInterval>;
   private readonly strandedEndpointCleanupTimer: ReturnType<typeof setInterval>;
   private strandedEndpointCleanupRunning = false;
@@ -414,7 +443,7 @@ export class SessionManager {
           // answer or a multi-viewer pane will inject duplicate replies into
           // the application that issued the query.
           if (this.resizeOwners.get(paneId) !== socket) return;
-          this.backends.get(paneId)?.write(session, message.data, true);
+          this.writePaneBackend(paneId, session, message.data, true);
           return;
         }
         const socketState = this.socketState.get(socket);
@@ -424,7 +453,7 @@ export class SessionManager {
           this.agentSessions.interruptAgentForPane(paneId);
         }
         this.advancePaneInputEpoch(paneId);
-        this.backends.get(paneId)?.write(session, message.data, false);
+        this.writePaneBackend(paneId, session, message.data, false);
       }
       if (message.type === "resize") {
         const size = normalizeSize(message.cols, message.rows);
@@ -623,8 +652,103 @@ export class SessionManager {
     const size = normalizeSize(cols, rows);
     const session = this.ensureSession(pane, size.cols, size.rows);
     this.advancePaneInputEpoch(paneId);
-    this.backends.get(paneId)?.write(session, data);
+    this.writePaneBackend(paneId, session, data, false);
     return true;
+  }
+
+  beginPaneInputProof(paneId: string, nonce: string, nowMs = Date.now()): PaneInputProofSnapshot {
+    this.prunePaneInputProofs(nowMs);
+    if (!/^[a-f0-9]{16}$/.test(nonce)) throw new Error("invalid_proof_nonce");
+    const context = this.state.findPaneContext(paneId);
+    if (!context || context.pane.status !== "running") throw new Error("pane_not_running");
+    if (this.paneInputProofs.size >= MAX_PANE_INPUT_PROOFS) throw new Error("proof_limit");
+    const record: PaneInputProofRecord = {
+      id: crypto.randomUUID(),
+      paneId,
+      backendWrites: 0,
+      userWrites: 0,
+      terminalResponseWrites: 0,
+      answerBytesObserved: false,
+      syntheticEnterObserved: false,
+      matchers: ["Alpha", "One", "Two", `custom-${nonce}`].map(proofMatcher),
+      expiresAt: nowMs + PANE_INPUT_PROOF_TTL_MS,
+    };
+    this.paneInputProofs.set(record.id, record);
+    return this.publicPaneInputProof(record);
+  }
+
+  finishPaneInputProof(id: string, nowMs = Date.now()): PaneInputProofSnapshot {
+    this.prunePaneInputProofs(nowMs);
+    const record = this.paneInputProofs.get(id);
+    if (!record) throw new Error("proof_not_found");
+    this.paneInputProofs.delete(id);
+    const snapshot = this.publicPaneInputProof(record);
+    this.wipePaneInputProof(record);
+    return snapshot;
+  }
+
+  private publicPaneInputProof(record: PaneInputProofRecord): PaneInputProofSnapshot {
+    const { matchers: _matchers, expiresAt: _expiresAt, ...snapshot } = record;
+    return { ...snapshot };
+  }
+
+  private prunePaneInputProofs(nowMs = Date.now()): void {
+    for (const [id, proof] of this.paneInputProofs) {
+      if (proof.expiresAt <= nowMs) {
+        this.paneInputProofs.delete(id);
+        this.wipePaneInputProof(proof);
+      }
+    }
+  }
+
+  private wipePaneInputProof(proof: PaneInputProofRecord): void {
+    for (const matcher of proof.matchers) {
+      matcher.pattern.fill(0);
+      matcher.failure.fill(0);
+      matcher.matched = 0;
+    }
+    proof.matchers.length = 0;
+  }
+
+  private observeProtectedAnswerStream(proof: PaneInputProofRecord, data: string): void {
+    if (proof.answerBytesObserved) return;
+    for (const byte of Buffer.from(data, "utf8")) {
+      for (const matcher of proof.matchers) {
+        while (matcher.matched > 0 && byte !== matcher.pattern[matcher.matched]) {
+          matcher.matched = matcher.failure[matcher.matched - 1]!;
+        }
+        if (byte === matcher.pattern[matcher.matched]) matcher.matched += 1;
+        if (matcher.matched === matcher.pattern.length) {
+          proof.answerBytesObserved = true;
+          this.wipePaneInputProof(proof);
+          return;
+        }
+      }
+    }
+  }
+
+  private observePaneBackendWrite(paneId: string, data: string, terminalResponse: boolean): void {
+    this.prunePaneInputProofs();
+    for (const proof of this.paneInputProofs.values()) {
+      if (proof.paneId !== paneId) continue;
+      proof.backendWrites += 1;
+      if (terminalResponse) proof.terminalResponseWrites += 1;
+      else proof.userWrites += 1;
+      if (/[\r\n]/.test(data)) proof.syntheticEnterObserved = true;
+      this.observeProtectedAnswerStream(proof, data);
+    }
+  }
+
+  private writePaneBackend(
+    paneId: string,
+    session: BackendSession,
+    data: string,
+    terminalResponse: boolean,
+  ): void {
+    const backend = this.backends.get(paneId);
+    if (!backend) return;
+    this.observePaneBackendWrite(paneId, data, terminalResponse);
+    backend.write(session, data, terminalResponse);
   }
 
   private ensureSession(pane: PaneState, cols: number, rows: number): BackendSession {
@@ -744,7 +868,7 @@ export class SessionManager {
 
     session.on("output", (data) => {
       for (const response of colorQueryParser.push(data, currentTerminalTheme).responses) {
-        backend.write(session, response, true);
+        this.writePaneBackend(pane.id, session, response, true);
       }
       this.broadcastOutput(pane.id, data);
       this.applyBackpressure(pane.id, session);
@@ -981,6 +1105,8 @@ export class SessionManager {
     this.durableCwdLastReadAt.clear();
     for (const timer of this.pausedSessions.values()) clearInterval(timer);
     this.pausedSessions.clear();
+    for (const proof of this.paneInputProofs.values()) this.wipePaneInputProof(proof);
+    this.paneInputProofs.clear();
     for (const [paneId, session] of this.sessions) {
       const binding = this.agentInputSessionBindings.get(paneId);
       if (binding) this.agentInputSourceRetirer?.(paneId, binding);

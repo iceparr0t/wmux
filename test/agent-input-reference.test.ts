@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   buildAgentInputAnswers,
+  escapeAgentInputDisplayControls,
   isAgentInputRequestVisible,
   newAgentInputSubmissionId,
   validAgentInputAnswer,
@@ -29,6 +30,34 @@ test("reference harness maps single, multi, and custom answers in exact question
   assert.deepEqual(buildAgentInputAnswers(questions, [[], [], []], ["blocked", "blocked", "allowed"]), [
     [], [], ["allowed"],
   ], "the browser maps custom text only for questions projected with custom true");
+});
+
+test("reference shelf makes deceptive controls visible without changing submitted labels", () => {
+  const rawLabel = "Approve\u202Etxt\u2066now\u2069\u200B";
+  assert.equal(
+    escapeAgentInputDisplayControls(rawLabel),
+    "Approve⟦U+202E⟧txt⟦U+2066⟧now⟦U+2069⟧⟦U+200B⟧",
+  );
+  assert.equal(escapeAgentInputDisplayControls("line\n\tcontent"), "line\n\tcontent");
+  assert.equal(escapeAgentInputDisplayControls("bell\u0007"), "bell⟦U+0007⟧");
+  assert.notEqual(
+    escapeAgentInputDisplayControls("Approve\u202E"),
+    escapeAgentInputDisplayControls("Approve⟦U+202E⟧"),
+    "literal escape-token text must remain distinguishable from a raw control",
+  );
+  assert.equal(
+    escapeAgentInputDisplayControls("Approve⟦U+202E⟧"),
+    "Approve⟦U+27E6⟧U+202E⟦U+27E7⟧",
+  );
+  const deceptiveQuestion: AgentInputQuestion = {
+    header: "Confirm",
+    question: "Choose",
+    options: [{ label: rawLabel, description: "" }],
+    multiple: false,
+    custom: false,
+  };
+  assert.deepEqual(buildAgentInputAnswers([deceptiveQuestion], [[rawLabel]], [""]), [[rawLabel]],
+    "display escaping must not alter the exact SDK answer value");
 });
 
 test("reference validation accepts option-plus-custom cardinality and enforces UTF-8 byte budgets", () => {

@@ -29,6 +29,7 @@
     "test:e2e:browser:chromium": "playwright test --config=playwright.browser.config.ts --project=chromium --project=mobile-chromium",
     "test:e2e:browser:webkit": "playwright test --config=playwright.browser.config.ts --project=mobile-webkit",
     "test:e2e:serve": "node --import tsx e2e/remote-server.ts",
+    "proof:opencode-questions": "node scripts/run-opencode-question-live-proof.mjs",
     "docs:screenshots": "playwright test e2e/docs-screenshots.spec.ts --project=chromium --project=mobile-chromium",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.e2e.json",
     "check:scripts": "node scripts/check-scripts.mjs",
