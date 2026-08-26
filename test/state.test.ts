@@ -961,6 +961,124 @@ test("automatic titles are idempotent, pane-local in multi-tab workspaces, and p
   });
 });
 
+test("Prime automatic title claims follow the most recently active root session", () => {
+  withTempState((filePath) => {
+    const store = new StateStore(machines, filePath);
+    const workspace = store.snapshot().workspaces[0];
+    const tab = workspace.tabs[0];
+    const paneId = tab.panes[0].id;
+
+    const rootA = store.setAutoTitle({
+      workspaceId: workspace.id,
+      tabId: tab.id,
+      sourcePaneId: paneId,
+      sourceSessionId: "prime-root-a",
+      claimTitleOwnership: true,
+      tabOnlyIfMultiple: false,
+      title: "Prime root A",
+      descriptor: "A is active",
+    });
+    assert.equal(rootA.workspaceApplied, true);
+    assert.equal(rootA.tabApplied, true);
+
+    const unclaimedRootB = store.setAutoTitle({
+      workspaceId: workspace.id,
+      tabId: tab.id,
+      sourcePaneId: paneId,
+      sourceSessionId: "prime-root-b",
+      tabOnlyIfMultiple: false,
+      title: "Unclaimed root B",
+      descriptor: "must not apply",
+    });
+    assert.equal(unclaimedRootB.workspaceApplied, false);
+    assert.equal(unclaimedRootB.tabApplied, false);
+    assert.equal(store.snapshot().workspaces[0].name, "Prime root A");
+
+    const sameTitleClaim = store.setAutoTitle({
+      workspaceId: workspace.id,
+      tabId: tab.id,
+      sourcePaneId: paneId,
+      sourceSessionId: "prime-root-b",
+      claimTitleOwnership: true,
+      tabOnlyIfMultiple: false,
+      title: "Prime root A",
+    });
+    assert.equal(sameTitleClaim.workspaceApplied, false);
+    assert.equal(sameTitleClaim.tabApplied, false);
+    const sameTitleRevision = store.snapshot().revision;
+    store.setAutoTitle({
+      workspaceId: workspace.id,
+      tabId: tab.id,
+      sourcePaneId: paneId,
+      sourceSessionId: "prime-root-a",
+      tabOnlyIfMultiple: false,
+      title: "A cannot reclaim without activity",
+    });
+    assert.equal(store.snapshot().revision, sameTitleRevision);
+    assert.equal(store.snapshot().workspaces[0].name, "Prime root A");
+
+    store.setAutoTitle({
+      workspaceId: workspace.id,
+      tabId: tab.id,
+      sourcePaneId: paneId,
+      sourceSessionId: "prime-root-b",
+      claimTitleOwnership: true,
+      tabOnlyIfMultiple: false,
+      title: "Prime root B",
+      descriptor: "B is active",
+    });
+    const revision = store.snapshot().revision;
+    const staleRootA = store.setAutoTitle({
+      workspaceId: workspace.id,
+      tabId: tab.id,
+      sourcePaneId: paneId,
+      sourceSessionId: "prime-root-a",
+      tabOnlyIfMultiple: false,
+      title: "Stale root A",
+      descriptor: "stale descriptor",
+    });
+    assert.equal(staleRootA.workspaceApplied, false);
+    assert.equal(staleRootA.tabApplied, false);
+    assert.equal(store.snapshot().revision, revision);
+    assert.equal(store.snapshot().workspaces[0].name, "Prime root B");
+    assert.equal(store.snapshot().workspaces[0].descriptor, "B is active");
+
+    // Calls without a Prime session identity retain the legacy helper behavior.
+    store.setAutoTitle({
+      workspaceId: workspace.id,
+      tabId: tab.id,
+      sourcePaneId: paneId,
+      tabOnlyIfMultiple: false,
+      title: "Legacy helper title",
+    });
+    assert.equal(store.snapshot().workspaces[0].name, "Legacy helper title");
+    store.flush();
+
+    // Claims are server-only and intentionally do not survive a restart.
+    const reloaded = new StateStore(machines, filePath);
+    const withoutClaim = reloaded.setAutoTitle({
+      workspaceId: workspace.id,
+      tabId: tab.id,
+      sourcePaneId: paneId,
+      sourceSessionId: "prime-root-a",
+      tabOnlyIfMultiple: false,
+      title: "No restart claim",
+    });
+    assert.equal(withoutClaim.workspaceApplied, false);
+    assert.equal(reloaded.snapshot().workspaces[0].name, "Legacy helper title");
+    reloaded.setAutoTitle({
+      workspaceId: workspace.id,
+      tabId: tab.id,
+      sourcePaneId: paneId,
+      sourceSessionId: "prime-root-a",
+      claimTitleOwnership: true,
+      tabOnlyIfMultiple: false,
+      title: "Root A reclaimed",
+    });
+    assert.equal(reloaded.snapshot().workspaces[0].name, "Root A reclaimed");
+  });
+});
+
 test("legacy automatic titles remain compatible only for an unambiguous sole pane", () => {
   withTempState((filePath) => {
     const store = new StateStore(machines, filePath);

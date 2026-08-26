@@ -175,6 +175,24 @@ test("wmux-title prefers the refreshed persisted helper URL when the environment
       paneId: "pane_source",
     });
 
+    await execFileAsync("bash", [script("wmux-title"),
+      "--title", "Claimed Prime title",
+      "--source-session-id", "prime-root-session",
+      "--claim-title-ownership",
+    ], { env });
+    assert.deepEqual(payload, {
+      title: "Claimed Prime title",
+      tabOnlyIfMultiple: true,
+      tabId: "tab_source",
+      paneId: "pane_source",
+      sourceSessionId: "prime-root-session",
+      claimTitleOwnership: true,
+    });
+    await assert.rejects(execFileAsync("bash", [script("wmux-title"),
+      "--title", "Missing source session",
+      "--claim-title-ownership",
+    ], { env }), /requires --source-session-id/);
+
     await assert.rejects(execFileAsync("bash", [script("wmux-title"), "--title", "Partial HERDR"], {
       env: { ...env, HERDR_WORKSPACE_ID: "ws_partial" },
     }), /incomplete HERDR identity tuple/);
