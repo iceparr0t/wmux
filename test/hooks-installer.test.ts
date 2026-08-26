@@ -530,8 +530,22 @@ printf '%s|%s\n' "$WMUX_PANE_ID" "$HERDR_PANE_ID"` } };
       ["ws_22222222", "tab_22222222", "pane_22222222", "completed", ""],
     ]);
     assert.deepEqual(titleCaptured, [
-      { title: "Name workspace one", tabOnlyIfMultiple: false, tabId: "tab_11111111", paneId: "pane_11111111" },
-      { title: "Name workspace two", tabOnlyIfMultiple: false, tabId: "tab_22222222", paneId: "pane_22222222" },
+      {
+        title: "Name workspace one",
+        tabOnlyIfMultiple: false,
+        tabId: "tab_11111111",
+        paneId: "pane_11111111",
+        sourceSessionId: "root",
+        claimTitleOwnership: true,
+      },
+      {
+        title: "Name workspace two",
+        tabOnlyIfMultiple: false,
+        tabId: "tab_22222222",
+        paneId: "pane_22222222",
+        sourceSessionId: "root",
+        claimTitleOwnership: true,
+      },
     ]);
     assert.equal(captured[0]?.runId, captured[2]?.runId);
     assert.equal(captured[1]?.runId, captured[3]?.runId);
@@ -1117,13 +1131,13 @@ test("Prime Agent extension periodically refreshes contextual titles and preserv
       .filter((event) => event.status === "running")
       .map((event) => event.title);
     assert.deepEqual(runningTitles, ["", "", "", "", "", "", ""]);
-    assert.deepEqual(titleCaptured.map((request) => request.title), [
-      "repair the wmux naming lifecycle now",
-      "Progress checkpoint 6",
-    ]);
+    assert.equal(titleCaptured[0]?.title, "repair the wmux naming lifecycle now");
+    assert.equal(titleCaptured.at(-1)?.title, "Progress checkpoint 6");
     assert.ok(titleCaptured.every((request) => request.tabOnlyIfMultiple === false));
     assert.ok(titleCaptured.every((request) => request.tabId === "tab_33333333"));
     assert.ok(titleCaptured.every((request) => request.paneId === "pane_33333333"));
+    assert.ok(titleCaptured.every((request) => request.sourceSessionId === "title-root"));
+    assert.ok(titleCaptured.every((request) => request.claimTitleOwnership === true));
 
     // A global automatic name from another branch must not be mistaken for a
     // manual override when navigating the session tree in either direction.
@@ -1158,7 +1172,12 @@ test("Prime Agent extension periodically refreshes contextual titles and preserv
     const shared = (globalThis as any)[Symbol.for("wmux.prime-agent.title-state.v1")] as Map<string, unknown>;
     shared.delete("pane_33333333:title-root");
     handlers = await loadHandlers("reloaded");
+    const beforeReloadTitleCount = titleCaptured.length;
     await handlers.get("session_start")?.({ reason: "reload" }, context);
+    await waitUntil(() => titleCaptured.length === beforeReloadTitleCount + 1);
+    const reloadTitleRequest = titleCaptured.at(-1) ?? {};
+    assert.equal(reloadTitleRequest.sourceSessionId, "title-root");
+    assert.equal("claimTitleOwnership" in reloadTitleRequest, false);
     await runTurn("Continue after reload", "Reloaded title work continues.");
     assert.equal(captured.filter((event) => event.status === "running").at(-1)?.title, "");
     assert.ok(titleStates.length >= 12);
@@ -1170,13 +1189,36 @@ test("Prime Agent extension periodically refreshes contextual titles and preserv
     assert.equal((titleStates.at(-1) as any)?.ownership, "external");
     assert.ok(titleStates.length >= 13);
 
+    // A descendant session_start in the shared Prime worker must not replace
+    // the root title poll context or claim title ownership.
+    const descendantContext = {
+      ...context,
+      sessionManager: {
+        ...context.sessionManager,
+        getSessionId: () => "title-child",
+        getHeader: () => ({ id: "title-child", rlmDepth: 1 }),
+      },
+    };
+    const beforeDescendantStart = titleCaptured.length;
+    await handlers.get("session_start")?.({ reason: "startup" }, descendantContext);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(titleCaptured.length, beforeDescendantStart);
+
     // Prime exposes no extension event for /name. The idle reconciler treats
     // Prime's internal name as canonical, retries a transient helper failure,
     // and publishes it without a new turn.
     failNextTitle = true;
-    sessionName = "Canonical idle name";
-    appendSessionEntry({ type: "session_info", name: sessionName });
-    await waitUntil(() => titleCaptured.filter((request) => request.title === sessionName).length === 2);
+    const idleRootName = "Canonical idle name";
+    sessionName = idleRootName;
+    appendSessionEntry({ type: "session_info", name: idleRootName });
+    // Prime shares extension runtime actions across same-worker RLM sessions.
+    // The root poll must use its context entries, not a child-bound API getter.
+    sessionName = "Child runtime name";
+    await waitUntil(() => titleCaptured.filter((request) => request.title === idleRootName).length === 2);
+    const idleNameRequests = titleCaptured.filter((request) => request.title === idleRootName);
+    assert.ok(idleNameRequests.every((request) => request.sourceSessionId === "title-root"));
+    assert.ok(idleNameRequests.every((request) => request.claimTitleOwnership === true));
+    assert.equal(titleCaptured.some((request) => request.sourceSessionId === "title-child"), false);
     const idleTitleCount = titleCaptured.length;
     await new Promise((resolve) => setTimeout(resolve, 1_100));
     assert.equal(titleCaptured.length, idleTitleCount);

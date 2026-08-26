@@ -180,6 +180,49 @@ test("pane-scoped auto titles validate the exact workspace, tab, and pane tuple"
     });
     assert.equal(valid.status, 200);
 
+    const claimed = await postTitle({
+      title: "Claimed root",
+      tabId: firstTarget.id,
+      paneId: firstTarget.panes[0].id,
+      sourceSessionId: "prime-root-a",
+      claimTitleOwnership: true,
+      tabOnlyIfMultiple: false,
+    });
+    assert.equal(claimed.status, 200);
+    const stale = await postTitle({
+      title: "Stale root",
+      tabId: firstTarget.id,
+      paneId: firstTarget.panes[0].id,
+      sourceSessionId: "prime-root-b",
+      tabOnlyIfMultiple: false,
+    });
+    assert.equal(stale.status, 200);
+    const stalePayload = await stale.json() as {
+      workspace: { name: string };
+      workspaceApplied: boolean;
+      tabApplied: boolean;
+    };
+    assert.equal(stalePayload.workspace.name, "Claimed root");
+    assert.equal(stalePayload.workspaceApplied, false);
+    assert.equal(stalePayload.tabApplied, false);
+
+    const missingSource = await postTitle({
+      title: "Missing source session",
+      tabId: firstTarget.id,
+      paneId: firstTarget.panes[0].id,
+      claimTitleOwnership: true,
+    });
+    assert.equal(missingSource.status, 400);
+    assert.deepEqual(await missingSource.json(), { error: "auto_title_claim_requires_source_session" });
+    const emptySource = await postTitle({
+      title: "Empty source session",
+      tabId: firstTarget.id,
+      paneId: firstTarget.panes[0].id,
+      sourceSessionId: "",
+    });
+    assert.equal(emptySource.status, 400);
+    assert.deepEqual(await emptySource.json(), { error: "invalid_auto_title_source_session" });
+
     const missingTab = await postTitle({ title: "Missing tab", paneId: firstTarget.panes[0].id });
     assert.equal(missingTab.status, 400);
     assert.deepEqual(await missingTab.json(), { error: "auto_title_pane_requires_tab" });

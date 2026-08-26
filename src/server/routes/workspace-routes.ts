@@ -421,9 +421,26 @@ export const workspaceRoutes: readonly ApiRoute[] = [
         title?: string;
         tabId?: string;
         paneId?: string;
+        sourceSessionId?: string;
+        claimTitleOwnership?: boolean;
         descriptor?: string;
         tabOnlyIfMultiple?: boolean;
       };
+      if (
+        body.sourceSessionId !== undefined
+        && (
+          typeof body.sourceSessionId !== "string"
+          || body.sourceSessionId.length === 0
+          || body.sourceSessionId.length > 256
+        )
+      ) throw new HttpError(400, "invalid_auto_title_source_session");
+      if (
+        body.claimTitleOwnership !== undefined
+        && typeof body.claimTitleOwnership !== "boolean"
+      ) throw new HttpError(400, "invalid_auto_title_claim");
+      if (body.claimTitleOwnership && !body.sourceSessionId) {
+        throw new HttpError(400, "auto_title_claim_requires_source_session");
+      }
       if (body.paneId !== undefined) {
         if (!body.tabId) throw new HttpError(400, "auto_title_pane_requires_tab");
         const source = deps.state.findPaneContext(body.paneId);
@@ -452,6 +469,8 @@ export const workspaceRoutes: readonly ApiRoute[] = [
         title: body.title ?? "",
         tabId: body.tabId,
         sourcePaneId: body.paneId,
+        sourceSessionId: body.sourceSessionId,
+        claimTitleOwnership: body.claimTitleOwnership,
         descriptor: body.descriptor,
         tabOnlyIfMultiple: body.tabOnlyIfMultiple,
       });

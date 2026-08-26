@@ -108,6 +108,8 @@ interface SetAutoTitleInput {
   title: string;
   tabId?: string;
   sourcePaneId?: string;
+  sourceSessionId?: string;
+  claimTitleOwnership?: boolean;
   descriptor?: string;
   tabOnlyIfMultiple?: boolean;
 }
@@ -135,6 +137,7 @@ export class WorkspaceDepthError extends Error {
 
 export class StateStore extends EventEmitter {
   private state: PersistedState;
+  private readonly autoTitleSessionClaims = new Map<string, string>();
   private writeTimer: ReturnType<typeof setTimeout> | null = null;
   private dirty = false;
   private replaceBackupOnFlush = false;
@@ -484,6 +487,7 @@ export class StateStore extends EventEmitter {
     if (!nextLayout) return false;
     tab.layout = nextLayout;
     tab.panes = tab.panes.filter((pane) => pane.id !== paneId);
+    this.autoTitleSessionClaims.delete(paneId);
     this.state.notifications = this.state.notifications.filter(
       (notification) => notification.paneId !== paneId,
     );
@@ -503,6 +507,7 @@ export class StateStore extends EventEmitter {
     const tab = workspace.tabs.find((candidate) => candidate.id === tabId);
     if (!tab) return [];
     const paneIds = tab.panes.map((pane) => pane.id);
+    for (const paneId of paneIds) this.autoTitleSessionClaims.delete(paneId);
     workspace.tabs = workspace.tabs.filter((candidate) => candidate.id !== tabId);
     if (workspace.activeTabId === tabId) {
       workspace.activeTabId = workspace.tabs.at(-1)?.id ?? workspace.tabs[0]?.id ?? "";
@@ -522,6 +527,7 @@ export class StateStore extends EventEmitter {
     const workspace = this.state.workspaces[index];
     if (!workspace) return [];
     const paneIds = workspace.tabs.flatMap((tab) => tab.panes.map((pane) => pane.id));
+    for (const paneId of paneIds) this.autoTitleSessionClaims.delete(paneId);
     const promotedChildren = this.state.workspaces.filter((candidate) => candidate.parentWorkspaceId === workspaceId);
     for (const child of promotedChildren) {
       if (workspace.parentWorkspaceId) child.parentWorkspaceId = workspace.parentWorkspaceId;
@@ -612,6 +618,23 @@ export class StateStore extends EventEmitter {
     }
     if (!sourceTab) throw new Error("auto title source pane does not match workspace and tab");
     const ownership = autoTitleOwnership(workspace, sourceTab, sourcePaneId);
+    let sessionAccepted = true;
+    if (input.sourceSessionId) {
+      const currentClaim = this.autoTitleSessionClaims.get(sourcePaneId);
+      if (input.claimTitleOwnership) {
+        this.autoTitleSessionClaims.set(sourcePaneId, input.sourceSessionId);
+      } else if (currentClaim !== input.sourceSessionId) {
+        sessionAccepted = false;
+      }
+    }
+    if (!sessionAccepted) {
+      return {
+        workspace: structuredClone(workspace),
+        tab: input.tabId ? structuredClone(sourceTab) : undefined,
+        workspaceApplied: false,
+        tabApplied: false,
+      };
+    }
 
     let workspaceApplied = false;
     let tabApplied = false;

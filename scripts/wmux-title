@@ -44,10 +44,12 @@ tab_only_if_multiple=1
 workspace_explicit=0
 tab_explicit=0
 pane_explicit=0
+source_session_id=""
+claim_title_ownership=0
 
 usage() {
   cat >&2 <<'EOF'
-Usage: wmux-title [--manual] [--workspace <id>] [--tab <id>] [--pane <id>] [--descriptor <text>] [--tab-always] --title <text>
+Usage: wmux-title [--manual] [--workspace <id>] [--tab <id>] [--pane <id>] [--source-session-id <id>] [--claim-title-ownership] [--descriptor <text>] [--tab-always] --title <text>
 EOF
 }
 
@@ -80,6 +82,14 @@ while [[ $# -gt 0 ]]; do
       descriptor="${2:?--descriptor requires a value}"
       shift 2
       ;;
+    --source-session-id)
+      source_session_id="${2:?--source-session-id requires a value}"
+      shift 2
+      ;;
+    --claim-title-ownership)
+      claim_title_ownership=1
+      shift
+      ;;
     --manual)
       manual=1
       shift
@@ -107,6 +117,14 @@ done
 
 if [[ -z "${workspace_id}" || -z "${title}" ]]; then
   usage
+  exit 2
+fi
+if [[ "${claim_title_ownership}" -eq 1 && -z "${source_session_id}" ]]; then
+  echo "wmux-title: --claim-title-ownership requires --source-session-id" >&2
+  exit 2
+fi
+if [[ "${manual}" -eq 1 && ( -n "${source_session_id}" || "${claim_title_ownership}" -eq 1 ) ]]; then
+  echo "wmux-title: session title arbitration is only available for automatic titles" >&2
   exit 2
 fi
 
@@ -172,6 +190,12 @@ else
   fi
   if [[ -n "${pane_id}" ]]; then
     payload="${payload},\"paneId\":$(printf '%s' "$pane_id" | json_escape)"
+  fi
+  if [[ -n "${source_session_id}" ]]; then
+    payload="${payload},\"sourceSessionId\":$(printf '%s' "$source_session_id" | json_escape)"
+  fi
+  if [[ "${claim_title_ownership}" -eq 1 ]]; then
+    payload="${payload},\"claimTitleOwnership\":true"
   fi
   if [[ -n "${descriptor}" ]]; then
     payload="${payload},\"descriptor\":$(printf '%s' "$descriptor" | json_escape)"
