@@ -191,6 +191,37 @@ export const authRoutes: readonly ApiRoute[] = [
     },
   },
   {
+    id: "auth-credential-renew",
+    method: "POST",
+    pattern: /^\/api\/auth\/credentials\/(automation|helper)\/renew$/,
+    policy: routePolicy(
+      "auth-credential-renew",
+      "POST",
+      /^\/api\/auth\/credentials\/(automation|helper)\/renew$/,
+      "normal",
+      undefined,
+      true,
+    ),
+    handler: async ({ deps, match, sendJson }) => {
+      if (!deps.scopedCredentials) {
+        sendJson(409, { error: "scoped_credentials_unavailable" });
+        return;
+      }
+      try {
+        const credential = deps.scopedCredentials.renew(
+          match?.[1] as ScopedCredentialKind,
+        );
+        sendJson(200, { credential }, { "cache-control": "no-store" });
+      } catch (error) {
+        if (error instanceof ScopedCredentialRotationError) {
+          sendJson(409, { error: error.code });
+          return;
+        }
+        throw error;
+      }
+    },
+  },
+  {
     id: "auth-credential-rotate",
     method: "POST",
     pattern: /^\/api\/auth\/credentials\/(automation|helper)\/rotate$/,

@@ -48,3 +48,20 @@ test("the application mounts behind the mode/session gate", () => {
   assert.match(gate, /error instanceof UnauthorizedError/);
   assert.match(gate, /250, 750, 1_500/);
 });
+
+
+test("shared-or-login settings require password reauthentication before credential administration", () => {
+  const settings = fs.readFileSync(path.join(repoRoot, "src/client/src/SettingsModal.tsx"), "utf8");
+  const modal = fs.readFileSync(path.join(repoRoot, "src/client/src/OpenTuiSettingsModal.tsx"), "utf8");
+  assert.match(settings, /authInfo\?\.browserAuthMode === "shared-or-login"/);
+  assert.match(settings, /error instanceof ApiResponseError && error\.status === 403/);
+  assert.match(settings, /const \{ token \} = await api\.login\(username, password\)/);
+  assert.match(settings, /if \(token\) setToken\(token\)/);
+  assert.match(modal, /ADMINISTRATOR REAUTHENTICATION/);
+  assert.match(modal, /type="password"/);
+  assert.match(modal, /reauthenticate/);
+  assert.match(modal, /renew/);
+  assert.match(modal, /return "expired"/);
+  assert.match(modal, /return "expires soon"/);
+  assert.doesNotMatch(modal, /available with login-only browser authentication/);
+});

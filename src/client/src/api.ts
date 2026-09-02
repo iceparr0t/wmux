@@ -74,6 +74,8 @@ export const modalSettingsUpdate = (settings: WmuxSettings): ModalSettingsUpdate
 });
 
 export class UnauthorizedError extends Error {
+  readonly status = 401;
+
   constructor() {
     super("unauthorized");
     this.name = "UnauthorizedError";
@@ -113,12 +115,19 @@ export interface KittyGraphicsSourceRequest {
   offset?: number;
 }
 
-const responseError = async (response: Response): Promise<Error> => {
+export class ApiResponseError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+    this.name = "ApiResponseError";
+  }
+}
+
+const responseError = async (response: Response): Promise<ApiResponseError> => {
   try {
     const body = await response.json() as { error?: string };
-    return new Error(body.error || `HTTP ${response.status}`);
+    return new ApiResponseError(response.status, body.error || `HTTP ${response.status}`);
   } catch {
-    return new Error(`HTTP ${response.status}`);
+    return new ApiResponseError(response.status, `HTTP ${response.status}`);
   }
 };
 
@@ -132,7 +141,7 @@ const json = async <T>(path: string, init?: RequestInit): Promise<T> => {
     },
   });
   if (response.status === 401) throw new UnauthorizedError();
-  if (!response.ok) throw new Error(await response.text());
+  if (!response.ok) throw await responseError(response);
   return response.json() as Promise<T>;
 };
 
@@ -155,6 +164,9 @@ export interface ScopedCredentialMetadata {
   kind: "automation" | "helper";
   issuedAt: number;
   expiresAt: number;
+  expiresInMs: number;
+  expiryState: "active" | "near-expiry" | "expired";
+  renewable: boolean;
   rotatable: boolean;
 }
 
@@ -195,6 +207,11 @@ export const api = {
   scopedCredentials: () =>
     json<{ credentials: ScopedCredentialMetadata[] }>(
       "/api/auth/credentials",
+    ),
+  renewScopedCredential: (kind: ScopedCredentialMetadata["kind"]) =>
+    json<{ credential: ScopedCredentialMetadata }>(
+      `/api/auth/credentials/${kind}/renew`,
+      { method: "POST" },
     ),
   rotateScopedCredential: (kind: ScopedCredentialMetadata["kind"]) =>
     json<{ credential: ScopedCredentialMetadata }>(

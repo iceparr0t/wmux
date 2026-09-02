@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { api, modalSettingsUpdate, WorkspaceReorderConflictError } from "../src/client/src/api.ts";
+import { api, ApiResponseError, modalSettingsUpdate, WorkspaceReorderConflictError } from "../src/client/src/api.ts";
 import { setToken } from "../src/client/src/token.ts";
 
 test("create requests carry browser-local source pane context", async () => {
@@ -185,4 +185,21 @@ test("pane image staging sends authenticated raw bytes without a client path", a
   });
   assert.equal(requests[1].path, `/api/panes/pane%20%2F%20one/paste-images/paste-${"a".repeat(36)}`);
   assert.equal(requests[1].init?.method, "DELETE");
+});
+
+
+test("credential administration retains typed authorization failures", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ error: "unauthorized" }), {
+    status: 403,
+    headers: { "content-type": "application/json" },
+  })) as typeof fetch;
+  try {
+    await assert.rejects(
+      api.scopedCredentials(),
+      (error: unknown) => error instanceof ApiResponseError && error.status === 403 && error.message === "unauthorized",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

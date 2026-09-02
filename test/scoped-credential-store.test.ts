@@ -103,3 +103,25 @@ test("scoped credential metadata refuses future schemas", () => {
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+
+test("renewal extends the same scoped secret and exposes expiry state", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-scoped-renewal-"));
+  try {
+    const auth = createAuth(directory);
+    const nowMs = 1_000_000;
+    const store = new ScopedCredentialStore(auth, path.join(directory, "scoped-credentials.json"), 10 * 24 * 60 * 60 * 1_000, nowMs);
+    const before = store.list(nowMs + 4 * 24 * 60 * 60 * 1_000).find((record) => record.kind === "helper")!;
+    assert.equal(before.expiryState, "near-expiry");
+    assert.equal(before.renewable, true);
+    const helper = auth.helperToken;
+    const renewed = store.renew("helper", nowMs + 4 * 24 * 60 * 60 * 1_000);
+    assert.equal(renewed.expiryState, "active");
+    assert.equal(renewed.expiresInMs, 10 * 24 * 60 * 60 * 1_000);
+    assert.equal(auth.helperToken, helper);
+    assert.equal(store.authenticate(helper!, renewed.expiresAt - 1), "helper");
+    assert.equal(store.list(renewed.expiresAt).find((record) => record.kind === "helper")!.expiryState, "expired");
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});

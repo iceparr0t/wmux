@@ -32,6 +32,7 @@ const routeCases: Array<[string, string, string]> = [
   ["auth-sessions", "GET", "/api/auth/sessions"],
   ["auth-session-revoke", "DELETE", "/api/auth/sessions/session"],
   ["auth-credentials", "GET", "/api/auth/credentials"],
+  ["auth-credential-renew", "POST", "/api/auth/credentials/helper/renew"],
   ["auth-credential-rotate", "POST", "/api/auth/credentials/helper/rotate"],
   ["bootstrap", "GET", "/api/bootstrap"],
   ["agent-session-timeline", "GET", "/api/agent-sessions/session"],
@@ -131,6 +132,9 @@ test("browser, automation, helper, registration, and legacy policies are separat
   assert.equal(authorizeHttpPrincipal(auth, principal("registered-host"), policy("GET", "/api/helpers/windows/win/bootstrap")), true);
   assert.equal(authorizeHttpPrincipal(auth, principal("registered-host"), policy("GET", "/api/bootstrap")), false);
   assert.equal(authorizeHttpPrincipal(auth, principal("automation"), policy("GET", "/api/auth/session")), false);
+  assert.equal(authorizeHttpPrincipal(auth, principal("browser-session"), policy("POST", "/api/auth/credentials/helper/renew")), true);
+  assert.equal(authorizeHttpPrincipal(auth, principal("legacy-shared"), policy("POST", "/api/auth/credentials/helper/renew")), false);
+  assert.equal(authorizeHttpPrincipal(auth, principal("automation"), policy("POST", "/api/auth/credentials/helper/renew")), false);
   assert.equal(authorizeHttpPrincipal(auth, principal("browser-session"), policy("GET", "/api/auth/sessions")), true);
   assert.equal(authorizeHttpPrincipal(auth, principal("automation"), policy("GET", "/api/auth/sessions")), false);
   assert.equal(authorizeHttpPrincipal(auth, principal("helper"), policy("POST", "/api/auth/credentials/helper/rotate")), false);

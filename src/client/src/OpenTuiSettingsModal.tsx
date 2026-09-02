@@ -3,6 +3,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type FormEvent as ReactFormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
@@ -43,6 +44,7 @@ interface OpenTuiSettingsModalProps {
   currentSessionId?: string;
   scopedCredentials: ScopedCredentialMetadata[];
   securityAvailable: boolean;
+  securityReauthenticationRequired: boolean;
   securityLoading: boolean;
   securityError: string;
   saving: boolean;
@@ -59,12 +61,14 @@ interface OpenTuiSettingsModalProps {
     cleanupKey?: string,
   ) => void | Promise<void>;
   onRevokeBrowserSession: (session: BrowserSessionMetadata) => void | Promise<void>;
+  onRenewScopedCredential: (credential: ScopedCredentialMetadata) => void | Promise<void>;
   onRotateScopedCredential: (credential: ScopedCredentialMetadata) => void | Promise<void>;
+  onReauthenticateSecurity: (username: string, password: string) => Promise<void>;
 }
 
 type FieldId = "font" | "scrollback" | `alias:${string}`;
 type ChoiceId = "scheme" | "inactive-streaming" | "frame-rate" | "terminal-scroll" | "sidebar-host-grouping";
-type FocusId = FieldId | ChoiceId | "manage" | "close" | "audit" | "reset" | "cancel" | "save" | `cleanup:${string}` | `revoke:${string}` | `rotate:${string}`;
+type FocusId = FieldId | ChoiceId | "manage" | "close" | "audit" | "reset" | "cancel" | "save" | "reauthenticate" | `cleanup:${string}` | `revoke:${string}` | `renew:${string}` | `rotate:${string}`;
 
 interface EditState {
   id: FieldId;
@@ -136,6 +140,8 @@ interface LayoutAuditRow {
   meta: string;
   detail: string;
   actionLabel?: string;
+  secondaryId?: FocusId;
+  secondaryActionLabel?: string;
   start: number;
   height: number;
 }
@@ -181,6 +187,7 @@ export function OpenTuiSettingsModal({
   currentSessionId,
   scopedCredentials,
   securityAvailable,
+  securityReauthenticationRequired,
   securityLoading,
   securityError,
   saving,
@@ -193,7 +200,9 @@ export function OpenTuiSettingsModal({
   onRunSessionAudit,
   onCleanupSession,
   onRevokeBrowserSession,
+  onRenewScopedCredential,
   onRotateScopedCredential,
+  onReauthenticateSecurity,
 }: OpenTuiSettingsModalProps) {
   const theme = useOpenTuiTheme();
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -214,6 +223,11 @@ export function OpenTuiSettingsModal({
   const [scrollOffset, setScrollOffset] = useState(0);
   const [viewportRows, setViewportRows] = useState(32);
   const [semanticMetrics, setSemanticMetrics] = useState<CellMetrics>(metricsRef.current);
+  const [reauthenticationOpen, setReauthenticationOpen] = useState(false);
+  const [reauthenticationUsername, setReauthenticationUsername] = useState("");
+  const [reauthenticationPassword, setReauthenticationPassword] = useState("");
+  const [reauthenticationError, setReauthenticationError] = useState("");
+  const [reauthenticating, setReauthenticating] = useState(false);
   const compiledKeybindings = useMemo(() => compileKeybindings(keybindings), [keybindings]);
 
   useEffect(() => {
@@ -246,6 +260,7 @@ export function OpenTuiSettingsModal({
       currentSessionId,
       scopedCredentials,
       securityAvailable,
+      securityReauthenticationRequired,
       securityLoading,
       securityError,
     ),
@@ -258,6 +273,7 @@ export function OpenTuiSettingsModal({
       securityAvailable,
       securityError,
       securityLoading,
+      securityReauthenticationRequired,
       sessionAudit,
       sessionAuditError,
       sessionAuditLoading,
@@ -405,6 +421,11 @@ export function OpenTuiSettingsModal({
       await onRunSessionAudit();
       return;
     }
+    if (id === "reauthenticate") {
+      setReauthenticationError("");
+      setReauthenticationOpen(true);
+      return;
+    }
     if (id === "scheme") {
       adjustScheme(1);
       return;
@@ -430,6 +451,12 @@ export function OpenTuiSettingsModal({
       const sessionId = decodeURIComponent(id.slice("revoke:".length));
       const session = browserSessions.find((candidate) => candidate.id === sessionId);
       if (session) await onRevokeBrowserSession(session);
+      return;
+    }
+    if (id.startsWith("renew:")) {
+      const kind = id.slice("renew:".length);
+      const credential = scopedCredentials.find((candidate) => candidate.kind === kind);
+      if (credential) await onRenewScopedCredential(credential);
       return;
     }
     if (id.startsWith("rotate:")) {
@@ -664,6 +691,24 @@ export function OpenTuiSettingsModal({
     && groupingRow + sidebarGroupingItem.height <= footerTop);
   const saveCol = Math.max(2, semanticMetrics.cols - 9);
 
+  const submitReauthentication = async (event: ReactFormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (reauthenticating) return;
+    setReauthenticating(true);
+    setReauthenticationError("");
+    try {
+      await onReauthenticateSecurity(reauthenticationUsername, reauthenticationPassword);
+      setReauthenticationPassword("");
+      setReauthenticationOpen(false);
+      panelRef.current?.focus({ preventScroll: true });
+    } catch (error) {
+      setReauthenticationPassword("");
+      setReauthenticationError(error instanceof Error ? error.message : "Password reauthentication failed");
+    } finally {
+      setReauthenticating(false);
+    }
+  };
+
   return (
     <div className="settings-backdrop open-tui-settings-backdrop" onMouseDown={(event) => event.currentTarget === event.target && onCancel()}>
       <div
@@ -718,6 +763,44 @@ export function OpenTuiSettingsModal({
             if (event.key === "Enter" || event.key === " ") event.stopPropagation();
           }}
         />
+        {reauthenticationOpen ? (
+          <form
+            className="open-tui-settings-reauthentication"
+            aria-label="Password reauthentication"
+            onSubmit={(event) => void submitReauthentication(event)}
+            onKeyDown={(event) => event.stopPropagation()}
+          >
+            <strong>ADMINISTRATOR REAUTHENTICATION</strong>
+            <p>Verify your password to inventory or rotate scoped credentials.</p>
+            <label>
+              USERNAME
+              <input
+                autoFocus
+                autoComplete="username"
+                value={reauthenticationUsername}
+                onChange={(event) => setReauthenticationUsername(event.currentTarget.value)}
+              />
+            </label>
+            <label>
+              PASSWORD
+              <input
+                type="password"
+                autoComplete="current-password"
+                value={reauthenticationPassword}
+                onChange={(event) => setReauthenticationPassword(event.currentTarget.value)}
+              />
+            </label>
+            {reauthenticationError ? <p className="open-tui-settings-reauthentication-error">{reauthenticationError}</p> : null}
+            <div>
+              <button type="button" onClick={() => {
+                setReauthenticationPassword("");
+                setReauthenticationOpen(false);
+                panelRef.current?.focus({ preventScroll: true });
+              }} disabled={reauthenticating}>CANCEL</button>
+              <button type="submit" disabled={reauthenticating}>{reauthenticating ? "VERIFYING" : "VERIFY"}</button>
+            </div>
+          </form>
+        ) : null}
         {editing ? (
           <input
             ref={editorInputRef}
@@ -764,6 +847,7 @@ const buildLayout = (
   currentSessionId: string | undefined,
   scopedCredentials: ScopedCredentialMetadata[],
   securityAvailable: boolean,
+  securityReauthenticationRequired: boolean,
   securityLoading: boolean,
   securityError: string,
 ): SettingsLayout => {
@@ -774,6 +858,7 @@ const buildLayout = (
   const push = (item: LayoutItemInput) => {
     items.push({ ...item, start: row } as LayoutItem);
     if ("id" in item && typeof item.id === "string") focusableIds.push(item.id as FocusId);
+    if (item.kind === "audit-row" && item.secondaryId) focusableIds.push(item.secondaryId);
     row += item.height;
   };
 
@@ -840,8 +925,17 @@ const buildLayout = (
   push({ kind: "section", title: "SESSIONS AND CREDENTIALS", height: 2 });
   if (securityLoading && !securityAvailable) {
     push({ kind: "message", text: "loading security inventory", tone: "muted", height: 2 });
-  } else if (!securityAvailable && !securityError) {
-    push({ kind: "message", text: "available with login-only browser authentication", tone: "muted", height: 2 });
+  } else if (securityReauthenticationRequired) {
+    push({ kind: "message", text: "shared access requires password reauthentication for credential administration", tone: "muted", height: 2 });
+    push({
+      kind: "audit-row",
+      id: "reauthenticate",
+      status: "admin",
+      meta: "password reauthentication required",
+      detail: "verify before inventory or credential rotation",
+      actionLabel: "reauthenticate",
+      height: 2,
+    });
   }
   if (securityError) push({ kind: "message", text: securityError, tone: "error", height: 2 });
   if (securityAvailable) {
@@ -859,11 +953,13 @@ const buildLayout = (
     for (const credential of scopedCredentials) {
       push({
         kind: "audit-row",
-        id: credential.rotatable ? `rotate:${credential.kind}` : undefined,
-        status: credential.kind,
-        meta: `issued ${formatTimestamp(credential.issuedAt)}`,
-        detail: `expires ${formatTimestamp(credential.expiresAt)}${credential.rotatable ? "" : " / environment-backed"}`,
-        actionLabel: credential.rotatable ? "rotate" : undefined,
+        id: credential.renewable ? `renew:${credential.kind}` : undefined,
+        status: credentialStatus(credential.expiryState),
+        meta: `${credential.kind} / issued ${formatTimestamp(credential.issuedAt)}`,
+        detail: `expires ${formatTimestamp(credential.expiresAt)} / ${formatRemainingLifetime(credential.expiresInMs)}${credential.rotatable ? "" : " / environment-backed"}`,
+        actionLabel: credential.renewable ? "renew" : undefined,
+        secondaryId: credential.rotatable ? `rotate:${credential.kind}` : undefined,
+        secondaryActionLabel: credential.rotatable ? "rotate" : undefined,
         height: 2,
       });
     }
@@ -979,15 +1075,24 @@ const drawSettings = (
     } else if (item.kind === "message") {
       write(row, 2, item.text, item.tone === "error" ? rgba.red : rgba.faint, 600);
     } else {
-      const selected = item.id === focusId;
+      const primarySelected = item.id === focusId;
+      const secondarySelected = item.secondaryId === focusId;
+      const selected = primarySelected || secondarySelected;
       fillCells(grid, row, 1, Math.max(0, cols - 2), selected ? rgba.active : rgba.black);
       write(row, 2, item.status.toUpperCase(), statusColor(item.status, theme), 700);
       write(row, 14, item.meta, selected ? rgba.text : rgba.muted, selected ? 700 : 600);
       write(row + 1, 14, item.detail, rgba.faint, 400);
       if (item.id && item.actionLabel) {
-        drawButton(grid, row, Math.max(2, cols - item.actionLabel.length - 4), item.actionLabel, selected, hits, item.id, "activate", theme);
+        const secondaryWidth = item.secondaryId && item.secondaryActionLabel
+          ? item.secondaryActionLabel.length + 4
+          : 0;
+        const primaryCol = Math.max(2, cols - item.actionLabel.length - secondaryWidth - 6);
+        drawButton(grid, row, primaryCol, item.actionLabel, primarySelected, hits, item.id, "activate", theme);
+        if (item.secondaryId && item.secondaryActionLabel) {
+          drawButton(grid, row, Math.max(2, cols - item.secondaryActionLabel.length - 4), item.secondaryActionLabel, secondarySelected, hits, item.secondaryId, "activate", theme);
+        }
       } else if (item.id && item.backend && item.name) {
-        drawButton(grid, row, Math.max(2, cols - 9), "quit", selected, hits, item.id, "activate", theme);
+        drawButton(grid, row, Math.max(2, cols - 9), "quit", primarySelected, hits, item.id, "activate", theme);
       }
     }
   }
@@ -1176,10 +1281,22 @@ const clampScrollbackRows = (value: number): number => {
 
 const cleanAlias = (value: string): string => value.replace(/\s+/g, " ").trim().slice(0, 40);
 
+const credentialStatus = (state: ScopedCredentialMetadata["expiryState"]): string => {
+  if (state === "expired") return "expired";
+  if (state === "near-expiry") return "expires soon";
+  return "credential";
+};
+
+const formatRemainingLifetime = (remainingMs: number): string => {
+  if (remainingMs <= 0) return "expired";
+  const hours = Math.ceil(remainingMs / (60 * 60 * 1_000));
+  return hours >= 48 ? `${Math.ceil(hours / 24)}d remaining` : `${hours}h remaining`;
+};
+
 const statusColor = (status: string, { rgba }: OpenTuiTheme): RGBA => {
   if (status === "active") return rgba.green;
-  if (status === "missing" || status === "duplicate") return rgba.gold;
-  if (status === "orphan") return rgba.red;
+  if (status === "missing" || status === "duplicate" || status === "expires soon") return rgba.gold;
+  if (status === "orphan" || status === "expired") return rgba.red;
   return rgba.muted;
 };
 

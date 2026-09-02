@@ -40,6 +40,9 @@ export interface ScopedCredentialMetadata {
   kind: ScopedCredentialKind;
   issuedAt: number;
   expiresAt: number;
+  expiresInMs: number;
+  expiryState: "active" | "near-expiry" | "expired";
+  renewable: boolean;
   rotatable: boolean;
 }
 
@@ -128,17 +131,39 @@ export class ScopedCredentialStore {
     return undefined;
   }
 
-  list(): ScopedCredentialMetadata[] {
+  list(nowMs = Date.now()): ScopedCredentialMetadata[] {
     return (["automation", "helper"] as const).flatMap((kind) => {
       const record = this.records[kind];
       if (!record || !this.token(kind)) return [];
+      const expiresInMs = Math.max(0, record.expiresAt - nowMs);
       return [{
         kind,
         issuedAt: record.issuedAt,
         expiresAt: record.expiresAt,
+        expiresInMs,
+        expiryState: record.expiresAt <= nowMs
+          ? "expired"
+          : expiresInMs <= 7 * 24 * 60 * 60 * 1_000
+            ? "near-expiry"
+            : "active",
+        renewable: true,
         rotatable: Boolean(this.tokenPath(kind)),
       }];
     });
+  }
+
+  renew(kind: ScopedCredentialKind, nowMs = Date.now()): ScopedCredentialMetadata {
+    const token = this.token(kind);
+    const record = this.records[kind];
+    if (!token || !record) {
+      throw new ScopedCredentialRotationError("credential_not_configured");
+    }
+    this.records[kind] = {
+      ...record,
+      expiresAt: nowMs + this.ttlMs,
+    };
+    this.persist();
+    return this.list(nowMs).find((candidate) => candidate.kind === kind)!;
   }
 
   rotate(kind: ScopedCredentialKind, nowMs = Date.now()): ScopedCredentialMetadata {
@@ -159,7 +184,7 @@ export class ScopedCredentialStore {
       expiresAt: nowMs + this.ttlMs,
     };
     this.persist();
-    return this.list().find((record) => record.kind === kind)!;
+    return this.list(nowMs).find((record) => record.kind === kind)!;
   }
 
   private token(kind: ScopedCredentialKind): string | undefined {

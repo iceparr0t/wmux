@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   api,
+  ApiResponseError,
+  UnauthorizedError,
   type BrowserSessionMetadata,
   type ScopedCredentialMetadata,
 } from "./api";
+import { setToken } from "./token";
 import { OpenTuiSettingsModal } from "./OpenTuiSettingsModal";
 import { terminalColorSchemes } from "./color-schemes";
 import { MAX_TERMINAL_FONT_SIZE, MIN_TERMINAL_FONT_SIZE } from "./types";
@@ -55,6 +58,7 @@ export function SettingsModal({
   const [securityLoading, setSecurityLoading] = useState(false);
   const [securityError, setSecurityError] = useState("");
   const [securityAvailable, setSecurityAvailable] = useState(false);
+  const [securityReauthenticationRequired, setSecurityReauthenticationRequired] = useState(false);
 
   useEffect(() => {
     setDraft(normalizeSettings(settings, defaults.terminalFontSize));
@@ -63,21 +67,28 @@ export function SettingsModal({
   const loadSecurity = useCallback(async () => {
     setSecurityLoading(true);
     setSecurityError("");
+    setSecurityReauthenticationRequired(false);
+    const authInfo = await api.authInfo().catch(() => undefined);
     try {
-      const authInfo = await api.authInfo();
-      if (authInfo.browserAuthMode !== "login-only") {
-        setSecurityAvailable(false);
-        return;
-      }
-      const [sessionResponse, credentialResponse] = await Promise.all([
-        api.browserSessions(),
-        api.scopedCredentials(),
-      ]);
+      if (!authInfo) throw new Error("Security inventory unavailable");
+      const credentialResponse = await api.scopedCredentials();
+      const sessionResponse = authInfo.browserAuthMode === "login-only"
+        ? await api.browserSessions()
+        : { sessions: [], currentSessionId: undefined };
       setBrowserSessions(sessionResponse.sessions);
       setCurrentSessionId(sessionResponse.currentSessionId);
       setScopedCredentials(credentialResponse.credentials);
       setSecurityAvailable(true);
     } catch (error) {
+      if (
+        authInfo?.browserAuthMode === "shared-or-login"
+        && authInfo.loginEnabled
+        && (error instanceof UnauthorizedError || (error instanceof ApiResponseError && error.status === 403))
+      ) {
+        setSecurityAvailable(false);
+        setSecurityReauthenticationRequired(true);
+        return;
+      }
       setSecurityError(error instanceof Error ? error.message : "Security inventory failed");
     } finally {
       setSecurityLoading(false);
@@ -153,6 +164,18 @@ export function SettingsModal({
     }
   };
 
+  const renewScopedCredential = async (credential: ScopedCredentialMetadata) => {
+    setSecurityLoading(true);
+    setSecurityError("");
+    try {
+      await api.renewScopedCredential(credential.kind);
+      await loadSecurity();
+    } catch (error) {
+      setSecurityError(error instanceof Error ? error.message : "Credential renewal failed");
+      setSecurityLoading(false);
+    }
+  };
+
   const rotateScopedCredential = async (credential: ScopedCredentialMetadata) => {
     if (!window.confirm(`Rotate the ${credential.kind} credential now? Existing copies will stop working immediately.`)) return;
     setSecurityLoading(true);
@@ -162,6 +185,21 @@ export function SettingsModal({
       await loadSecurity();
     } catch (error) {
       setSecurityError(error instanceof Error ? error.message : "Credential rotation failed");
+      setSecurityLoading(false);
+    }
+  };
+
+  const reauthenticateSecurity = async (username: string, password: string) => {
+    setSecurityLoading(true);
+    setSecurityError("");
+    try {
+      const { token } = await api.login(username, password);
+      if (token) setToken(token);
+      await loadSecurity();
+    } catch (error) {
+      setSecurityError(error instanceof Error ? error.message : "Password reauthentication failed");
+      throw error;
+    } finally {
       setSecurityLoading(false);
     }
   };
@@ -178,6 +216,7 @@ export function SettingsModal({
       currentSessionId={currentSessionId}
       scopedCredentials={scopedCredentials}
       securityAvailable={securityAvailable}
+      securityReauthenticationRequired={securityReauthenticationRequired}
       securityLoading={securityLoading}
       securityError={securityError}
       saving={saving}
@@ -190,7 +229,9 @@ export function SettingsModal({
       onRunSessionAudit={runSessionAudit}
       onCleanupSession={cleanupSession}
       onRevokeBrowserSession={revokeBrowserSession}
+      onRenewScopedCredential={renewScopedCredential}
       onRotateScopedCredential={rotateScopedCredential}
+      onReauthenticateSecurity={reauthenticateSecurity}
     />
   );
 }

@@ -5828,6 +5828,86 @@ button.active-tool {
   pointer-events: none;
 }
 
+.open-tui-settings-reauthentication {
+  position: absolute;
+  z-index: 4;
+  display: grid;
+  gap: 8px;
+  width: min(360px, calc(100% - 32px));
+  top: 50%;
+  left: 50%;
+  box-sizing: border-box;
+  border: 1px solid var(--gold-dim);
+  background: var(--black);
+  padding: 14px;
+  color: var(--text);
+  font: 700 11px/1.3 var(--wmux-mono-font);
+  transform: translate(-50%, -50%);
+  box-shadow: 10px 12px 0 rgba(0, 0, 0, 0.56);
+}
+
+.open-tui-settings-reauthentication > strong,
+.open-tui-settings-reauthentication label {
+  color: var(--gold);
+  letter-spacing: 0.06em;
+}
+
+.open-tui-settings-reauthentication > p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.open-tui-settings-reauthentication label {
+  display: grid;
+  gap: 4px;
+}
+
+.open-tui-settings-reauthentication input {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: var(--panel);
+  padding: 8px;
+  color: var(--ivory);
+  font: inherit;
+}
+
+.open-tui-settings-reauthentication input:focus {
+  border-color: var(--gold);
+  outline: 1px solid var(--gold);
+}
+
+.open-tui-settings-reauthentication-error {
+  color: var(--red) !important;
+}
+
+.open-tui-settings-reauthentication > div {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.open-tui-settings-reauthentication button {
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 0;
+  background: var(--black);
+  color: var(--text);
+  font: inherit;
+}
+
+.open-tui-settings-reauthentication button:last-child {
+  border-color: var(--gold-dim);
+  color: var(--gold);
+}
+
+.open-tui-settings-reauthentication button:focus-visible,
+.open-tui-settings-reauthentication button:hover {
+  outline: 0;
+  background: var(--selection);
+  color: var(--selection-text);
+}
+
 @media (max-width: 800px), (max-height: 500px) and (pointer: coarse) {
   .app-shell {
     position: relative;

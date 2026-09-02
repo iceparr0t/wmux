@@ -220,3 +220,82 @@ test("login-only enforces scoped REST and WebSocket transports end to end", asyn
     fs.rmSync(directory, { recursive: true, force: true });
   }
 });
+
+
+test("shared-or-login requires password reauthentication for scoped credential administration", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-shared-credential-admin-"));
+  const auth: AuthConfig = {
+    enabled: true,
+    token: "legacy-test-token",
+    loginEnabled: true,
+    credentials: { username: "operator", passwordHash: hashPassword("correct horse") },
+    sessionSecret: "session-test-secret",
+    browserAuthMode: "shared-or-login",
+    automationToken: "A".repeat(43),
+    automationTokenPath: path.join(directory, "automation-token"),
+    helperToken: "H".repeat(43),
+    helperTokenPath: path.join(directory, "helper-token"),
+  };
+  fs.writeFileSync(auth.automationTokenPath, `${auth.automationToken}\n`, { mode: 0o600 });
+  fs.writeFileSync(auth.helperTokenPath, `${auth.helperToken}\n`, { mode: 0o600 });
+  const state = new StateStore([], path.join(directory, "state.json"));
+  const settings = new SettingsStore(path.join(directory, "settings.json"));
+  const server = await createHttpServer("127.0.0.1", state, [], {} as SessionManager, settings, {
+    auth,
+    healthResolvers: { machines: async () => [], streams: async () => [] },
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    assert.equal((await fetch(`${base}/api/auth/credentials`, { headers: bearer(auth.token) })).status, 403);
+    assert.equal((await fetch(`${base}/api/auth/credentials/helper/renew`, {
+      method: "POST",
+      headers: bearer(auth.token),
+    })).status, 403);
+    assert.equal((await fetch(`${base}/api/auth/credentials`, { headers: bearer(auth.automationToken!) })).status, 403);
+
+    const login = await fetch(`${base}/api/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "operator", password: "correct horse" }),
+    });
+    assert.equal(login.status, 200);
+    assert.equal(login.headers.get("set-cookie"), null);
+    const { token } = await login.json() as { token: string };
+    assert.match(token, /^wsess\./);
+
+    const inventory = await fetch(`${base}/api/auth/credentials`, { headers: bearer(token) });
+    assert.equal(inventory.status, 200);
+    const credentials = (await inventory.json() as {
+      credentials: Array<{ kind: string; renewable: boolean; expiryState: string; expiresInMs: number }>;
+    }).credentials;
+    assert.deepEqual(credentials.map(({ kind }) => kind), ["automation", "helper"]);
+    assert.ok(credentials.every((credential) => credential.renewable && credential.expiryState === "active" && credential.expiresInMs > 0));
+
+    const oldHelperToken = auth.helperToken!;
+    assert.equal((await fetch(`${base}/api/auth/credentials/helper/renew`, {
+      method: "POST",
+      headers: bearer(token),
+    })).status, 200);
+    assert.equal(auth.helperToken, oldHelperToken);
+    assert.equal((await fetch(`${base}/api/auth/credentials/helper/rotate`, {
+      method: "POST",
+      headers: bearer(token),
+    })).status, 200);
+    assert.notEqual(auth.helperToken, oldHelperToken);
+    assert.equal((await fetch(`${base}/api/notifications`, {
+      method: "POST",
+      headers: bearer(oldHelperToken),
+      body: "{}",
+    })).status, 401);
+    assert.equal((await fetch(`${base}/api/auth/credentials`, { headers: bearer(auth.token) })).status, 403);
+  } finally {
+    server.close();
+    await once(server, "close");
+    state.flush();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
