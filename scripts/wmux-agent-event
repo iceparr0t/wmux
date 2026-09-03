@@ -6,6 +6,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 
@@ -201,6 +202,23 @@ def post_json(url, payload):
         pass
 
 
+def delivery_failure_reason(error):
+    # This is intentionally a small, non-secret vocabulary. Callers can
+    # surface it without accidentally logging an URL, request body, or token.
+    if isinstance(error, urllib.error.HTTPError):
+        if error.code == 401:
+            return "unauthorized"
+        if error.code == 403:
+            return "forbidden"
+        if 400 <= error.code < 500:
+            return "client_error"
+        if 500 <= error.code < 600:
+            return "server_error"
+    if isinstance(error, (urllib.error.URLError, TimeoutError, OSError)):
+        return "unreachable"
+    return "failed"
+
+
 def codex_lifecycle_tail(path, start=None, limit=1024 * 1024):
     if not path or not os.path.isfile(path):
         return []
@@ -341,6 +359,11 @@ def main():
     parser.add_argument("--codex-reconcile", action="store_true")
     parser.add_argument("--opencode-hook", action="store_true")
     parser.add_argument("--prime-agent-hook", action="store_true")
+    parser.add_argument(
+        "--delivery-status",
+        action="store_true",
+        help="emit a machine-readable, non-secret delivery result to stderr",
+    )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -489,7 +512,16 @@ def main():
     try:
         post_json(args.url, payload)
     except Exception as error:  # noqa: BLE001
-        print(f"wmux-agent-event: delivery failed: {error}", file=sys.stderr)
+        if args.delivery_status:
+            print(
+                "WMUX_DELIVERY_STATUS=" + json.dumps({
+                    "status": "failed",
+                    "reason": delivery_failure_reason(error),
+                }, separators=(",", ":")),
+                file=sys.stderr,
+            )
+        else:
+            print(f"wmux-agent-event: delivery failed: {error}", file=sys.stderr)
     return 0
 
 

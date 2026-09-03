@@ -60,6 +60,7 @@ for (const script of [
   "scripts/wmux-moonlight-gateway",
   "scripts/wmux-set-password",
   "scripts/wmux-provision-scoped-auth.mjs",
+  "scripts/wmux-check-scoped-credentials",
 ]) {
   run(process.execPath, ["--check", script]);
 }

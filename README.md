@@ -393,6 +393,7 @@ Within the private Host/Origin/bind boundary, only `/api/health`, auth metadata,
   Use owner-only token files at the configured paths and never put credentials in arguments, logs, documentation, or URLs.
   Scoped credentials expire after 30 days by default.
   Set `WMUX_SCOPED_CREDENTIAL_TTL_MS` to an integer from one hour through 365 days to choose a different lifetime for newly discovered or rotated credentials.
+  Run `scripts/wmux-check-scoped-credentials --require` as a read-only deployment check; add `--json` for automation. It returns 1 inside the warning window and 2 inside the failure window or for unsafe metadata, without emitting token digests or values.
   Settings shows issue and expiry times and can atomically rotate file-backed credentials without returning their values to the browser.
   An old value loses authority immediately and fails with `401`.
   Environment-backed credentials must be rotated through their external owner.
@@ -599,6 +600,8 @@ registration intent also converges repeated response loss or broker termination
 after server commit without replaying relay plaintext from the server.
 
 `wmux-hooks install prime-agent` writes an auto-loaded managed extension to `~/.prime/agent/extensions/wmux.ts`.
+The installer pins content-addressed, owner-controlled copies of `wmux-agent-event` and `wmux-title` so later source-tree edits cannot change a running extension. It rejects redirected or writable staging paths.
+Bounded delivery warnings distinguish authorization and reachability failures without exposing URLs or credentials, and telemetry delivery never delays Prime lifecycle callbacks.
 While a root turn or any nested RLM subagent is running, the pane's sidebar row uses the animated working indicator.
 When a Prime session is idle with an active scheduled heartbeat, that row uses a distinct red heart pulse.
 A delivered heartbeat turn switches back to the ordinary blue working spinner until its work finishes, then returns to the heart while the schedule remains active.

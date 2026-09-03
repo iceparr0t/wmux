@@ -193,6 +193,14 @@ test("Prime Agent installer writes an idempotent managed extension and preserves
     assert.match(extension, /hasPendingMessages/);
     assert.match(extension, /--prime-agent-hook/);
     assert.match(extension, /wmux-title/);
+    assert.doesNotMatch(extension, new RegExp(repoRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    const stagedEvent = extension.match(/const eventScript = "([^"]+)"/)?.[1];
+    const stagedTitle = extension.match(/const titleScript = "([^"]+)"/)?.[1];
+    assert.ok(stagedEvent && stagedTitle);
+    assert.match(stagedEvent, /\.prime[\/]+agent[\/]+wmux-managed[\/]+[a-f0-9]{64}[\/]+wmux-agent-event$/);
+    assert.equal(fs.readFileSync(stagedEvent, "utf8"), fs.readFileSync(path.join(repoRoot, "scripts", "wmux-agent-event"), "utf8"));
+    assert.equal(fs.readFileSync(stagedTitle, "utf8"), fs.readFileSync(path.join(repoRoot, "scripts", "wmux-title"), "utf8"));
+    assert.equal(fs.statSync(stagedEvent).mode & 0o777, 0o500);
     assert.match(extension, /setSessionName/);
     assert.match(extension, /getSessionName/);
     assert.match(extension, /appendEntry/);
@@ -209,12 +217,65 @@ test("Prime Agent installer writes an idempotent managed extension and preserves
     assert.equal(status.primeAgent, "installed");
     assert.equal(status.primeAgentPath, extensionPath);
 
+    fs.chmodSync(stagedEvent, 0o700);
+    fs.writeFileSync(stagedEvent, "tampered helper\n");
+    fs.chmodSync(stagedEvent, 0o500);
+    const tamperedStatus = JSON.parse((await execFileAsync(hooks, ["status"], { env })).stdout) as Record<string, unknown>;
+    assert.equal(tamperedStatus.primeAgent, "not_installed");
+    await assert.rejects(
+      execFileAsync(hooks, ["install", "prime-agent"], { env }),
+      /unsafe or does not match this wmux release/,
+    );
+
     fs.writeFileSync(extensionPath, "user-owned Prime Agent extension\n");
     const reinstall = await execFileAsync(hooks, ["install", "prime-agent"], { env });
     assert.match(reinstall.stdout, /Preserved existing unmanaged Prime Agent extension/);
     assert.equal(fs.readFileSync(extensionPath, "utf8"), "user-owned Prime Agent extension\n");
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("Prime Agent installer rejects redirected extension and managed-helper directories", { skip: process.platform === "win32" }, async () => {
+  const hooks = path.join(repoRoot, "scripts", "wmux-hooks");
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-prime-agent-paths-"));
+  const outsideExtensions = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-prime-agent-outside-ext-"));
+  const outsideAgent = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-prime-agent-outside-agent-"));
+  try {
+    const agentDirectory = path.join(home, ".prime", "agent");
+    fs.mkdirSync(agentDirectory, { recursive: true, mode: 0o700 });
+    fs.symlinkSync(outsideExtensions, path.join(agentDirectory, "extensions"), "dir");
+    await assert.rejects(
+      execFileAsync(hooks, ["install", "prime-agent"], { env: { ...process.env, HOME: home } }),
+      /Prime Agent directories must be/,
+    );
+    assert.equal(fs.existsSync(path.join(outsideExtensions, "wmux.ts")), false);
+    const redirectedStatus = JSON.parse((await execFileAsync(hooks, ["status"], { env: { ...process.env, HOME: home } })).stdout) as Record<string, unknown>;
+    assert.equal(redirectedStatus.primeAgent, "not_installed");
+
+    fs.rmSync(path.join(agentDirectory, "extensions"));
+    fs.mkdirSync(path.join(agentDirectory, "extensions"), { mode: 0o700 });
+    const outsideTarget = path.join(outsideExtensions, "outside.ts");
+    fs.writeFileSync(outsideTarget, "outside extension\n", { mode: 0o600 });
+    fs.symlinkSync(outsideTarget, path.join(agentDirectory, "extensions", "wmux.ts"));
+    await assert.rejects(
+      execFileAsync(hooks, ["install", "prime-agent"], { env: { ...process.env, HOME: home } }),
+      /extension path must be a safe/,
+    );
+    assert.equal(fs.readFileSync(outsideTarget, "utf8"), "outside extension\n");
+
+    fs.rmSync(path.join(home, ".prime"), { recursive: true, force: true });
+    fs.mkdirSync(path.join(home, ".prime"), { mode: 0o700 });
+    fs.symlinkSync(outsideAgent, path.join(home, ".prime", "agent"), "dir");
+    await assert.rejects(
+      execFileAsync(hooks, ["install", "prime-agent"], { env: { ...process.env, HOME: home } }),
+      /Prime Agent directories must be/,
+    );
+    assert.deepEqual(fs.readdirSync(outsideAgent), []);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(outsideExtensions, { recursive: true, force: true });
+    fs.rmSync(outsideAgent, { recursive: true, force: true });
   }
 });
 
@@ -246,7 +307,7 @@ test("Prime Agent extension binds each session to its forwarded pane environment
     "WMUX_WORKSPACE_ID", "WMUX_TAB_ID", "WMUX_PANE_ID",
     "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID", "WMUX_DELEGATED_RUN", "RLM_DEPTH",
     "PRIME_AGENT_INTERNAL_DAEMON_WORKER", "WMUX_PRIME_RETRY_GRACE_MS",
-    "WMUX_PRIME_LATE_RETRY_WINDOW_MS",
+    "WMUX_PRIME_LATE_RETRY_WINDOW_MS", "WMUX_PRIME_TEST_AWAIT_DELIVERY",
   ].map((key) => [key, process.env[key]]));
   try {
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -270,6 +331,7 @@ test("Prime Agent extension binds each session to its forwarded pane environment
       PRIME_AGENT_INTERNAL_DAEMON_WORKER: "1",
       WMUX_PRIME_RETRY_GRACE_MS: "80",
       WMUX_PRIME_LATE_RETRY_WINDOW_MS: "500",
+      WMUX_PRIME_TEST_AWAIT_DELIVERY: "1",
     });
     await execFileAsync(path.join(repoRoot, "scripts", "wmux-hooks"), ["install", "prime-agent"], { env: process.env });
     const extensionPath = path.join(home, ".prime", "agent", "extensions", "wmux.ts");
@@ -954,7 +1016,7 @@ test("Prime Agent extension periodically refreshes contextual titles and preserv
     "WMUX_HELPER_TOKEN", "WMUX_HELPER_TOKEN_PATH", "WMUX_BROWSER_AUTH_MODE",
     "WMUX_WORKSPACE_ID", "WMUX_TAB_ID", "WMUX_PANE_ID",
     "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID", "WMUX_DELEGATED_RUN",
-    "PRIME_AGENT_INTERNAL_DAEMON_WORKER", "WMUX_PRIME_TITLE_SYNC_INTERVAL_MS",
+    "PRIME_AGENT_INTERNAL_DAEMON_WORKER", "WMUX_PRIME_TITLE_SYNC_INTERVAL_MS", "WMUX_PRIME_TEST_AWAIT_DELIVERY",
   ].map((key) => [key, process.env[key]]));
   try {
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -971,6 +1033,7 @@ test("Prime Agent extension periodically refreshes contextual titles and preserv
       HERDR_PANE_ID: "pane_33333333",
       PRIME_AGENT_INTERNAL_DAEMON_WORKER: "1",
       WMUX_PRIME_TITLE_SYNC_INTERVAL_MS: "60",
+      WMUX_PRIME_TEST_AWAIT_DELIVERY: "1",
     });
     delete process.env.WMUX_HELPER_URL;
     delete process.env.WMUX_PUBLIC_URL;
@@ -1352,6 +1415,146 @@ test("generated OpenCode plugin forwards a complete top-level lifecycle", { skip
       else process.env[key] = value;
     }
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("Prime Agent extension warns once for unauthenticated helper delivery without failing a turn", { skip: process.platform === "win32", concurrency: false }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-prime-agent-delivery-warning-"));
+  const server = http.createServer((_request, response) => {
+    response.writeHead(401, { "content-type": "application/json" });
+    response.end("{}");
+  });
+  const saved = Object.fromEntries([
+    "HOME", "WMUX_URL", "WMUX_TOKEN", "WMUX_TOKEN_PATH", "WMUX_BROWSER_AUTH_MODE",
+    "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID", "PRIME_AGENT_INTERNAL_DAEMON_WORKER",
+    "WMUX_PRIME_TEST_AWAIT_DELIVERY",
+  ].map((key) => [key, process.env[key]]));
+  const warnings: unknown[][] = [];
+  const originalWarn = console.warn;
+  try {
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    Object.assign(process.env, {
+      HOME: home,
+      WMUX_URL: `http://127.0.0.1:${address.port}`,
+      WMUX_TOKEN: "",
+      WMUX_TOKEN_PATH: path.join(home, "missing-token"),
+      WMUX_BROWSER_AUTH_MODE: "shared-or-login",
+      HERDR_WORKSPACE_ID: "ws_aaaaaaaa",
+      HERDR_TAB_ID: "tab_aaaaaaaa",
+      HERDR_PANE_ID: "pane_aaaaaaaa",
+      PRIME_AGENT_INTERNAL_DAEMON_WORKER: "1",
+      WMUX_PRIME_TEST_AWAIT_DELIVERY: "1",
+    });
+    await execFileAsync(path.join(repoRoot, "scripts", "wmux-hooks"), ["install", "prime-agent"], { env: process.env });
+    const extensionPath = path.join(home, ".prime", "agent", "extensions", "wmux.ts");
+    const importedPath = path.join(home, "delivery-warning-extension.ts");
+    fs.copyFileSync(extensionPath, importedPath);
+    const module = await import(pathToFileURL(importedPath).href);
+    const handlers = new Map<string, (event: any, context: any) => Promise<void>>();
+    module.default({
+      on: (name: string, handler: (event: any, context: any) => Promise<void>) => handlers.set(name, handler),
+      getSessionName: () => undefined,
+      setSessionName: () => {},
+      appendEntry: () => {},
+    });
+    const context = {
+      hasPendingMessages: () => false,
+      isIdle: () => true,
+      sessionManager: {
+        getSessionId: () => "delivery-warning",
+        getSessionDir: () => path.join(home, ".prime", "agent", "sessions"),
+        getHeader: () => ({ id: "delivery-warning", rlmDepth: 0 }),
+      },
+    };
+    console.warn = (...values: unknown[]) => { warnings.push(values); };
+    await handlers.get("before_agent_start")?.({ prompt: "test delivery" }, context);
+    await handlers.get("agent_end")?.({ messages: [{ role: "assistant", content: "done" }] }, context);
+    assert.deepEqual(warnings, [["wmux delivery warning [unauthorized]: agent activity or auto-title was not delivered"]]);
+    await handlers.get("session_shutdown")?.({}, context);
+  } finally {
+    console.warn = originalWarn;
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+
+test("Prime Agent lifecycle callbacks do not wait for stalled wmux telemetry", { skip: process.platform === "win32", concurrency: false }, async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-prime-agent-nonblocking-"));
+  let requests = 0;
+  const server = http.createServer((_request, _response) => { requests += 1; });
+  const saved = Object.fromEntries([
+    "HOME", "WMUX_URL", "WMUX_HELPER_URL", "WMUX_PUBLIC_URL", "WMUX_HELPER_TOKEN", "WMUX_HELPER_TOKEN_PATH", "WMUX_BROWSER_AUTH_MODE",
+    "WMUX_TOKEN", "WMUX_TOKEN_PATH", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID",
+    "PRIME_AGENT_INTERNAL_DAEMON_WORKER", "WMUX_PRIME_TEST_AWAIT_DELIVERY",
+  ].map((key) => [key, process.env[key]]));
+  const warnings: unknown[][] = [];
+  const originalWarn = console.warn;
+  try {
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    Object.assign(process.env, {
+      HOME: home,
+      WMUX_URL: `http://127.0.0.1:${address.port}`,
+      WMUX_HELPER_TOKEN: "stalled-helper-token-0123456789abcdef",
+      WMUX_BROWSER_AUTH_MODE: "login-only",
+      HERDR_WORKSPACE_ID: "ws_bbbbbbbb",
+      HERDR_TAB_ID: "tab_bbbbbbbb",
+      HERDR_PANE_ID: "pane_bbbbbbbb",
+      PRIME_AGENT_INTERNAL_DAEMON_WORKER: "1",
+    });
+    delete process.env.WMUX_HELPER_URL;
+    delete process.env.WMUX_PUBLIC_URL;
+    delete process.env.WMUX_HELPER_TOKEN_PATH;
+    delete process.env.WMUX_TOKEN;
+    delete process.env.WMUX_TOKEN_PATH;
+    delete process.env.WMUX_PRIME_TEST_AWAIT_DELIVERY;
+    await execFileAsync(path.join(repoRoot, "scripts", "wmux-hooks"), ["install", "prime-agent"], { env: process.env });
+    const extensionPath = path.join(home, ".prime", "agent", "extensions", "wmux.ts");
+    const importedPath = path.join(home, "nonblocking-extension.ts");
+    fs.copyFileSync(extensionPath, importedPath);
+    const module = await import(pathToFileURL(importedPath).href);
+    const handlers = new Map<string, (event: any, context: any) => Promise<void>>();
+    module.default({
+      on: (name: string, handler: (event: any, context: any) => Promise<void>) => handlers.set(name, handler),
+      getSessionName: () => undefined,
+      setSessionName: () => false,
+      appendEntry: () => {},
+    });
+    const context = {
+      hasPendingMessages: () => false,
+      isIdle: () => true,
+      sessionManager: {
+        getSessionId: () => "nonblocking-delivery",
+        getSessionDir: () => path.join(home, ".prime", "agent", "sessions"),
+        getHeader: () => ({ id: "nonblocking-delivery", rlmDepth: 0 }),
+      },
+    };
+    console.warn = (...values: unknown[]) => { warnings.push(values); };
+    const startedAt = Date.now();
+    await handlers.get("before_agent_start")?.({ prompt: "stalled delivery" }, context);
+    assert.ok(Date.now() - startedAt < 500, "lifecycle callback waited for telemetry");
+    await waitUntil(() => requests >= 1 || warnings.length >= 1);
+    assert.ok(requests >= 1, `helper failed before reaching stalled server: ${JSON.stringify(warnings)}`);
+    server.closeAllConnections();
+    await waitUntil(() => warnings.length === 1);
+    assert.deepEqual(warnings, [["wmux delivery warning [unreachable]: agent activity or auto-title was not delivered"]]);
+  } finally {
+    console.warn = originalWarn;
+    server.closeAllConnections();
+    if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     fs.rmSync(home, { recursive: true, force: true });
   }
 });

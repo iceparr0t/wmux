@@ -217,6 +217,40 @@ test("wmux-title prefers the refreshed persisted helper URL when the environment
   }
 });
 
+test("wmux-title delivery status is bounded and preserves hook success on 401", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-title-status-"));
+  const secret = "title-helper-secret-0123456789abcdef";
+  const server = http.createServer((_request, response) => {
+    response.writeHead(401, { "content-type": "text/plain" }).end(`rejected ${secret}`);
+  });
+  try {
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address === "object");
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: home,
+      WMUX_URL: `http://127.0.0.1:${address.port}`,
+      WMUX_HELPER_TOKEN: secret,
+      WMUX_BROWSER_AUTH_MODE: "login-only",
+    };
+    delete env.WMUX_HELPER_TOKEN_PATH;
+    delete env.WMUX_TOKEN;
+    delete env.WMUX_TOKEN_PATH;
+    const result = await execFileAsync("bash", [script("wmux-title"),
+      "--delivery-status",
+      "--workspace", "ws_test",
+      "--title", "Status test",
+    ], { env });
+    assert.equal(result.stdout, "");
+    assert.equal(result.stderr.trim(), 'WMUX_DELIVERY_STATUS={"status":"failed","reason":"unauthorized"}');
+    assert.equal(result.stderr.includes(secret), false);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
 test("explicit malformed helper environments fail before compatibility fallback", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-helper-env-"));
   try {

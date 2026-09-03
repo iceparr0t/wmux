@@ -569,3 +569,27 @@ test("agent harness hooks silently return without wmux pane context", async () =
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("agent event delivery status is non-secret and preserves hook success on 401", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wmux-agent-event-status-"));
+  const token = "t".repeat(32);
+  const server = http.createServer((_request, response) => {
+    response.writeHead(401, { "content-type": "application/json" });
+    response.end("{}");
+  });
+  try {
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const result = await runAgentEvent(
+      ["--delivery-status", "--url", `http://127.0.0.1:${address.port}`, "--agent", "prime-agent", "--pane", "pane-test", "--force"],
+      agentEventEnv(dir, { WMUX_HELPER_TOKEN: token }),
+    );
+    assert.equal(result.stdout, "");
+    assert.equal(result.stderr.trim(), 'WMUX_DELIVERY_STATUS={"status":"failed","reason":"unauthorized"}');
+    assert.doesNotMatch(result.stderr, new RegExp(token));
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

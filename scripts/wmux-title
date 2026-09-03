@@ -41,13 +41,14 @@ title=""
 descriptor=""
 manual=0
 tab_only_if_multiple=1
+delivery_status=0
 workspace_explicit=0
 tab_explicit=0
 pane_explicit=0
 
 usage() {
   cat >&2 <<'EOF'
-Usage: wmux-title [--manual] [--workspace <id>] [--tab <id>] [--pane <id>] [--descriptor <text>] [--tab-always] --title <text>
+Usage: wmux-title [--manual] [--delivery-status] [--workspace <id>] [--tab <id>] [--pane <id>] [--descriptor <text>] [--tab-always] --title <text>
 EOF
 }
 
@@ -86,6 +87,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --tab-always)
       tab_only_if_multiple=0
+      shift
+      ;;
+    --delivery-status)
+      delivery_status=1
       shift
       ;;
     -h|--help)
@@ -180,8 +185,27 @@ else
   path="/api/workspaces/${workspace_id}/auto-title"
 fi
 
-curl -fsS \
+if [[ "${delivery_status}" -eq 0 ]]; then
+  curl -fsS \
+    -H "content-type: application/json" \
+    "${auth_header[@]}" \
+    -d "${payload}" \
+    "${wmux_url%/}${path}" >/dev/null
+  exit 0
+fi
+
+# The managed Prime extension consumes this bounded marker. Do not expose curl
+# diagnostics because they can include deployment URLs.
+http_status="$(curl -sS --connect-timeout 3 --max-time 15 -o /dev/null -w '%{http_code}' \
   -H "content-type: application/json" \
   "${auth_header[@]}" \
   -d "${payload}" \
-  "${wmux_url%/}${path}" >/dev/null
+  "${wmux_url%/}${path}" 2>/dev/null || true)"
+case "${http_status}" in
+  2??) ;;
+  401) printf '%s\n' 'WMUX_DELIVERY_STATUS={"status":"failed","reason":"unauthorized"}' >&2 ;;
+  403) printf '%s\n' 'WMUX_DELIVERY_STATUS={"status":"failed","reason":"forbidden"}' >&2 ;;
+  4??) printf '%s\n' 'WMUX_DELIVERY_STATUS={"status":"failed","reason":"client_error"}' >&2 ;;
+  5??) printf '%s\n' 'WMUX_DELIVERY_STATUS={"status":"failed","reason":"server_error"}' >&2 ;;
+  *) printf '%s\n' 'WMUX_DELIVERY_STATUS={"status":"failed","reason":"unreachable"}' >&2 ;;
+esac
