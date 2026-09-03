@@ -394,10 +394,10 @@ Within the private Host/Origin/bind boundary, only `/api/health`, auth metadata,
   Scoped credentials expire after 30 days by default.
   Set `WMUX_SCOPED_CREDENTIAL_TTL_MS` to an integer from one hour through 365 days to choose a different lifetime for newly discovered or rotated credentials.
   Run `scripts/wmux-check-scoped-credentials --require` as a read-only deployment check; add `--json` for automation. It returns 1 inside the warning window and 2 inside the failure window or for unsafe metadata, without emitting token digests or values.
-  Settings shows issue and expiry times and can atomically rotate file-backed credentials without returning their values to the browser.
-  An old value loses authority immediately and fails with `401`.
+  Settings shows issue and expiry times. It can renew a credential without changing its token bytes, or atomically rotate a file-backed value without returning it to the browser.
+  Shared-token browser users must first reauthenticate with the configured password; this creates browser-session authority without weakening the scoped route policy.
+  Renewal extends the existing value so staged remote copies remain valid. Rotation invalidates the old value immediately with `401` and requires explicit restaging.
   Environment-backed credentials must be rotated through their external owner.
-  Copies provisioned to remote hosts must still be distributed explicitly after rotation.
 - Automation and helper credentials are distinct typed principals.
   Automation is limited to reviewed controller actions and pane-output WebSocket access; helper is limited to reviewed event, title, notification, media, clipboard, stream, and profile operations.
   Both use authorization headers only; scoped credentials are forbidden in query parameters and never fall back or retry across scopes.
