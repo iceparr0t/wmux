@@ -3161,6 +3161,14 @@ export default function (pi: any) {
       idleReconcileCandidate = undefined
       return
     }
+    // Positive input requests can make the runtime appear idle while the tool
+    // is waiting for the user. Preserve Waiting across reloads until the new
+    // runner receives the questionnaire result.
+    if ([...activity.pendingQuestions.values()].includes(key)) {
+      idleReconcileCandidate = undefined
+      scheduleIdleReconcile(ctx)
+      return
+    }
     // A provider-error hold owns this binding across extension reloads. Its
     // retry grace must finish or be resumed before ordinary idle healing.
     if (activity.retryFailures.has(key)) {
@@ -3430,9 +3438,6 @@ export default function (pi: any) {
     const messages = Array.isArray(event.messages) ? event.messages : []
     const assistant = messages.findLast((message: any) => message?.role === "assistant")
     const stopReason = typeof assistant?.stopReason === "string" ? assistant.stopReason : ""
-    // Prime emits intermediate toolUse ends before auto-compaction. A queued
-    // continuation gets a short idle grace below so it cannot strand a run.
-    if (stopReason === "toolUse") return
     const identity = boundIdentity
     const depth = sessionDepth(ctx)
     const key = sessionKey(ctx)
@@ -3440,10 +3445,24 @@ export default function (pi: any) {
     await reconcileHeartbeatState(ctx)
     const activity = sharedActivities.get(identity.paneId)
     if (!activity) return
+    const resumeBinding = paneLifecycleBinding(activity, key)
+    const clearedFinalQuestion = clearQuestionsForSession(activity, key)
+    if (clearedFinalQuestion && resumeBinding) {
+      await send({ hook_event_name: "Resume" }, resumeBinding)
+    }
     const completed = depth > 0
       ? activity.descendants.get(key)
       : activity.root?.sessionKey === key ? activity.root.binding : undefined
-    if (!completed) return
+    // Prime emits intermediate toolUse ends before auto-compaction. A queued
+    // continuation gets a short idle grace below so it cannot strand a run.
+    if (stopReason === "toolUse") {
+      await cleanupActivity(identity, activity)
+      return
+    }
+    if (!completed) {
+      await cleanupActivity(identity, activity)
+      return
+    }
     const errorMessage = typeof assistant?.errorMessage === "string" ? assistant.errorMessage.trim() : ""
     const terminal: PendingTerminal = {
       input: {
@@ -3484,9 +3503,9 @@ export default function (pi: any) {
       publishedCanonicalTitles.delete(key)
       publishingCanonicalTitles.delete(key)
     }
+    if (event?.reason === "reload") return
     const activity = sharedActivities.get(identity.paneId)
     const clearedFinalQuestion = activity ? clearQuestionsForSession(activity, key) : false
-    if (event?.reason === "reload") return
     if (activity) cancelRetryFailure(activity, key)
     if (activity?.root && depth > 0 && clearedFinalQuestion) {
       await send({ hook_event_name: "Resume" }, activity.root.binding)

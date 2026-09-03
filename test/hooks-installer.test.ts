@@ -420,6 +420,8 @@ test("Prime Agent extension binds each session to its forwarded pane environment
     const childOneA = await createHandlers("1");
     const childOneB = await createHandlers("1");
     const childOneReloaded = await createHandlers("1");
+    const questionOriginal = await createHandlers("1");
+    const questionReloaded = await createHandlers("1");
     const unsafe = await createHandlers("3");
     const missing = await createHandlers();
     const partial = await createHandlers("4", true);
@@ -647,6 +649,45 @@ printf '%s|%s\n' "$WMUX_PANE_ID" "$HERDR_PANE_ID"` } };
       "running", "waiting", "running", "completed",
     ]);
     assert.ok(captured.slice(questionStart).every((event) => event.runId === questionRunId));
+
+    // A mid-question extension reload preserves the pending marker so the new
+    // runner can publish Resume when it receives the eventual tool result.
+    const reloadQuestionStart = captured.length;
+    await questionOriginal.get("before_agent_start")?.({ prompt: "Reload during questionnaire" }, context(0, false, "root-question-reload"));
+    const reloadQuestionRunId = captured.at(-1)?.runId;
+    await questionOriginal.get("tool_call")?.({ toolName: "questionnaire", toolCallId: "reload-question-1", input: {} }, context(0, false, "root-question-reload"));
+    assert.deepEqual(captured.slice(reloadQuestionStart).map((event) => event.status), ["running", "waiting"]);
+    await questionOriginal.get("session_shutdown")?.({ reason: "reload" }, context(0, false, "root-question-reload"));
+    assert.equal(captured.at(-1)?.status, "waiting");
+    let reloadQuestionIdle = true;
+    const reloadQuestionContext = {
+      ...context(0, false, "root-question-reload"),
+      isIdle: () => reloadQuestionIdle,
+    };
+    await questionReloaded.get("session_start")?.({ reason: "reload" }, reloadQuestionContext);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(captured.at(-1)?.status, "waiting");
+    reloadQuestionIdle = false;
+    await questionReloaded.get("tool_result")?.({ toolName: "questionnaire", toolCallId: "reload-question-1" }, reloadQuestionContext);
+    assert.equal(captured.at(-1)?.status, "running");
+    assert.equal(captured.at(-1)?.runId, reloadQuestionRunId);
+    await questionReloaded.get("agent_end")?.({ messages: [{ role: "assistant", content: "reloaded question answered" }] }, context(0, false, "root-question-reload"));
+    assert.deepEqual(captured.slice(reloadQuestionStart).map((event) => event.status), ["running", "waiting", "running", "completed"]);
+    await questionReloaded.get("session_shutdown")?.({ reason: "quit" }, context(0, false, "root-question-reload"));
+
+    // A blocked questionnaire can end without tool_result. Agent completion
+    // clears its stale marker so the next real question still publishes Waiting.
+    const blockedQuestionStart = captured.length;
+    await one.get("before_agent_start")?.({ prompt: "Question blocked by another extension" }, context(0, false, "root-question-blocked"));
+    await one.get("tool_call")?.({ toolName: "questionnaire", toolCallId: "blocked-question", input: {} }, context(0, false, "root-question-blocked"));
+    await one.get("agent_end")?.({ messages: [{ role: "assistant", content: "question blocked", stopReason: "stop" }] }, context(0, false, "root-question-blocked"));
+    assert.deepEqual(captured.slice(blockedQuestionStart).map((event) => event.status), ["running", "waiting", "running", "completed"]);
+    const nextQuestionStart = captured.length;
+    await one.get("before_agent_start")?.({ prompt: "Ask a later question" }, context(0, false, "root-question-next"));
+    await one.get("tool_call")?.({ toolName: "questionnaire", toolCallId: "next-question", input: {} }, context(0, false, "root-question-next"));
+    assert.deepEqual(captured.slice(nextQuestionStart).map((event) => event.status), ["running", "waiting"]);
+    await one.get("tool_result")?.({ toolName: "questionnaire", toolCallId: "next-question" }, context(0, false, "root-question-next"));
+    await one.get("agent_end")?.({ messages: [{ role: "assistant", content: "later question answered", stopReason: "stop" }] }, context(0, false, "root-question-next"));
 
     // A nested questionnaire updates the pane's published root lifecycle rather
     // than creating an unrelated child run.
