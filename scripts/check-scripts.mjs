@@ -61,6 +61,8 @@ for (const script of [
   "scripts/wmux-set-password",
   "scripts/wmux-provision-scoped-auth.mjs",
   "scripts/wmux-check-scoped-credentials",
+  "plugins/wmux/scripts/wmux-mcp.mjs",
+  "plugins/wmux/scripts/wmux-context.mjs",
 ]) {
   run(process.execPath, ["--check", script]);
 }
